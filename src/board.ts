@@ -8,6 +8,8 @@ import type { Presence } from "./transport.ts";
 import { ago, clip, plural } from "./util.ts";
 
 const RECENT_SHOWN = 4;
+/** The board lists at most this many agents; a result the model reads must stay bounded. */
+const MAX_LISTED = 25;
 
 function label(peer: Presence): string {
 	const name = peer.name && peer.name !== peer.callsign ? ` "${clip(peer.name, 30)}"` : "";
@@ -68,7 +70,8 @@ export function renderBoard(input: BoardInput): string {
 			? `📡 You are ${self.callsign}. No other agent is live ${where}.`
 			: `📡 You are ${self.callsign}. ${plural(others.length, "other agent")} live ${where}:`,
 	);
-	for (const peer of others) lines.push(...describePeer(peer, root));
+	for (const peer of others.slice(0, MAX_LISTED)) lines.push(...describePeer(peer, root));
+	if (others.length > MAX_LISTED) lines.push(`… and ${others.length - MAX_LISTED} more`);
 	lines.push("", ...describePeer(self, root, { self: true }));
 	if (input.inboundAsks.length > 0) {
 		lines.push("", `Unanswered asks (a peer is blocked waiting — answer with action "reply"):`);

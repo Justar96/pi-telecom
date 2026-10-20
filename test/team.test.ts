@@ -454,3 +454,74 @@ test("PI_TELECOM_MAX_WAKES=0: peer messages never start a turn, asks still do", 
 	await b.tool({ action: "reply", message: "a" });
 	await pending;
 });
+
+// ---------------------------------------------------------------- pi extension best practices
+
+test("tool schema: string enums are flat (Google-compatible), hints and output schema declared", async () => {
+	const proj = makeProject("p-schema");
+	const a = await session(proj);
+	const tool = a.tools.get("telecom") as unknown as {
+		parameters: { properties: Record<string, any> };
+		annotations: Record<string, boolean>;
+		outputSchema: { properties: Record<string, unknown> };
+	};
+	const action = tool.parameters.properties.action;
+	assert.equal(action.anyOf, undefined, "no anyOf: Google rejects unions of literals");
+	assert.deepEqual(action.enum, ["board", "send", "ask", "reply", "broadcast", "status", "claim", "release"]);
+	assert.equal(tool.parameters.properties.scope.anyOf, undefined);
+	assert.deepEqual(tool.annotations, { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false });
+	assert.ok(tool.outputSchema.properties.ok);
+	const raw = await (a.tools.get("telecom") as any).execute("x", { action: "board" }, undefined, undefined, a.ctx);
+	assert.deepEqual(raw.structuredContent, raw.details, "codemode gets the same facts as the UI");
+	assert.equal(raw.structuredContent.ok, true);
+});
+
+test("hooks fail open: an internal error never blocks the user's edit", async () => {
+	const proj = makeProject("p-failopen");
+	const a = await session(proj);
+	await session(proj); // a teammate, so the guard does real work
+	const brokenCtx = { ...a.ctx, cwd: undefined }; // path.resolve(undefined) throws inside the guard
+	let result: unknown = "not called";
+	for (const handler of a.handlers.get("tool_call") ?? []) {
+		result = await handler({ type: "tool_call", toolName: "write", toolCallId: "t1", input: { path: "x.ts", content: "" } }, brokenCtx);
+	}
+	assert.equal(result, undefined, "no block, no throw");
+	assert.ok(a.notified.some((n) => /telecom tool_call:/.test(n)), "the bug is reported to the human");
+});
+
+test("tool results render folded by default and in full when expanded", async () => {
+	const proj = makeProject("p-render");
+	const a = await session(proj);
+	const tool = a.tools.get("telecom") as any;
+	const theme = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
+	const long = { content: [{ type: "text", text: Array.from({ length: 20 }, (_, i) => `line ${i}`).join("\n") }], details: { ok: true } };
+	const folded = tool.renderResult(long, { expanded: false, isPartial: false }, theme).render(80).join("\n");
+	assert.match(folded, /line 7/);
+	assert.doesNotMatch(folded, /line 8\b/);
+	assert.match(folded, /12 more lines/);
+	const full = tool.renderResult(long, { expanded: true, isPartial: false }, theme).render(80).join("\n");
+	assert.match(full, /line 19/);
+	const waiting = tool.renderResult({ content: [{ type: "text", text: "waiting for bravo…" }], details: {} }, { expanded: false, isPartial: true }, theme);
+	assert.match(waiting.render(80).join("\n"), /waiting for bravo/);
+});
+
+test("the board stays bounded with many agents", async () => {
+	const proj = makeProject("p-crowd");
+	const a = await session(proj);
+	const { openTransport, processStartTicks } = await import("../src/transport.ts");
+	const t = openTransport(process.env.PI_TELECOM_DIR as string);
+	const ids: string[] = [];
+	for (let i = 0; i < 30; i++) {
+		const id = `crowd-session-${String(i).padStart(4, "0")}`;
+		ids.push(id);
+		t.writePresence({
+			v: 1, id, callsign: `agent${i}`, pid: process.ppid, ticks: processStartTicks(process.ppid),
+			cwd: proj, projectRoot: findProjectRoot(proj), role: "main", state: "idle", claims: [], recent: [],
+			startedAt: 1, heartbeatAt: Date.now(),
+		});
+	}
+	const board = await a.tool({ action: "board" });
+	assert.match(board.text, /30 other agents live/);
+	assert.match(board.text, /… and 5 more/);
+	for (const id of ids) t.removePresence(id);
+});

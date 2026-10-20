@@ -43,12 +43,41 @@ function check(name, ok, detail = "") {
 const textOf = (content) =>
 	typeof content === "string" ? content : (content ?? []).map((c) => c.text ?? "").join("\n");
 
-async function run(agent, prompt, timeoutMs = 120_000) {
+/** Is the agent mid-run? (A peer's ask can wake it at any time.) */
+function busy(agent) {
+	const last = agent.records.filter((r) => r.type === "agent_start" || r.type === "agent_settled").at(-1);
+	return last?.type === "agent_start";
+}
+
+/**
+ * Prompt an agent and wait for THAT run to settle. A peer may have woken the agent (an ask), and
+ * a prompt sent mid-run is queued rather than started — so wait for idle first, then for the run
+ * this prompt starts, then for its own end. Returns the records of exactly that run.
+ */
+async function run(agent, prompt, timeoutMs = 180_000) {
+	if (busy(agent)) {
+		const at = agent.records.length;
+		await agent.waitFor((r) => r.type === "agent_settled" && agent.records.indexOf(r) >= at, timeoutMs);
+	}
 	const from = agent.records.length;
 	const id = agent.send({ type: "prompt", message: prompt });
 	await agent.waitFor((r) => r.type === "response" && r.id === id);
-	await agent.waitFor((r) => r.type === "agent_settled" && agent.records.indexOf(r) >= from, timeoutMs);
+	const start = await agent.waitFor((r) => r.type === "agent_start" && agent.records.indexOf(r) >= from, timeoutMs);
+	const startAt = agent.records.indexOf(start);
+	await agent.waitFor((r) => r.type === "agent_settled" && agent.records.indexOf(r) > startAt, timeoutMs);
 	return agent.records.slice(from);
+}
+
+/** What a run did, for a failure message: every tool call with its result, and the final reply. */
+function describe(records) {
+	const tools = records
+		.filter((r) => r.type === "tool_execution_end")
+		.map((r) => `${r.toolName}${r.isError ? "✗" : "✓"} ${JSON.stringify(r.args ?? {}).slice(0, 160)} → ${textOf(r.result?.content).slice(0, 240)}`);
+	const reply = records
+		.filter((r) => r.type === "message_end" && r.message?.role === "assistant")
+		.map((r) => `${r.message.stopReason ?? ""} ${r.message.errorMessage ?? ""} ${textOf(r.message.content)}`.trim())
+		.at(-1);
+	return `tools: ${tools.join(" | ") || "none"}\n    final reply: ${reply ?? "none"}`;
 }
 
 const toolEnds = (records, name) => records.filter((r) => r.type === "tool_execution_end" && r.toolName === name);
@@ -74,6 +103,8 @@ try {
 	check("the two agents settled on distinct callsigns", csA !== csB, `${csA} / ${csB}`);
 	console.log(`agents: A=${csA}, B=${csB}, model=${model}\n`);
 
+	const only = process.env.TELECOM_LIVE_ONLY;
+	if (!only || only === "core") {
 	// 1. B reads the file: its view is recorded.
 	const r1 = await run(b, "Use the read tool to read shared.txt, then reply with just its first line.");
 	check("B read shared.txt with the real read tool", toolEnds(r1, "read").length > 0);
@@ -125,9 +156,14 @@ try {
 	const replied = toolEnds(b.records, "telecom").some((t) => !t.isError && /replied to/.test(textOf(t.result?.content)));
 	check(`${csB} was woken by the ask and replied with the telecom tool`, replied);
 
+	}
+
+	if (!only || only === "claims") {
 	// 5. A claims a file; B is asked to change it. B must be held back, A must be told, and the
 	//    two should sort it out between themselves (B asks, A answers) — or B retries knowingly.
-	await run(a, 'Use the telecom tool to claim ["auth.txt"] with message "rewriting auth". Do nothing else.');
+	const r5a = await run(a, 'Use the telecom tool to claim ["auth.txt"] with message "rewriting auth". Do nothing else.');
+	const claimCall = toolEnds(r5a, "telecom").find((t) => !t.isError && /claimed auth\.txt/.test(textOf(t.result?.content)));
+	check(`${csA} claimed auth.txt with the telecom tool`, Boolean(claimCall), describe(r5a));
 	const r5 = await run(
 		b,
 		'Append a line "b was here" to auth.txt using the edit tool. If a tool call is refused, follow the advice in the refusal.',
@@ -136,7 +172,7 @@ try {
 	const seq5 = r5.filter((r) => r.type === "tool_execution_end").map((r) => `${r.toolName}${r.isError ? "✗" : "✓"}`);
 	console.log(`    B's tool sequence: ${seq5.join(" → ")}`);
 	const claimBlock = toolEnds(r5, "edit").find((e) => e.isError && new RegExp(`inside ${csA}'s claim`).test(textOf(e.result?.content)));
-	check(`B's edit inside ${csA}'s claim was held back`, Boolean(claimBlock), JSON.stringify(toolEnds(r5, "edit").map((e) => textOf(e.result?.content))));
+	check(`B's edit inside ${csA}'s claim was held back`, Boolean(claimBlock), describe(r5));
 	const told = await a
 		.waitFor((r) => r.type === "message_end" && r.message?.customType === "telecom-claim", 10_000)
 		.catch(() => null);
@@ -144,6 +180,7 @@ try {
 	const askedOwner = toolEnds(r5, "telecom").some((t) => /answered:|interrupted/.test(textOf(t.result?.content)));
 	console.log(`    ${csB} ${askedOwner ? `asked ${csA} and got an answer` : "did not ask (retried or stopped)"}; auth.txt is now: ${JSON.stringify(readFileSync(join(project, "auth.txt"), "utf8"))}`);
 	await new Promise((r) => setTimeout(r, 1_000));
+	}
 	check("both agents end the scenario settled (no runaway ping-pong)", ![a, b].some((p) => {
 		const last = p.records.filter((r) => r.type === "agent_start" || r.type === "agent_settled").at(-1);
 		return last?.type === "agent_start";

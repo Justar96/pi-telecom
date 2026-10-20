@@ -46,11 +46,29 @@ function project(name) {
 	return dir;
 }
 
+/** Is the agent mid-run? (A peer's ask can wake it at any time.) */
+function busy(agent) {
+	const last = agent.records.filter((r) => r.type === "agent_start" || r.type === "agent_settled").at(-1);
+	return last?.type === "agent_start";
+}
+
+/**
+ * Prompt an agent and wait for THAT run to settle. A peer may have woken the agent (an ask), and
+ * a prompt sent mid-run is queued rather than started — so wait for idle first, then for the run
+ * this prompt starts, then for its own end. Returns the records of exactly that run.
+ */
 async function run(agent, prompt, timeoutMs = 180_000) {
+	if (busy(agent)) {
+		const at = agent.records.length;
+		await agent.waitFor((r) => r.type === "agent_settled" && agent.records.indexOf(r) >= at, timeoutMs);
+	}
 	const from = agent.records.length;
 	const id = agent.send({ type: "prompt", message: prompt });
 	await agent.waitFor((r) => r.type === "response" && r.id === id);
-	await agent.waitFor((r) => r.type === "agent_settled" && agent.records.indexOf(r) >= from, timeoutMs);
+	const start = await agent.waitFor((r) => r.type === "agent_start" && agent.records.indexOf(r) >= from, timeoutMs);
+	const startAt = agent.records.indexOf(start);
+	await agent.waitFor((r) => r.type === "agent_settled" && agent.records.indexOf(r) > startAt, timeoutMs);
+	return agent.records.slice(from);
 }
 
 function usageOf(agent) {

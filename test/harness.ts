@@ -65,14 +65,16 @@ export class Session {
 		const self = this;
 		this.ctx = {
 			cwd,
-			hasUI: false,
-			mode: "print",
+			hasUI: true,
+			mode: "rpc",
 			model: { id: "test-model" },
 			sessionManager: {
 				getSessionId: () => self.id,
 				getEntries: () => self.entries,
+				getBranch: () => self.entries,
 			},
 			ui: {
+				theme: { fg: (_color: string, text: string) => text, bold: (text: string) => text },
 				setStatus: (_key: string, text: string | undefined) => {
 					self.status = text;
 				},

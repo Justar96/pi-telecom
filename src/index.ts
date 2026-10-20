@@ -23,9 +23,11 @@
  * Messaging is derived from @tinoy/pi-ipc (MIT, github.com/tinoy1336/pi-extensions); the team
  * layer — projects, callsigns, briefs, change notices, claims and the guard — is new.
  */
+import { type JsonValue, StringEnum } from "@earendil-works/pi-ai";
 import type {
 	ExtensionAPI,
 	ExtensionContext,
+	ExtensionUIContext,
 	ToolCallEventResult,
 	ToolResultEvent,
 } from "@earendil-works/pi-coding-agent";
@@ -93,16 +95,28 @@ function remember<K, V>(map: Map<K, V>, key: K, value: V, cap = CALL_MAP_CAP): v
 type ToolResult = {
 	content: Array<{ type: "text"; text: string }>;
 	details: Record<string, unknown>;
+	/** The same facts as `details`, for programmatic callers (codemode scripts); see `outputSchema`. */
+	structuredContent: JsonValue;
 	isError?: boolean;
 };
 
 function ok(text: string, details: Record<string, unknown> = {}): ToolResult {
-	return { content: [{ type: "text", text }], details: { ok: true, ...details } };
+	const data = { ok: true, ...details };
+	return { content: [{ type: "text", text }], details: data, structuredContent: data as JsonValue };
 }
 
 function fail(text: string, details: Record<string, unknown> = {}): ToolResult {
-	return { content: [{ type: "text", text: `telecom: ${text}` }], details: { ok: false, ...details }, isError: true };
+	const data = { ok: false, ...details };
+	return {
+		content: [{ type: "text", text: `telecom: ${text}` }],
+		details: data,
+		structuredContent: data as JsonValue,
+		isError: true,
+	};
 }
+
+/** Tool results are folded to this many lines until expanded. */
+const RESULT_FOLD_LINES = 8;
 
 interface FileChangedData {
 	path: string;
@@ -152,6 +166,33 @@ export default function telecom(pi: ExtensionAPI): void {
 
 	registerRenderers(pi);
 
+	/** The UI, when this mode has one (the TUI or an RPC client); print and JSON modes get null. */
+	function ui(): ExtensionUIContext | null {
+		return ctxRef?.hasUI ? ctxRef.ui : null;
+	}
+
+	/**
+	 * Every hook is registered through this. pi treats a throwing `tool_call` handler as a veto —
+	 * it blocks the tool — so a telecom bug must never escape as an exception: it is reported once
+	 * and the hook gives no opinion. The guard therefore fails OPEN: telecom is a teammate, not a
+	 * security boundary, and a bug in it must not stop anyone's work.
+	 */
+	const on = ((event: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) =>
+		pi.on(event as never, ((ev: unknown, ctx: ExtensionContext) => {
+			try {
+				const out = handler(ev, ctx);
+				return out instanceof Promise
+					? out.catch((error: unknown) => {
+							report(event, error);
+							return undefined;
+						})
+					: out;
+			} catch (error) {
+				report(event, error);
+				return undefined;
+			}
+		}) as never)) as ExtensionAPI["on"];
+
 	// ------------------------------------------------------------------ helpers
 
 	function root(): string {
@@ -165,7 +206,7 @@ export default function telecom(pi: ExtensionAPI): void {
 		if (reported.has(text)) return;
 		reported.add(text);
 		try {
-			ctxRef?.ui.notify(text, "warning");
+			ui()?.notify(text, "warning");
 		} catch {
 			/* no UI */
 		}
@@ -251,18 +292,20 @@ export default function telecom(pi: ExtensionAPI): void {
 	}
 
 	function updateStatus(): void {
-		const ui = ctxRef?.ui;
-		if (!ui || !self) return;
+		const u = ui();
+		if (!u || !self) return;
 		try {
+			// Rebuilt on every refresh, so a theme change shows up within a second.
+			const fg = (color: "accent" | "dim" | "warning", text: string) => (u.theme ? u.theme.fg(color, text) : text);
 			const mates = team();
 			const asks = ledger.inbound().length;
 			const busy = mates.filter((p) => p.state === "busy").length;
-			const parts = [`📡 ${self.callsign}`];
-			parts.push(mates.length === 0 ? "solo" : `${plural(mates.length, "peer")}${busy ? ` (${busy} busy)` : ""}`);
-			if (self.claims.length > 0) parts.push(plural(self.claims.length, "claim"));
-			if (asks > 0) parts.push(`${plural(asks, "ask")} waiting`);
-			ui.setStatus("telecom", parts.join(" · "));
-			if (widgetOn) ui.setWidget("telecom", boardText("project").split("\n"));
+			const parts = [fg("accent", `📡 ${self.callsign}`)];
+			parts.push(fg("dim", mates.length === 0 ? "solo" : `${plural(mates.length, "peer")}${busy ? ` (${busy} busy)` : ""}`));
+			if (self.claims.length > 0) parts.push(fg("dim", plural(self.claims.length, "claim")));
+			if (asks > 0) parts.push(fg("warning", `${plural(asks, "ask")} waiting`));
+			u.setStatus("telecom", parts.join(fg("dim", " · ")));
+			if (widgetOn) u.setWidget("telecom", boardText("project").split("\n"));
 		} catch {
 			/* UI not available in this mode */
 		}
@@ -526,7 +569,7 @@ export default function telecom(pi: ExtensionAPI): void {
 			self.callsign = pickCallsign(taken);
 			persistCallsign();
 			publish();
-			ctxRef?.ui.notify(`📡 callsign ${old} was taken; you are now ${self.callsign}`, "info");
+			ui()?.notify(`📡 callsign ${old} was taken; you are now ${self.callsign}`, "info");
 		}
 		const mates = team(peers);
 		const ids = new Set(mates.map((p) => p.id));
@@ -537,7 +580,7 @@ export default function telecom(pi: ExtensionAPI): void {
 			if (joined.length) parts.push(`${joined.map((p) => p.callsign).join(", ")} joined`);
 			if (left.length) parts.push(`${plural(left.length, "agent")} left`);
 			try {
-				ctxRef?.ui.notify(`📡 ${parts.join("; ")}`, "info");
+				ui()?.notify(`📡 ${parts.join("; ")}`, "info");
 			} catch {
 				/* no UI */
 			}
@@ -576,8 +619,8 @@ export default function telecom(pi: ExtensionAPI): void {
 		self = null;
 		unavailable = reason;
 		try {
-			ctxRef?.ui.setStatus("telecom", "📡 off (session open elsewhere)");
-			ctxRef?.ui.notify(`📡 telecom: ${reason}`, "warning");
+			ui()?.setStatus("telecom", "📡 off (session open elsewhere)");
+			ui()?.notify(`📡 telecom: ${reason}`, "warning");
 		} catch {
 			/* no UI */
 		}
@@ -639,14 +682,14 @@ export default function telecom(pi: ExtensionAPI): void {
 		}
 		self = null;
 		try {
-			ctxRef?.ui.setStatus("telecom", undefined);
-			ctxRef?.ui.setWidget("telecom", undefined);
+			ui()?.setStatus("telecom", undefined);
+			ui()?.setWidget("telecom", undefined);
 		} catch {
 			/* no UI */
 		}
 	}
 
-	pi.on("session_start", (_event, ctx) => {
+	on("session_start", (_event, ctx) => {
 		ctxRef = ctx;
 		cfg = readConfig();
 		if (cfg.disabled) return;
@@ -667,7 +710,7 @@ export default function telecom(pi: ExtensionAPI): void {
 			const peers = transport.readPeers().filter((p) => p.id !== id);
 			const taken = new Set(peers.filter((p) => p.projectRoot === projectRoot).map((p) => p.callsign));
 			let remembered: string | undefined;
-			for (const entry of ctx.sessionManager.getEntries()) {
+			for (const entry of ctx.sessionManager.getBranch()) {
 				if (entry.type === "custom" && entry.customType === CALLSIGN_ENTRY) {
 					const cs = (entry.data as { callsign?: unknown } | undefined)?.callsign;
 					if (typeof cs === "string" && CALLSIGN_PATTERN.test(cs)) remembered = cs;
@@ -720,21 +763,21 @@ export default function telecom(pi: ExtensionAPI): void {
 		}
 	});
 
-	pi.on("session_shutdown", (event) => {
+	on("session_shutdown", (event) => {
 		stop(event?.reason === "reload");
 	});
 
-	pi.on("session_compact", () => {
+	on("session_compact", () => {
 		awareness.markCompacted();
 		// The summary may have dropped the team picture: the next prompt gets a full brief.
 		if (briefState) briefState = { ...briefState, fullAt: 0 };
 	});
 
-	pi.on("session_info_changed", () => {
+	on("session_info_changed", () => {
 		if (self) publish();
 	});
 
-	pi.on("model_select", (event) => {
+	on("model_select", (event) => {
 		if (!self) return;
 		self.model = event.model.id;
 		publish();
@@ -742,7 +785,7 @@ export default function telecom(pi: ExtensionAPI): void {
 
 	// ------------------------------------------------------------------ turns
 
-	pi.on("before_agent_start", (event, ctx) => {
+	on("before_agent_start", (event, ctx) => {
 		ctxRef = ctx;
 		if (!self) return;
 		self.state = "busy";
@@ -764,7 +807,7 @@ export default function telecom(pi: ExtensionAPI): void {
 		};
 	});
 
-	pi.on("agent_before_settle", (event) => {
+	on("agent_before_settle", (event) => {
 		if (!self || event.outcome === "aborted" || !event.context.canContinue) return;
 		const due = ledger.inbound().filter((a) => !a.reminded);
 		if (due.length === 0) return;
@@ -784,7 +827,7 @@ export default function telecom(pi: ExtensionAPI): void {
 		};
 	});
 
-	pi.on("agent_settled", () => {
+	on("agent_settled", () => {
 		if (!self) return;
 		self.state = "idle";
 		flushNotices(true);
@@ -804,7 +847,7 @@ export default function telecom(pi: ExtensionAPI): void {
 		return undefined;
 	}
 
-	pi.on("tool_call", (event, ctx) => {
+	on("tool_call", (event, ctx) => {
 		if (!self || (event.toolName !== "edit" && event.toolName !== "write")) return;
 		const raw = (event.input as { path?: unknown }).path;
 		if (typeof raw !== "string" || !raw.trim()) return;
@@ -837,7 +880,7 @@ export default function telecom(pi: ExtensionAPI): void {
 		return verdictToResult(stale, event.toolCallId);
 	});
 
-	pi.on("tool_result", (event, ctx) => {
+	on("tool_result", (event, ctx) => {
 		if (!self) return;
 		const toolName = event.toolName;
 		if (toolName !== "read" && toolName !== "edit" && toolName !== "write") return;
@@ -894,19 +937,10 @@ export default function telecom(pi: ExtensionAPI): void {
 			"Message peers only for real coordination (requests, handoffs, shared-interface changes) — no acknowledgements; each message costs the recipient a turn.",
 		],
 		parameters: Type.Object({
-			action: Type.Union(
-				[
-					Type.Literal("board"),
-					Type.Literal("send"),
-					Type.Literal("ask"),
-					Type.Literal("reply"),
-					Type.Literal("broadcast"),
-					Type.Literal("status"),
-					Type.Literal("claim"),
-					Type.Literal("release"),
-				],
-				{ description: "What to do." },
-			),
+			// StringEnum, not a Union of Literals: Google models reject the anyOf form.
+			action: StringEnum(["board", "send", "ask", "reply", "broadcast", "status", "claim", "release"] as const, {
+				description: "What to do.",
+			}),
 			to: Type.Optional(Type.String({ description: "send/ask: callsign, session name or id prefix." })),
 			message: Type.Optional(
 				Type.String({ description: "The text; for status your task; for claim the reason." }),
@@ -917,11 +951,13 @@ export default function telecom(pi: ExtensionAPI): void {
 			),
 			timeoutSec: Type.Optional(Type.Number({ description: "ask: seconds to wait (default 300)." })),
 			scope: Type.Optional(
-				Type.Union([Type.Literal("project"), Type.Literal("machine")], {
-					description: 'board/broadcast: "project" (default) or "machine".',
-				}),
+				StringEnum(["project", "machine"] as const, { description: 'board/broadcast: "project" (default) or "machine".' }),
 			),
 		}),
+		// Hints for permission extensions: telecom only talks to local pi sessions and edits nothing.
+		annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+		// Codemode scripts receive `structuredContent` (always `{ ok, ... }`) instead of the text.
+		outputSchema: Type.Object({ ok: Type.Boolean() }, { additionalProperties: true }),
 
 		renderCall(args, theme) {
 			const a = args as { action?: string; to?: string; message?: string; askId?: string; paths?: string[] };
@@ -931,6 +967,24 @@ export default function telecom(pi: ExtensionAPI): void {
 			if (a.paths?.length) text += theme.fg("muted", ` ${a.paths.join(", ")}`);
 			if (a.message) text += theme.fg("dim", ` — ${clip(a.message, 70)}`);
 			return new Text(text, 0, 0);
+		},
+
+		// Compact by default (the board can be long); the full text when expanded.
+		renderResult(result, { expanded, isPartial }, theme) {
+			const text = result.content
+				.map((part) => (part.type === "text" ? part.text : ""))
+				.join("\n")
+				.trim();
+			if (isPartial) return new Text(theme.fg("dim", text || "working…"), 0, 0);
+			const failed = (result.details as { ok?: unknown } | undefined)?.ok === false;
+			const color = failed ? "error" : "toolOutput";
+			const lines = text.split("\n");
+			if (expanded || lines.length <= RESULT_FOLD_LINES) return new Text(theme.fg(color, text), 0, 0);
+			return new Text(
+				`${theme.fg(color, lines.slice(0, RESULT_FOLD_LINES).join("\n"))}\n${theme.fg("dim", `… ${lines.length - RESULT_FOLD_LINES} more lines (expand to read)`)}`,
+				0,
+				0,
+			);
 		},
 
 		async execute(_toolCallId, params, signal, onUpdate) {
