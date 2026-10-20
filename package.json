@@ -1,5 +1,5 @@
 {
-	"name": "@justar96/pi-telecom",
+	"name": "@justar_96/pi-telecom",
 	"version": "0.1.0",
 	"description": "Telecom for pi: parallel pi agents in the same project see each other, talk, claim work, and get told when a peer changes a file they depend on.",
 	"license": "MIT",

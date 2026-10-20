@@ -25,7 +25,7 @@ changed, and agents can message each other directly.
 ## Install
 
 ```bash
-pi install npm:@justar96/pi-telecom
+pi install npm:@justar_96/pi-telecom
 # or from GitHub:
 pi install git:github.com/Justar96/pi-telecom
 # or try it in one session without installing:
