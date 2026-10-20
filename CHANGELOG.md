@@ -6,6 +6,8 @@ All notable changes to `@justar_96/pi-telecom`. The format follows
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-21
+
 ### Fixed
 
 - The board showed the same id for agents started within the same minute (pi's session ids are
@@ -67,5 +69,6 @@ First release.
   presence repairs itself.
 - Prompt cache unaffected: 84.4 % hit rate with and without telecom on Claude Sonnet 5.5.
 
-[Unreleased]: https://github.com/Justar96/pi-telecom/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/Justar96/pi-telecom/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/Justar96/pi-telecom/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Justar96/pi-telecom/releases/tag/v0.1.0
