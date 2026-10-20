@@ -11,17 +11,12 @@ typed into another. Telecom connects every pi session in a project, so each agen
 is working, on what, which areas are taken, and which files just changed. Agents can also ask
 each other questions directly.
 
-```
-┌ terminal 1 · alpha ───────────────────┐   ┌ terminal 2 · bravo ───────────────────┐
-│ > refactor the auth module            │   │ > fix the flaky upload test           │
-│ telecom claim src/auth/** "refactor"  │   │                                       │
-│ edit src/auth/session.ts ✓            │──▶│ 📡 alpha changed a file you are       │
-│                                       │   │    working with                       │
-│                                       │   │  • src/auth/session.ts — edited       │
-│ 📡 Ask from bravo — they are blocked  │◀──│ telecom ask alpha "is login() async   │
-│ telecom reply "yes, since 3 min ago"  │──▶│ now?"  → alpha answered: yes, …       │
-└───────────────────────────────────────┘   └───────────────────────────────────────┘
-```
+![Two pi sessions working in one repository: alpha answers bravo's question while bravo gets a change notice with alpha's diff](https://raw.githubusercontent.com/Justar96/pi-telecom/main/docs/images/team.png)
+
+<sub>A real moment from two pi sessions in one repository: alpha on Claude Opus 5.5, bravo on GPT-6.1
+Sol. alpha made <code>login()</code> async and fixed the test that calls it. bravo had read that test, so it
+got a change notice with alpha's diff; asked to fix the test, it asked alpha first, and alpha
+answered. Captured with <code>npm run screenshots</code>.</sub>
 
 ## Quick start
 
@@ -89,9 +84,10 @@ telecom: alpha edited shared.txt 5s ago (1 edit from line 1), after you last rea
 shared.txt and re-apply your change on top of theirs (prefer `edit` over a whole-file `write`).
 ```
 
-In live tests on Claude Sonnet 5.5, the agent that got this refusal re-read the file and applied
-its change on top of the peer's, so both changes were kept. When it was held back from a claimed
-file, it asked the owner, waited for the answer, and then made the edit.
+In live tests on Claude Opus 5.5 and GPT-6.1 Sol, both models re-read a file after its change
+notice instead of writing over it, so both changes were kept. Asked to edit inside a peer's claim,
+both contacted the owner first: one waited when told to, the other went ahead once the owner
+released the claim.
 
 ## Features
 
@@ -151,7 +147,7 @@ with no activity inside it. When a claim is released, anyone who was held back i
 | action | parameters | what it does |
 |---|---|---|
 | `board` | `scope?` | Shows who works here, on what, their claims and recent changes, and asks waiting on you. `scope: "machine"` covers every project. |
-| `send` | `to`, `message` | Messages one agent by callsign, session name or id prefix. It wakes the agent if it's idle. |
+| `send` | `to`, `message` | Messages one agent by callsign, session name or id. It wakes the agent if it's idle. |
 | `ask` | `to`, `message`, `timeoutSec?` | Sends a question and waits for the answer (default 300 s). A late answer still arrives as a message. |
 | `reply` | `message`, `askId?` | Answers an inbound ask. `askId` can be left out when only one ask is waiting. |
 | `broadcast` | `message`, `scope?` | Tells every agent in the project. It never wakes idle agents. |
@@ -208,10 +204,16 @@ already been sent. This was measured, not just designed: `npm run e2e:cache` rec
 the model receives while a peer sends the agent a change notice, a broadcast, a team brief, and a
 message mid-run, then runs the same prompts without telecom.
 
-| Claude Sonnet 5.5 | system prompt or tools changed | earlier messages rewritten | cache hit rate |
+| | system prompt or tools changed | earlier messages rewritten | cache hit rate* |
 |---|---|---|---|
-| with telecom | never | never | **84.4 %** |
-| without telecom | never | never | **84.4 %** |
+| Claude Opus 5.5, with telecom | never | never | **96.7 %** |
+| Claude Opus 5.5, without | never | never | **97.1 %** |
+| GPT-6.1 Sol, with telecom | never | never | **73.8 %** |
+| GPT-6.1 Sol, without | never | never | **74.8 %** |
+
+<sub>* Prompt tokens served from cache, from the second request on. The first request is warm or
+cold depending on what ran before it, not on telecom. OpenAI's caching is best-effort, which
+explains the lower rates with and without telecom.</sub>
 
 The fixed cost is about 900 prompt tokens for the tool and its guidelines, cached after the
 first request.

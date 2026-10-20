@@ -1,4 +1,4 @@
-/** util — small pure helpers shared by every module. No I/O except `fileFingerprint`. */
+/** util — small pure helpers shared by every module. No I/O except `fileFingerprint` and `fileExists`. */
 import { createHash } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
 
@@ -42,6 +42,23 @@ export function fileFingerprint(path: string): string | null {
 	}
 }
 
+/**
+ * The short form of a session id shown to people and models: its last 8 characters. pi's session
+ * ids are UUIDv7, whose leading characters are a timestamp shared by every session started within
+ * the same minute; the tail is random (in v4 ids too), so it tells sessions apart.
+ */
+export function shortId(id: string): string {
+	return id.replace(/-/g, "").slice(-8);
+}
+
+/** Does `query` (at least `min` characters) name this id, as its start or as its short form? */
+export function idMatches(id: string, query: string, min: number): boolean {
+	const q = query.replace(/-/g, "").toLowerCase();
+	if (q.length < min) return false;
+	const plain = id.replace(/-/g, "").toLowerCase();
+	return plain.startsWith(q) || plain.endsWith(q);
+}
+
 let idCounter = 0;
 
 /** A fresh id, unique across processes and safe as a file name. */
@@ -53,4 +70,28 @@ export function newId(prefix: string): string {
 
 export function plural(count: number, one: string, many = `${one}s`): string {
 	return `${count} ${count === 1 ? one : many}`;
+}
+
+/**
+ * Set `key` in an insertion-ordered map as its newest entry, evicting the oldest entries past
+ * `cap`. Every long-lived map keyed by peer input is bounded this way, so a busy or hostile peer
+ * cannot grow this process's memory without limit.
+ */
+export function setBounded<K, V>(map: Map<K, V>, key: K, value: V, cap: number): void {
+	map.delete(key);
+	map.set(key, value);
+	while (map.size > cap) {
+		const oldest = map.keys().next().value;
+		if (oldest === undefined) break;
+		map.delete(oldest);
+	}
+}
+
+/** True when `path` names an existing regular file. */
+export function fileExists(path: string): boolean {
+	try {
+		return statSync(path).isFile();
+	} catch {
+		return false;
+	}
 }

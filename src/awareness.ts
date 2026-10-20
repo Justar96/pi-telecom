@@ -19,7 +19,7 @@ import type { GuardMode } from "./config.ts";
 import { matchesClaim } from "./glob.ts";
 import { displayPath } from "./project.ts";
 import type { Claim, Presence } from "./transport.ts";
-import { ago, fileFingerprint } from "./util.ts";
+import { ago, fileFingerprint, setBounded } from "./util.ts";
 
 export interface PeerChange {
 	peerId: string;
@@ -122,13 +122,7 @@ export class Awareness {
 	 * the advice ("re-read it"), so they are not worth another interruption.
 	 */
 	notePeerChange(change: PeerChange): { relation: Relation | null; firstNotice: boolean } {
-		this.changes.delete(change.path);
-		this.changes.set(change.path, change);
-		while (this.changes.size > CHANGE_CAP) {
-			const oldest = this.changes.keys().next().value;
-			if (oldest === undefined) break;
-			this.changes.delete(oldest);
-		}
+		setBounded(this.changes, change.path, change, CHANGE_CAP);
 		const view = this.views.get(change.path);
 		if (!view || !view.inContext) return { relation: null, firstNotice: false };
 		if (view.via === "read" && Date.now() - view.at > READ_RELEVANCE_MS) return { relation: null, firstNotice: false };

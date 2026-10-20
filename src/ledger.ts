@@ -10,6 +10,7 @@
  *   - asks that stopped waiting are remembered, so a late answer reads as "late reply to your
  *     ask" instead of an unexplained message.
  */
+import { setBounded } from "./util.ts";
 
 export interface InboundAsk {
 	id: string;
@@ -65,19 +66,10 @@ export function createAskLedger(): AskLedger {
 	const outbound = new Map<string, PendingAsk>();
 	const abandoned = new Map<string, { toCallsign: string; text: string }>();
 
-	function rememberAbandoned(id: string, pending: PendingAsk): void {
-		abandoned.set(id, { toCallsign: pending.toCallsign, text: pending.text });
-		while (abandoned.size > ABANDONED_CAP) {
-			const oldest = abandoned.keys().next().value;
-			if (oldest === undefined) break;
-			abandoned.delete(oldest);
-		}
-	}
-
 	function stop(id: string, outcome: AskOutcome & { ok: false }): void {
 		const pending = outbound.get(id);
 		if (!pending) return;
-		rememberAbandoned(id, pending);
+		setBounded(abandoned, id, { toCallsign: pending.toCallsign, text: pending.text }, ABANDONED_CAP);
 		pending.settle(outcome);
 	}
 

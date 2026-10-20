@@ -5,7 +5,7 @@
 import { UNRESPONSIVE_MS } from "./awareness.ts";
 import { displayPath } from "./project.ts";
 import type { Presence } from "./transport.ts";
-import { ago, clip, plural } from "./util.ts";
+import { ago, clip, plural, shortId } from "./util.ts";
 
 const RECENT_SHOWN = 4;
 /** The board lists at most this many agents; a result the model reads must stay bounded. */
@@ -32,7 +32,7 @@ export function describePeer(peer: Presence, root: string, opts: { self?: boolea
 		!opts.self && now - peer.heartbeatAt > UNRESPONSIVE_MS
 			? `unresponsive, last seen ${ago(peer.heartbeatAt, now)}`
 			: peer.state;
-	lines.push(`• ${label(peer)} [${state}]${branch}${where}${you}  id ${peer.id.slice(0, 8)}`);
+	lines.push(`• ${label(peer)} [${state}]${branch}${where}${you}  id ${shortId(peer.id)}`);
 	if (peer.task) lines.push(`    task: ${clip(peer.task, 140)}${peer.taskAt ? ` (${ago(peer.taskAt, now)})` : ""}`);
 	const claims = liveClaims(peer, now);
 	if (claims.length > 0) {

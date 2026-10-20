@@ -9,7 +9,8 @@
  * same tools, unchanged message prefix), and the provider's own cacheRead/cacheWrite numbers are
  * compared with a baseline run of the same prompts without telecom.
  *
- *   TELECOM_LIVE_MODEL=anthropic/claude-sonnet-4-5 node scripts/e2e-cache.mjs
+ *   TELECOM_LIVE_MODEL=<provider>/claude-opus-5-5 node scripts/e2e-cache.mjs
+ *   (or gpt-6.1-sol — the models are listed in scripts/lab-models.mjs)
  *   (TELECOM_LIVE_EXTENSIONS=/path/to/provider.ts when the provider is an extension)
  *
  * Costs model calls. Exit 0 = pass, 1 = a check failed, 2 = no model configured.
@@ -142,7 +143,8 @@ async function scenario({ withTelecom }) {
 	}
 }
 
-function summarize(label, { rows: rs, usage }) {
+/** Share of prompt tokens served from cache. */
+function hitRate(usage) {
 	const total = usage.reduce(
 		(acc, u) => ({
 			input: acc.input + (u.input ?? 0),
@@ -152,7 +154,14 @@ function summarize(label, { rows: rs, usage }) {
 		{ input: 0, cacheRead: 0, cacheWrite: 0 },
 	);
 	const prompt = total.input + total.cacheRead + total.cacheWrite;
-	const hit = prompt ? total.cacheRead / prompt : 0;
+	return { hit: prompt ? total.cacheRead / prompt : 0, total };
+}
+
+function summarize(label, { rows: rs, usage }) {
+	const { hit, total } = hitRate(usage);
+	// The first request is warm or cold depending on what ran before it (an identical system prompt
+	// from an earlier run may still be cached), not on telecom. Compare from the second request on.
+	const steady = hitRate(usage.slice(1)).hit;
 	console.log(`\n${label}: ${rs.length} requests`);
 	console.log("  req  msgs  sys  tools  prefix   input  cacheRead  cacheWrite");
 	rs.forEach((r, i) => {
@@ -162,8 +171,8 @@ function summarize(label, { rows: rs, usage }) {
 			`  ${String(r.seq).padStart(3)}  ${String(r.messages).padStart(4)}  ${flag(r.systemSame)}  ${flag(r.toolsSame)}   ${r.prefixIntact === null ? "  -   " : r.prefixIntact ? "append" : "BROKEN"}  ${String(u.input ?? "?").padStart(6)}  ${String(u.cacheRead ?? "?").padStart(9)}  ${String(u.cacheWrite ?? "?").padStart(10)}`,
 		);
 	});
-	console.log(`  cache hit rate over all prompt tokens: ${(hit * 100).toFixed(1)}%`);
-	return { hit, total };
+	console.log(`  cache hit rate: ${(steady * 100).toFixed(1)}% after the first request (${(hit * 100).toFixed(1)}% including it)`);
+	return { hit, steady, total };
 }
 
 try {
@@ -178,15 +187,27 @@ try {
 	const broken = withT.rows.filter((r) => r.prefixIntact === false || r.systemSame === false || r.toolsSame === false);
 	check("every request with telecom is a pure append (system, tools and message prefix unchanged)", broken.length === 0,
 		JSON.stringify(broken, null, 1));
-	const readsOk = withT.usage.slice(1).every((u, i) => {
-		const prev = withT.usage[i];
-		const prevPrompt = (prev.cacheRead ?? 0) + (prev.cacheWrite ?? 0);
-		return (u.cacheRead ?? 0) >= prevPrompt * 0.9;
-	});
-	check("the provider served each request's previous prompt from cache", readsOk,
-		JSON.stringify(withT.usage.map((u) => [u.input, u.cacheRead, u.cacheWrite])));
-	check("cache hit rate with telecom is in line with the baseline", sw.hit >= so.hit - 0.05,
-		`with ${(sw.hit * 100).toFixed(1)}% vs without ${(so.hit * 100).toFixed(1)}%`);
+	// Per-request reuse is only a fair test when the provider caches deterministically. Some
+	// (OpenAI's automatic caching) are best-effort and miss pure-append requests even without
+	// telecom; for those the baseline is the yardstick, and the request-side append check above is
+	// the proof that telecom changed nothing.
+	const reuseMisses = (usage) =>
+		usage.slice(1).filter((u, i) => {
+			const prev = usage[i];
+			return (u.cacheRead ?? 0) < ((prev.input ?? 0) + (prev.cacheRead ?? 0) + (prev.cacheWrite ?? 0)) * 0.9 - 128;
+		}).length;
+	const missesWith = reuseMisses(withT.usage);
+	const missesWithout = reuseMisses(without.usage);
+	if (missesWithout === 0) {
+		check("the provider served each request's previous prompt from cache", missesWith === 0,
+			JSON.stringify(withT.usage.map((u) => [u.input, u.cacheRead, u.cacheWrite])));
+	} else {
+		console.log(
+			`  (provider caching is best-effort: it missed ${missesWithout} of ${without.usage.length - 1} requests without telecom and ${missesWith} with it — per-request reuse not judged)`,
+		);
+	}
+	check("cache hit rate with telecom is in line with the baseline (after the first request)", sw.steady >= so.steady - 0.05,
+		`with ${(sw.steady * 100).toFixed(1)}% vs without ${(so.steady * 100).toFixed(1)}%`);
 } catch (error) {
 	console.error(error);
 	failures++;

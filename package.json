@@ -41,6 +41,8 @@
 		"e2e": "node scripts/e2e-rpc.mjs",
 		"e2e:live": "node scripts/e2e-live.mjs",
 		"e2e:cache": "node scripts/e2e-cache.mjs",
+		"e2e:matrix": "node scripts/e2e-matrix.mjs",
+		"screenshots": "node scripts/screenshots/capture.mjs",
 		"check": "npm run typecheck && npm test && npm run e2e",
 		"prepublishOnly": "npm run typecheck && npm test"
 	},

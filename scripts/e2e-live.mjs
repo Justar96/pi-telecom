@@ -6,7 +6,8 @@
  * reaches: real `read`/`edit`/`write` tool events flowing through the guard, a change notice
  * produced by a real edit, and a full ask → wake → reply round trip between two agents.
  *
- *   TELECOM_LIVE_MODEL=anthropic/claude-haiku-4-5 node scripts/e2e-live.mjs
+ *   TELECOM_LIVE_MODEL=<provider>/claude-opus-5-5 node scripts/e2e-live.mjs
+ *   (or gpt-6.1-sol — the models are listed in scripts/lab-models.mjs; `npm run e2e:matrix` runs both)
  *
  * Only this extension is loaded. A model whose provider is itself an extension needs that
  * extension too: TELECOM_LIVE_EXTENSIONS=/path/to/provider/index.ts (comma-separated).
@@ -43,6 +44,19 @@ function check(name, ok, detail = "") {
 const textOf = (content) =>
 	typeof content === "string" ? content : (content ?? []).map((c) => c.text ?? "").join("\n");
 
+/** Wait until every agent has been idle for `quietMs`; false if that never happens within `maxMs`. */
+async function quiesce(agents, maxMs, quietMs) {
+	const deadline = Date.now() + maxMs;
+	let quietSince = null;
+	while (Date.now() < deadline) {
+		if (agents.some(busy)) quietSince = null;
+		else if (quietSince === null) quietSince = Date.now();
+		else if (Date.now() - quietSince >= quietMs) return true;
+		await new Promise((r) => setTimeout(r, 250));
+	}
+	return false;
+}
+
 /** Is the agent mid-run? (A peer's ask can wake it at any time.) */
 function busy(agent) {
 	const last = agent.records.filter((r) => r.type === "agent_start" || r.type === "agent_settled").at(-1);
@@ -68,11 +82,16 @@ async function run(agent, prompt, timeoutMs = 180_000) {
 	return agent.records.slice(from);
 }
 
+/** A tool call's arguments: only `tool_execution_start` carries them, so look the call up there. */
+function argsOf(records, end) {
+	return records.find((r) => r.type === "tool_execution_start" && r.toolCallId === end.toolCallId)?.args ?? {};
+}
+
 /** What a run did, for a failure message: every tool call with its result, and the final reply. */
 function describe(records) {
 	const tools = records
 		.filter((r) => r.type === "tool_execution_end")
-		.map((r) => `${r.toolName}${r.isError ? "✗" : "✓"} ${JSON.stringify(r.args ?? {}).slice(0, 160)} → ${textOf(r.result?.content).slice(0, 240)}`);
+		.map((r) => `${r.toolName}${r.isError ? "✗" : "✓"} ${JSON.stringify(argsOf(records, r)).slice(0, 160)} → ${textOf(r.result?.content).slice(0, 240)}`);
 	const reply = records
 		.filter((r) => r.type === "message_end" && r.message?.role === "assistant")
 		.map((r) => `${r.message.stopReason ?? ""} ${r.message.errorMessage ?? ""} ${textOf(r.message.content)}`.trim())
@@ -122,27 +141,27 @@ try {
 	);
 	check("the notice did not wake B", !b.records.slice(b.records.indexOf(notice)).some((r) => r.type === "agent_start"));
 
-	// 3. B tries a whole-file overwrite from its stale view: the guard must stop the first attempt.
+	// 3. B is asked for a change that is natural to do as a whole-file write from what it read in
+	//    step 1 — but bravo/alpha changed the file since. Safety: no write from the stale view may
+	//    land (B re-reads after the notice, or the guard stops it and B re-reads). Then the task.
 	const r3 = await run(
 		b,
-		'Without reading the file again, use the write tool to overwrite shared.txt so that it holds its two existing lines followed by a third line "line three: gamma". If a tool call is refused, follow the instructions in the refusal.',
+		'Add a third line "line three: gamma" to shared.txt by rewriting the whole file with the write tool.',
 	);
-	// Two correct outcomes: B heeded the change notice and re-read before writing, or B wrote from
-	// its stale view and the guard stopped it. The failure is a stale write that went through.
-	const seq = r3.filter((r) => r.type === "tool_execution_end").map((r) => `${r.toolName}${r.isError ? "✗" : "✓"}`);
-	console.log(`    B's tool sequence: ${seq.join(" → ")}`);
 	const ends = r3.filter((r) => r.type === "tool_execution_end");
-	const firstWrite = ends.findIndex((r) => r.toolName === "write");
-	const readFirst = ends.slice(0, Math.max(firstWrite, 0)).some((r) => r.toolName === "read");
-	const blocked = ends.find((w) => w.toolName === "write" && w.isError && /telecom:/.test(textOf(w.result?.content)));
-	check(
-		"B never wrote from its stale view (re-read after the notice, or was stopped by the guard)",
-		readFirst || Boolean(blocked),
-		JSON.stringify(ends.map((w) => `${w.toolName}: ${textOf(w.result?.content).slice(0, 200)}`)),
-	);
+	console.log(`    B's tool sequence: ${ends.map((r) => `${r.toolName}${r.isError ? "✗" : "✓"}`).join(" → ") || "none"}`);
+	const firstLanded = ends.findIndex((r) => (r.toolName === "write" || r.toolName === "edit") && !r.isError);
+	const readBefore = ends.slice(0, Math.max(firstLanded, 0)).some((r) => r.toolName === "read");
+	const blocked = ends.find((w) => w.isError && /telecom:/.test(textOf(w.result?.content)));
 	if (blocked) console.log(`    guard said: ${textOf(blocked.result.content).slice(0, 300)}`);
+	check(
+		"safety: no write from B's stale view landed (B re-read first, or the guard stopped it)",
+		firstLanded === -1 || readBefore,
+		describe(r3),
+	);
 	const finalText = readFileSync(join(project, "shared.txt"), "utf8");
-	check("B re-read and built on A's change: ALPHA kept, gamma added", /ALPHA/.test(finalText) && /gamma/.test(finalText), finalText);
+	check(`safety: ${csA}'s change survived (ALPHA kept)`, /ALPHA/.test(finalText), finalText);
+	check("task: B finished the change on top of it (gamma added)", /gamma/.test(finalText), `${finalText}\n    ${describe(r3)}`);
 
 	// 4. A asks B a question; B is woken by the ask, answers with telecom reply; A's call returns it.
 	const r4 = await run(
@@ -169,22 +188,56 @@ try {
 		'Append a line "b was here" to auth.txt using the edit tool. If a tool call is refused, follow the advice in the refusal.',
 		240_000,
 	);
-	const seq5 = r5.filter((r) => r.type === "tool_execution_end").map((r) => `${r.toolName}${r.isError ? "✗" : "✓"}`);
-	console.log(`    B's tool sequence: ${seq5.join(" → ")}`);
-	const claimBlock = toolEnds(r5, "edit").find((e) => e.isError && new RegExp(`inside ${csA}'s claim`).test(textOf(e.result?.content)));
-	check(`B's edit inside ${csA}'s claim was held back`, Boolean(claimBlock), describe(r5));
+	// Two good paths: the brief already told B about the claim, so B asks the owner FIRST; or B
+	// tries, the guard holds it back, and the owner is told. Either way the owner is involved
+	// before the file changes, and the file only changes with the owner's agreement or after the
+	// guard's warning. What must never happen is a silent edit inside someone else's claim.
+	const ends5 = r5.filter((r) => r.type === "tool_execution_end");
+	console.log(`    B's tool sequence: ${ends5.map((r) => `${r.toolName}${r.isError ? "✗" : "✓"}`).join(" → ") || "none"}`);
+	// Safety: an edit inside someone else's claim may land only after the owner was contacted
+	// (ask or send) or after the guard's warning. Not editing at all is always safe.
+	const isEdit = (r) => r.toolName === "edit" || r.toolName === "write";
+	const firstLanded5 = ends5.findIndex((r) => isEdit(r) && !r.isError);
+	const firstTry = ends5.findIndex(isEdit);
+	const contactedFirst = ends5
+		.slice(0, firstTry === -1 ? ends5.length : firstTry)
+		.some((r) => r.toolName === "telecom" && ["ask", "send"].includes(argsOf(r5, r).action));
+	const claimBlock = ends5.find((e) => e.isError && new RegExp(`inside ${csA}'s claim`).test(textOf(e.result?.content)));
 	const told = await a
-		.waitFor((r) => r.type === "message_end" && r.message?.customType === "telecom-claim", 10_000)
+		.waitFor((r) => r.type === "message_end" && ["telecom-claim", "telecom-ask", "telecom-message"].includes(r.message?.customType), 10_000)
 		.catch(() => null);
-	check(`${csA} was told that ${csB} needs its claimed file`, Boolean(told) && new RegExp(`${csB} needs a path you claimed`).test(textOf(told.message.content)));
-	const askedOwner = toolEnds(r5, "telecom").some((t) => /answered:|interrupted/.test(textOf(t.result?.content)));
-	console.log(`    ${csB} ${askedOwner ? `asked ${csA} and got an answer` : "did not ask (retried or stopped)"}; auth.txt is now: ${JSON.stringify(readFileSync(join(project, "auth.txt"), "utf8"))}`);
+	console.log(
+		`    path: ${contactedFirst ? `${csB} contacted ${csA} first` : claimBlock ? "held back by the guard" : "no contact"}${firstLanded5 === -1 ? ", no edit made" : ", edit made"}`,
+	);
+	check(
+		`safety: no edit landed inside ${csA}'s claim without contacting them or a guard warning`,
+		firstLanded5 === -1 || contactedFirst || Boolean(claimBlock),
+		describe(r5),
+	);
+	check(`${csA} was involved (asked, messaged, or told about the attempt)`, Boolean(told));
+	const authNow = readFileSync(join(project, "auth.txt"), "utf8");
+	const released = a.records.some(
+		(r) => r.type === "tool_execution_end" && r.toolName === "telecom" && argsOf(a.records, r).action === "release" && !r.isError,
+	);
+	const answer = toolEnds(r5, "telecom").map((t) => textOf(t.result?.content)).join(" ");
+	const agreed = released || /go ahead|you can|released|fine|ok\b|sure/i.test(answer);
+	console.log(`    ${csA} ${released ? "released the claim" : agreed ? "agreed" : "asked to wait"}; auth.txt is now: ${JSON.stringify(authNow)}`);
+	check(
+		"outcome: auth.txt changed only with the owner's agreement or after the guard's warning",
+		authNow === "auth v1\n" || agreed || Boolean(claimBlock),
+		`${authNow}\n    ${describe(r5)}`,
+	);
 	await new Promise((r) => setTimeout(r, 1_000));
 	}
-	check("both agents end the scenario settled (no runaway ping-pong)", ![a, b].some((p) => {
-		const last = p.records.filter((r) => r.type === "agent_start" || r.type === "agent_settled").at(-1);
-		return last?.type === "agent_start";
-	}));
+	// No runaway: a message may legitimately wake its recipient for a turn or two, but the pair
+	// must go quiet (both idle for 5 s) within 2 minutes, without a long chain of wake-ups.
+	const startsBefore = [a, b].map((p) => p.records.filter((r) => r.type === "agent_start").length);
+	const quiet = await quiesce([a, b], 120_000, 5_000);
+	const extraRuns = [a, b].map((p, i) => p.records.filter((r) => r.type === "agent_start").length - startsBefore[i]);
+	check(
+		`the agents go quiet on their own (no runaway ping-pong; extra turns after the scenario: ${extraRuns.join(" + ")})`,
+		quiet && extraRuns[0] + extraRuns[1] <= 4,
+	);
 } catch (error) {
 	console.error(error);
 	failures++;

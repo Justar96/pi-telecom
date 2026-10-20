@@ -35,7 +35,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CALLSIGN_PATTERN } from "./callsign.ts";
 import { ENV } from "./config.ts";
-import { messageOf } from "./util.ts";
+import { messageOf, shortId } from "./util.ts";
 
 export const WIRE_VERSION = 1;
 /** Largest envelope text, in UTF-8 bytes. */
@@ -45,6 +45,10 @@ export const ENVELOPE_CAP = 64 * 1024;
 /** Most envelopes handled per drain; the rest wait for the next tick, so a flood cannot stall. */
 export const DRAIN_BATCH = 64;
 const ID_PATTERN = /^[A-Za-z0-9._-]{1,128}$/;
+/** An unparseable presence file younger than this may be mid-rename; the sweep leaves it alone. */
+const UNPARSEABLE_GRACE_MS = 5_000;
+/** An inbox without a presence record is kept this long, so a starting session can publish first. */
+const ORPHAN_INBOX_GRACE_MS = 60_000;
 
 export type Result<T> = ({ ok: true } & T) | { ok: false; reason: string };
 
@@ -215,12 +219,33 @@ function num(value: unknown): value is number {
  * clipped, and lists are capped. A malformed or oversized record cannot inject text or bloat a
  * prompt; it is trimmed or skipped.
  */
-const LIMITS = { name: 60, task: 200, note: 160, model: 80, branch: 100, path: 4096, claims: 32, recent: 24 } as const;
+const LIMITS = {
+	name: 60,
+	task: 200,
+	note: 160,
+	model: 80,
+	branch: 100,
+	path: 4096,
+	claims: 32,
+	recent: 24,
+	summary: 120,
+	excerptLines: 4,
+	excerptLine: 100,
+} as const;
+
+const CONTROL_CHARS = /[\u0000-\u001f\u007f\u2028\u2029]/;
+const CONTROL_RUNS = new RegExp(`${CONTROL_CHARS.source}+`, "g");
+
+/** A path as a peer may send it: bounded, and without control characters that could break out
+ *  of the line it is shown on. Paths are compared as keys, so they are refused, never rewritten. */
+function isPath(value: unknown): value is string {
+	return str(value) && value.length <= LIMITS.path && !CONTROL_CHARS.test(value);
+}
 
 /** One line, at most `max` characters. */
 function line(value: unknown, max: number): string | undefined {
 	if (typeof value !== "string") return undefined;
-	const flat = value.replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, " ").replace(/\s+/g, " ").trim();
+	const flat = value.replace(CONTROL_RUNS, " ").replace(/\s+/g, " ").trim();
 	if (!flat) return undefined;
 	return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`;
 }
@@ -243,7 +268,7 @@ function parseRecent(value: unknown): RecentFile[] {
 	const out: RecentFile[] = [];
 	for (const raw of value.slice(0, LIMITS.recent)) {
 		const r = raw as Partial<RecentFile> | null;
-		if (!r || !str(r.path) || r.path.length > LIMITS.path || !num(r.at) || (r.op !== "edit" && r.op !== "write")) {
+		if (!r || !isPath(r.path) || !num(r.at) || (r.op !== "edit" && r.op !== "write")) {
 			continue;
 		}
 		out.push({ path: r.path, op: r.op, at: r.at });
@@ -294,7 +319,7 @@ export function parseEnvelope(value: unknown): Envelope | null {
 	if (r.kind === "answer" && !isId(r.answerTo)) return null;
 	if (r.kind === "event" && !(typeof r.topic === "string" && /^[a-z][a-z0-9._-]{0,63}$/.test(r.topic))) return null;
 	const fromCallsign =
-		typeof r.fromCallsign === "string" && CALLSIGN_PATTERN.test(r.fromCallsign) ? r.fromCallsign : r.from.slice(0, 8);
+		typeof r.fromCallsign === "string" && CALLSIGN_PATTERN.test(r.fromCallsign) ? r.fromCallsign : shortId(r.from);
 	return {
 		v: WIRE_VERSION,
 		id: r.id,
@@ -309,6 +334,91 @@ export function parseEnvelope(value: unknown): Envelope | null {
 		...(r.data !== undefined ? { data: r.data } : {}),
 		...(r.human === true ? { human: true } : {}),
 	};
+}
+
+// ---------------------------------------------------------------------------------------------
+// events
+
+/** `file.changed`: a peer edited or rewrote a file. */
+export interface FileChangedData {
+	/** Canonical absolute path. */
+	path: string;
+	op: "edit" | "write";
+	summary?: string;
+	/** A few changed lines from the patch. */
+	excerpt?: string[];
+	created?: boolean;
+}
+
+/** `claim.contested`: a peer was held back by one of this agent's claims. */
+export interface ClaimContestedData {
+	path: string;
+	pattern: string;
+}
+
+/** `claim.released`: a peer released claims this agent had been held back by. */
+export interface ClaimReleasedData {
+	patterns: string[];
+}
+
+/** `ask.withdrawn`: a peer stopped waiting for an answer to one of its asks. */
+export interface AskWithdrawnData {
+	askId: string;
+}
+
+export type TelecomEvent =
+	| { topic: "file.changed"; data: FileChangedData }
+	| { topic: "claim.contested"; data: ClaimContestedData }
+	| { topic: "claim.released"; data: ClaimReleasedData }
+	| { topic: "ask.withdrawn"; data: AskWithdrawnData };
+
+/**
+ * The typed payload of an `event` envelope, validated and bounded like a presence record, since
+ * its fields end up in this agent's model context. `null` for a malformed payload or a topic this
+ * version does not know (a newer peer's event is ignored, not an error).
+ */
+export function parseEvent(envelope: Envelope): TelecomEvent | null {
+	if (envelope.kind !== "event" || typeof envelope.data !== "object" || envelope.data === null) return null;
+	const d = envelope.data as Record<string, unknown>;
+	switch (envelope.topic) {
+		case "file.changed": {
+			if (!isPath(d.path) || (d.op !== "edit" && d.op !== "write")) return null;
+			const summary = line(d.summary, LIMITS.summary);
+			const excerpt = Array.isArray(d.excerpt)
+				? d.excerpt
+						.slice(0, LIMITS.excerptLines)
+						.map((l) => line(l, LIMITS.excerptLine))
+						.filter((l): l is string => l !== undefined)
+				: [];
+			return {
+				topic: "file.changed",
+				data: {
+					path: d.path,
+					op: d.op,
+					...(summary ? { summary } : {}),
+					...(excerpt.length > 0 ? { excerpt } : {}),
+					...(d.created === true ? { created: true } : {}),
+				},
+			};
+		}
+		case "claim.contested": {
+			const pattern = line(d.pattern, LIMITS.path);
+			if (!isPath(d.path) || !pattern) return null;
+			return { topic: "claim.contested", data: { path: d.path, pattern } };
+		}
+		case "claim.released": {
+			if (!Array.isArray(d.patterns)) return null;
+			const patterns = d.patterns
+				.slice(0, LIMITS.claims)
+				.map((p) => line(p, LIMITS.path))
+				.filter((p): p is string => p !== undefined);
+			return { topic: "claim.released", data: { patterns } };
+		}
+		case "ask.withdrawn":
+			return isId(d.askId) ? { topic: "ask.withdrawn", data: { askId: d.askId } } : null;
+		default:
+			return null;
+	}
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -416,7 +526,7 @@ export function openTransport(root: string): Transport {
 				// unparseable for more than a moment, or whose process is provably gone.
 				if (!record) {
 					try {
-						if (Date.now() - lstatSync(path).mtimeMs < 5_000) continue;
+						if (Date.now() - lstatSync(path).mtimeMs < UNPARSEABLE_GRACE_MS) continue;
 					} catch {
 						continue;
 					}
@@ -442,7 +552,7 @@ export function openTransport(root: string): Transport {
 			for (const id of inboxes) {
 				if (present.has(id) || !isId(id)) continue;
 				try {
-					if (Date.now() - lstatSync(join(inboxRoot, id)).mtimeMs < 60_000) continue;
+					if (Date.now() - lstatSync(join(inboxRoot, id)).mtimeMs < ORPHAN_INBOX_GRACE_MS) continue;
 					rmSync(join(inboxRoot, id), { recursive: true, force: true });
 				} catch {
 					/* raced with another sweeper */
