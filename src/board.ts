@@ -2,6 +2,7 @@
  * board — the team as text: for the `telecom` tool, the `/telecom` command, and the brief the
  * model is handed when a new prompt starts.
  */
+import { UNRESPONSIVE_MS } from "./awareness.ts";
 import { displayPath } from "./project.ts";
 import type { Presence } from "./transport.ts";
 import { ago, clip, plural } from "./util.ts";
@@ -25,7 +26,11 @@ export function describePeer(peer: Presence, root: string, opts: { self?: boolea
 	const where = peer.projectRoot === root ? "" : `  in ${peer.projectRoot}`;
 	const branch = peer.branch ? ` on ${peer.branch}` : "";
 	const you = opts.self ? " — you" : "";
-	lines.push(`• ${label(peer)} [${peer.state}]${branch}${where}${you}  id ${peer.id.slice(0, 8)}`);
+	const state =
+		!opts.self && now - peer.heartbeatAt > UNRESPONSIVE_MS
+			? `unresponsive, last seen ${ago(peer.heartbeatAt, now)}`
+			: peer.state;
+	lines.push(`• ${label(peer)} [${state}]${branch}${where}${you}  id ${peer.id.slice(0, 8)}`);
 	if (peer.task) lines.push(`    task: ${clip(peer.task, 140)}${peer.taskAt ? ` (${ago(peer.taskAt, now)})` : ""}`);
 	const claims = liveClaims(peer, now);
 	if (claims.length > 0) {
@@ -78,30 +83,80 @@ export function renderBoard(input: BoardInput): string {
 	return lines.join("\n");
 }
 
+/** What a brief is about: membership, callsigns, tasks and claims — not every file touched
+ *  (relevant file changes reach the agent as change notices instead). */
+export interface BriefState {
+	peers: Map<string, { callsign: string; task: string; claims: string[] }>;
+	fullAt: number;
+}
+
+/** A full brief is repeated at most this often; in between, only what changed is sent. */
+const FULL_BRIEF_EVERY_MS = 30 * 60_000;
+
+function stateOf(team: readonly Presence[], now: number): BriefState["peers"] {
+	return new Map(
+		team.map((p) => [
+			p.id,
+			{ callsign: p.callsign, task: p.task ?? "", claims: liveClaims(p, now).map((c) => c.pattern).sort() },
+		]),
+	);
+}
+
 /**
- * The brief a new prompt starts with: only same-project peers, compact, and only when something
- * changed since the last brief (the caller compares `signature`).
+ * The brief a new prompt starts with. The first one (and one every half hour) describes the whole
+ * team; after that only the changes are sent — who joined or left, new tasks, new or released
+ * claims — and nothing at all when nothing changed. Returns the text to send (or null) and the
+ * state to compare the next brief against.
  */
-export function renderBrief(self: Presence, peers: readonly Presence[]): { text: string; signature: string } | null {
+export function renderBrief(
+	self: Presence,
+	peers: readonly Presence[],
+	previous: BriefState | null,
+): { text: string | null; summary: string; state: BriefState } {
 	const root = self.projectRoot;
 	const now = Date.now();
 	const team = peers.filter((p) => p.id !== self.id && p.projectRoot === root);
-	if (team.length === 0) return null;
-	const signature = JSON.stringify(
-		team.map((p) => [
-			p.id,
-			p.callsign,
-			p.task ?? "",
-			liveClaims(p, now).map((c) => c.pattern),
-			p.recent.slice(0, RECENT_SHOWN).map((r) => r.path),
-		]),
-	);
-	const lines = [
-		`📡 Telecom — you are "${self.callsign}". ${plural(team.length, "other agent")} ${team.length === 1 ? "is" : "are"} working in this project right now:`,
-	];
-	for (const peer of team) lines.push(...describePeer(peer, root, { now }));
-	lines.push(
-		"Stay out of their claimed paths, re-read files they changed before editing, and use the telecom tool to coordinate when your work overlaps theirs.",
-	);
-	return { text: lines.join("\n"), signature };
+	const current = stateOf(team, now);
+	const summary = team
+		.map((p) => `${p.callsign} (${p.state}${p.task ? `: ${clip(p.task, 40)}` : ""})`)
+		.join(" · ");
+	if (!previous && team.length === 0) return { text: null, summary, state: { peers: current, fullAt: 0 } };
+	if (!previous || (team.length > 0 && now - previous.fullAt > FULL_BRIEF_EVERY_MS)) {
+		const state = { peers: current, fullAt: now };
+		const lines = [
+			`📡 Telecom — you are "${self.callsign}". ${plural(team.length, "other agent")} ${team.length === 1 ? "is" : "are"} working in this project right now:`,
+		];
+		for (const peer of team) lines.push(...describePeer(peer, root, { now }));
+		lines.push(
+			"Stay out of their claimed paths, re-read files they changed before editing, and use the telecom tool to coordinate when your work overlaps theirs.",
+		);
+		return { text: lines.join("\n"), summary, state };
+	}
+	const changes: string[] = [];
+	for (const peer of team) {
+		const before = previous.peers.get(peer.id);
+		const now_ = current.get(peer.id);
+		if (!now_) continue;
+		if (!before) {
+			changes.push(...describePeer(peer, root, { now }).map((l, i) => (i === 0 ? l.replace(/^• /, "• joined: ") : l)));
+			continue;
+		}
+		const name = before.callsign !== now_.callsign ? `${before.callsign} (now ${now_.callsign})` : now_.callsign;
+		if (before.callsign !== now_.callsign) changes.push(`• ${before.callsign} is now called ${now_.callsign}`);
+		if (before.task !== now_.task && now_.task) changes.push(`• ${name} is now on: ${clip(now_.task, 140)}`);
+		const added = now_.claims.filter((c) => !before.claims.includes(c));
+		const dropped = before.claims.filter((c) => !now_.claims.includes(c));
+		if (added.length) changes.push(`• ${name} claimed ${added.join(", ")}`);
+		if (dropped.length) changes.push(`• ${name} released ${dropped.join(", ")}`);
+	}
+	for (const [id, before] of previous.peers) {
+		if (!current.has(id)) changes.push(`• ${before.callsign} left${before.claims.length ? ` (its claims ${before.claims.join(", ")} are free)` : ""}`);
+	}
+	const state = { peers: current, fullAt: previous.fullAt };
+	if (changes.length === 0) return { text: null, summary, state };
+	const head =
+		team.length === 0
+			? `📡 Telecom — team update: you ("${self.callsign}") are now the only agent in this project.`
+			: `📡 Telecom — team update (you are "${self.callsign}"):`;
+	return { text: [head, ...changes].join("\n"), summary, state };
 }

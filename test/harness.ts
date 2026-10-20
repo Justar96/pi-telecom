@@ -118,13 +118,13 @@ export class Session {
 		return result;
 	}
 
-	async start(): Promise<this> {
-		await this.fire("session_start", { reason: "startup" });
+	async start(reason: "startup" | "reload" | "resume" = "startup"): Promise<this> {
+		await this.fire("session_start", { reason });
 		return this;
 	}
 
-	async stop(): Promise<void> {
-		await this.fire("session_shutdown", { reason: "quit" });
+	async stop(reason: "quit" | "reload" | "new" = "quit"): Promise<void> {
+		await this.fire("session_shutdown", { reason });
 	}
 
 	async tool(params: Record<string, unknown>, signal?: AbortSignal): Promise<{ text: string; details: any; isError: boolean }> {

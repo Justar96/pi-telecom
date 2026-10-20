@@ -25,9 +25,11 @@ changed, and agents can message each other directly.
 ## Install
 
 ```bash
-pi install /path/to/pi-extension-telecom     # local checkout, loaded in place
-# or try it for one session:
-pi -e /path/to/pi-extension-telecom/src/index.ts
+pi install npm:@justar96/pi-telecom
+# or from GitHub:
+pi install git:github.com/Justar96/pi-telecom
+# or try it in one session without installing:
+pi -e ./pi-telecom/src/index.ts
 ```
 
 Start two or more pi sessions in the same repository and they find each other. You don't need to
@@ -39,8 +41,8 @@ configure anything, and there is no daemon or port. It runs on Linux and macOS w
 |---|---|
 | **Callsign** | `alpha`, `bravo`, … (the first free NATO word in the project), shown in the footer: `📡 bravo · 2 peers (1 busy) · 1 claim`. It survives a resume. Change it with `/telecom name ops`. |
 | **Presence** | Busy or idle, current task (the first line of the latest prompt, or one the agent sets), git branch, claims, and recently changed files. Peers read it from the board. |
-| **Team brief** | When a prompt starts and the team has changed since the last brief, the model gets a short summary of who is working, on what, their claims, and what they changed recently. If nothing changed, it gets nothing (so solo work costs no tokens). |
-| **Change notices** | When a peer edits a file this agent **read or edited**, or a file inside this agent's **claim**, a notice arrives with a few changed lines. Edits that happen close together are combined into one notice, and a file triggers only one notice until the agent reads it again. If the agent is running, the notice goes in before its next step. If it is idle, the notice waits for the next prompt. Notices never start a turn. |
+| **Team brief** | When the first prompt starts with peers present, the model gets the whole team: who is working, on what, their claims, and their recent changes. After that, briefs list only what changed (who joined or left, new tasks, new or released claims); a peer editing files is not team news. If nothing changed, nothing is sent, so solo work costs no tokens. A full brief comes again after a compaction or every 30 minutes. |
+| **Change notices** | When a peer edits a file this agent **read (in the last hour) or edited**, or a file inside this agent's **claim**, a notice arrives with a few changed lines. Edits that happen close together are combined into one notice, and a file triggers only one notice until the agent reads it again. Files read before a compaction don't produce notices, since their content is no longer in context. If the agent is running, the notice goes in before its next step. If it is idle, the notice waits for the next prompt. Notices never start a turn. |
 | **Edit guard** | Stops an agent from overwriting a peer's work that it hasn't seen (see below). |
 | **Claims** | Reserve an area (`src/auth/**`) before a large change. Peers who try to edit there are held back once, and you are told. Overlapping claims are refused. A claim ends when you release it, when your session ends, or after 2 h without activity inside it. |
 | **Messaging** | `send`, `ask` (waits for the answer), `reply`, `broadcast`, from the model or from the human. |
@@ -55,7 +57,9 @@ does without telecom.
 |---|---|---|---|
 | `write` over a peer's change you haven't read | **blocked**: re-read, then re-apply | blocked | allowed |
 | `edit` over a peer's change you haven't read | allowed, with a ⚠ note in the result | blocked | allowed |
+| `write` after you edited over a peer's change without reading it | **blocked**: re-read first | blocked | allowed |
 | editing inside a peer's claim | blocked once, the owner is told; a deliberate retry goes through | always blocked | allowed |
+| editing inside a claim whose owner is unresponsive (no check-in for 45 s) | allowed, with a ⚠ note | allowed, with a ⚠ note | allowed |
 
 Every block explains what happened and what to do next, for example:
 `telecom: bravo edited shared.txt 11s ago (1 edit from line 1), after you last read it. Re-read
@@ -72,8 +76,10 @@ The guard blocks the same change at most twice, so an agent can never get stuck 
   forever: each side gets the other's question at once.
 - If the asker presses Esc, the question is withdrawn from the other agent. If the asked agent's
   session ends, the asker's call fails right away.
-- Peer messages can start at most 6 turns per minute (`PI_TELECOM_MAX_WAKES`). Messages beyond
-  that still arrive, but without starting a turn.
+- Peer messages can start at most 6 turns per minute (`PI_TELECOM_MAX_WAKES`, where `0` means
+  never; asks still wake). Messages beyond that still arrive, but without starting a turn.
+- A peer that hasn't checked in for 45 s (suspended or hung) is shown as `unresponsive` on the
+  board. Messages to it wait in its inbox, and its claims stop blocking anyone.
 
 ## The `telecom` tool (for the model)
 
@@ -109,10 +115,46 @@ All configuration is through environment variables, so you can set them per term
 | `PI_TELECOM_GUARD` | `standard` | `strict`, `standard` or `off` (see the guard table) |
 | `PI_TELECOM_CALLSIGN` | next free | a fixed callsign for this session |
 | `PI_TELECOM_ASK_TIMEOUT_MS` | `300000` | default wait for `ask` (at most 1 h) |
-| `PI_TELECOM_MAX_WAKES` | `6` | peer messages per minute that may start a turn |
+| `PI_TELECOM_MAX_WAKES` | `6` | peer messages per minute that may start a turn (`0` = never; asks still do) |
 | `PI_TELECOM_CLAIM_TTL_MIN` | `120` | a claim with no activity inside it expires after this many minutes |
 | `PI_TELECOM_DIR` | see below | where the switchboard lives |
 | `PI_TELECOM_DISABLE` | unset | `1` turns telecom off in this session |
+
+## Prompt cache
+
+Telecom never changes the system prompt or tools at runtime. Its tool and guidelines are fixed
+when it loads. Everything it sends is appended to the end of the conversation: the brief after
+the user prompt, notices before the agent's next step or at the end of the history. It never
+rewrites a message that has already been sent. `scripts/e2e-cache.mjs` measures this with a
+real model. A probe extension hashes every provider request while a peer hits the agent with a
+change notice, a broadcast, a team brief, and a message steered into the middle of a run. Then
+the same prompts run again without telecom. Results on Claude Sonnet 5.5:
+
+| | requests | system / tools changed | message prefix rewritten | cache hit rate |
+|---|---|---|---|---|
+| with telecom | 7 | never | never (every request a pure append) | **84.4 %** |
+| without telecom | 7 | never | never | **84.4 %** |
+
+The fixed cost is about 900 prompt tokens for the tool definition and guidelines, cached after
+the first request.
+
+## Durability
+
+- **Messages are acknowledged only after they are handled.** An inbox file is removed after
+  its message reaches the session. A crash in between redelivers the message instead of losing
+  it, and a duplicate delivery is recognized by id and handled once. A message that makes its
+  handler throw is reported and removed, so it can't block the inbox.
+- **`/reload` doesn't drop the line.** Peers keep seeing the agent during a reload, messages
+  sent meanwhile wait in its inbox, and the new runtime takes over the callsign, claims, task and
+  any unanswered asks. The asker can still get its answer.
+- **The same session open twice** (`pi -c` in two terminals) is detected. The process that
+  opened it later steps back (`📡 off (session open elsewhere)`) instead of both fighting over
+  one record and one inbox.
+- **Self-healing presence.** If a session's record disappears (a race with a cleanup, or a wiped
+  runtime directory), the session rewrites it within a second.
+- **Bounded input from peers.** A peer's record ends up in other models' context, so callsigns
+  must look like callsigns, free text is flattened to one line and clipped, and lists and
+  envelope sizes are capped (32 KB of text, 64 KB per envelope, 64 envelopes per drain).
 
 ## How it works
 
@@ -145,13 +187,16 @@ All configuration is through environment variables, so you can set them per term
 ```bash
 npm install
 npm run typecheck          # tsc, strict, erasable-syntax only
-npm test                   # 26 unit and multi-session scenario tests (node:test)
-node scripts/e2e-rpc.mjs   # two real pi processes over RPC, no model calls
-# live: two real agents driven by a real model (spends a few short turns)
-TELECOM_LIVE_MODEL=anthropic/claude-haiku-4-5 node scripts/e2e-live.mjs
+npm test                   # 36 unit and multi-session scenario tests (node:test)
+npm run e2e                # real pi processes over RPC, no model calls: discovery, broadcast,
+                           # rename, a real /reload, one session opened in two processes, exit
+# with a real model (spends a few short turns each):
+TELECOM_LIVE_MODEL=anthropic/claude-sonnet-4-5 npm run e2e:live   # notice → guard → re-read,
+                           # ask → wake → reply, claim → held back → owner asked
+TELECOM_LIVE_MODEL=anthropic/claude-sonnet-4-5 npm run e2e:cache  # the prompt-cache proof above
 ```
 
-The live script loads only this extension. If your model's provider is itself an extension, pass
+The live scripts load only this extension. If your model's provider is itself an extension, pass
 it with `TELECOM_LIVE_EXTENSIONS=/path/to/provider/index.ts`.
 
 | file | |

@@ -26,6 +26,7 @@ function check(name, ok, detail = "") {
 	if (!ok) failures++;
 }
 
+const extra = [];
 const a = startPi("agent-a", { cwd: project, env });
 const b = startPi("agent-b", { cwd: project, env });
 try {
@@ -62,13 +63,40 @@ try {
 	const board2 = await a.waitFor((r) => isNotify(/You are /)(r) && r !== board && /• ops/.test(r.message), 10_000).catch(() => null);
 	check("a rename is visible to the peer", Boolean(board2), a.notifies().slice(-1)[0]);
 
-	// 5. B leaves; A's board empties
+	// 5. a real /reload in B: A keeps seeing B, a message sent during the reload is not lost
+	const statusCount = b.records.filter(isStatus(/📡/)).length;
+	const reloadId = b.send({ type: "prompt", message: "/reload" });
+	await a.command("/telecom broadcast sent while you reload");
+	await b.waitFor((r) => r.type === "response" && r.id === reloadId, 20_000).catch(() => null);
+	await b.waitFor((r) => isStatus(/📡/)(r) && b.records.filter(isStatus(/📡/)).indexOf(r) >= statusCount, 20_000).catch(() => null);
+	const afterReload = await b
+		.waitFor((r) => r.type === "message_end" && r.message?.customType === "telecom-broadcast" && /while you reload/.test(JSON.stringify(r.message.content)), 15_000)
+		.catch(() => null);
+	check("a message sent during a real /reload still arrives", Boolean(afterReload));
+	await b.command("/telecom");
+	const boardB = await b.waitFor((r) => isNotify(/You are ops/)(r), 10_000).catch(() => null);
+	check("the callsign survives /reload", Boolean(boardB), b.notifies().slice(-1)[0]);
+
+	// 6. B leaves; A's board empties
 	b.child.stdin.end();
 	await new Promise((r) => b.child.once("exit", r));
 	await a.waitFor(isStatus(/solo/), 10_000).catch(() => {});
 	await a.command("/telecom");
 	const board3 = await a.waitFor(isNotify(/No other agent is live/), 10_000).catch(() => null);
 	check("a peer that exits disappears from the board", Boolean(board3), a.notifies().slice(-1)[0]);
+
+	// 7. the same session opened in two pi processes: the younger steps back
+	const sessionDir = join(scratch, "sessions");
+	const sid = "11111111-2222-4333-8444-555555555555";
+	const s1 = startPi("dup-1", { cwd: project, env, session: ["--session-dir", sessionDir, "--session-id", sid] });
+	await s1.waitFor(isStatus(/📡/), 30_000);
+	const s2 = startPi("dup-2", { cwd: project, env, session: ["--session-dir", sessionDir, "--session-id", sid] });
+	extra.push(s1, s2);
+	const backedOff = await s2.waitFor(isStatus(/off \(session open elsewhere\)/), 15_000).catch(() => null);
+	check("the second process of one session backs off", Boolean(backedOff), JSON.stringify(s2.records.filter(isStatus(/./)).map((r) => r.statusText)));
+	await a.command("/telecom");
+	const boardDup = await a.waitFor((r) => isNotify(/You are /)(r) && /1 other agent live/.test(r.message) && /dup-1/.test(r.message), 10_000).catch(() => null);
+	check("peers see that session exactly once", Boolean(boardDup), a.notifies().slice(-1)[0]);
 } catch (error) {
 	if (error.message !== "setup") {
 		console.error(error);
@@ -77,7 +105,7 @@ try {
 		failures = failures || 2;
 	}
 } finally {
-	for (const p of [a, b]) {
+	for (const p of [a, b, ...extra]) {
 		try {
 			p.child.stdin.end();
 			p.child.kill("SIGTERM");

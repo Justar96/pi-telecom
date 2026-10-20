@@ -1,8 +1,17 @@
 {
-	"name": "pi-telecom",
+	"name": "@justar96/pi-telecom",
 	"version": "0.1.0",
 	"description": "Telecom for pi: parallel pi agents in the same project see each other, talk, claim work, and get told when a peer changes a file they depend on.",
 	"license": "MIT",
+	"author": "Justar96",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/Justar96/pi-telecom.git"
+	},
+	"homepage": "https://github.com/Justar96/pi-telecom#readme",
+	"bugs": {
+		"url": "https://github.com/Justar96/pi-telecom/issues"
+	},
 	"type": "module",
 	"main": "src/index.ts",
 	"keywords": [
@@ -30,7 +39,9 @@
 		"test": "node --experimental-strip-types --no-warnings --test test/*.test.ts",
 		"e2e": "node scripts/e2e-rpc.mjs",
 		"e2e:live": "node scripts/e2e-live.mjs",
-		"check": "npm run typecheck && npm test && npm run e2e"
+		"e2e:cache": "node scripts/e2e-cache.mjs",
+		"check": "npm run typecheck && npm test && npm run e2e",
+		"prepublishOnly": "npm run typecheck && npm test"
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-coding-agent": "*",
@@ -43,8 +54,7 @@
 		"typebox": "^1.1.38",
 		"typescript": "^5.9.3"
 	},
-	"repository": {
-		"type": "git",
-		"url": "git+https://github.com/Justar96/pi-extension-telecom.git"
+	"publishConfig": {
+		"access": "public"
 	}
 }

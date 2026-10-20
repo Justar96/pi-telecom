@@ -32,8 +32,8 @@ import type {
 import { statSync } from "node:fs";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { Awareness, type PeerChange, type Verdict } from "./awareness.ts";
-import { renderBoard, renderBrief } from "./board.ts";
+import { Awareness, type PeerChange, UNRESPONSIVE_MS, type Verdict } from "./awareness.ts";
+import { type BriefState, renderBoard, renderBrief } from "./board.ts";
 import { CALLSIGN_PATTERN, mustYield, NATO, pickCallsign } from "./callsign.ts";
 import { MAX_ASK_TIMEOUT_MS, readConfig, type TelecomConfig } from "./config.ts";
 import { absolutePattern, claimsOverlap, matchesClaim } from "./glob.ts";
@@ -41,6 +41,7 @@ import { type AskOutcome, createAskLedger, type InboundAsk } from "./ledger.ts";
 import { canonicalPath, displayPath, findProjectRoot, readBranch } from "./project.ts";
 import { MESSAGE_TYPES, registerRenderers, type TelecomMessageDetails } from "./render.ts";
 import {
+	type Claim,
 	type Envelope,
 	openTransport,
 	type Presence,
@@ -58,6 +59,36 @@ const TICK_MS_DEFAULT = 500;
 const NOTICE_COALESCE_MS = 1_200;
 const HEARTBEAT_MS = 15_000;
 const MIN_ID_PREFIX = 4;
+/** Per-call bookkeeping kept between tool_call and tool_result; bounded in case a result never comes. */
+const CALL_MAP_CAP = 256;
+/** Envelope ids already handled, so an at-least-once redelivery is not handled twice. */
+const SEEN_CAP = 2_048;
+/** A reload handoff older than this belongs to a runtime that did not come back. */
+const HANDOFF_MAX_AGE_MS = 5 * 60_000;
+
+/** What a runtime parks for its replacement on `/reload`. */
+interface Handoff {
+	pid: number;
+	at: number;
+	callsign: string;
+	startedAt: number;
+	claims: Claim[];
+	task?: string;
+	taskAt?: number;
+	inboundAsks: Array<{ id: string; from: string; fromCallsign: string; text: string; at: number }>;
+	contesters: Array<[string, Array<[string, string]>]>;
+}
+
+/** Remember `key` in an insertion-ordered map, evicting the oldest entries past `cap`. */
+function remember<K, V>(map: Map<K, V>, key: K, value: V, cap = CALL_MAP_CAP): void {
+	map.delete(key);
+	map.set(key, value);
+	while (map.size > cap) {
+		const oldest = map.keys().next().value;
+		if (oldest === undefined) break;
+		map.delete(oldest);
+	}
+}
 
 type ToolResult = {
 	content: Array<{ type: "text"; text: string }>;
@@ -100,7 +131,7 @@ export default function telecom(pi: ExtensionAPI): void {
 	let lastHeartbeat = 0;
 	let peersCache: Presence[] = [];
 	let teamIds = new Set<string>();
-	let lastBriefSignature = "";
+	let briefState: BriefState | null = null;
 	let widgetOn = false;
 	let unavailable: string | null = null;
 
@@ -113,8 +144,11 @@ export default function telecom(pi: ExtensionAPI): void {
 	const callNotes = new Map<string, string>();
 	/** Whether a written path existed before the write, by tool call id. */
 	const existedBefore = new Map<string, boolean>();
+	/** The peer change a warned (stale) edit was applied over, by tool call id. */
+	const staleOver = new Map<string, PeerChange>();
 	/** Who was held back by each of our claims, so a release can tell them. */
 	const contesters = new Map<string, Map<string, string>>();
+	const seen = new Map<string, true>();
 
 	registerRenderers(pi);
 
@@ -182,7 +216,9 @@ export default function telecom(pi: ExtensionAPI): void {
 		const wake = mode === "wake-always" || (mode === "wake" && allowWake());
 		const note =
 			mode === "wake" && !wake
-				? `\n\n(telecom: more than ${cfg.maxWakesPerMinute} peer messages woke you in the last minute, so this one arrived without starting a turn.)`
+				? cfg.maxWakesPerMinute === 0
+					? "\n\n(telecom: peer wake-ups are off in this session (PI_TELECOM_MAX_WAKES=0), so this arrived without starting a turn.)"
+					: `\n\n(telecom: more than ${cfg.maxWakesPerMinute} peer messages woke you in the last minute, so this one arrived without starting a turn.)`
 				: "";
 		try {
 			pi.sendMessage(
@@ -276,6 +312,9 @@ export default function telecom(pi: ExtensionAPI): void {
 	}
 
 	function stateHint(peer: Presence): string {
+		if (Date.now() - peer.heartbeatAt > UNRESPONSIVE_MS) {
+			return `unresponsive since ${ago(peer.heartbeatAt)} — it waits in their inbox until they are back`;
+		}
 		return peer.state === "busy" ? "busy — it reaches them before their next step" : "idle — this wakes them";
 	}
 
@@ -442,17 +481,16 @@ export default function telecom(pi: ExtensionAPI): void {
 		if (!transport || !self) return;
 		tickCount++;
 		try {
-			const drained = transport.drain(self.id);
-			for (const env of drained.envelopes) {
-				try {
-					handleEnvelope(env);
-				} catch (error) {
-					report("inbound", error);
-				}
-			}
+			const drained = transport.drain(self.id, (env) => {
+				if (seen.has(env.id)) return;
+				remember(seen, env.id, true, SEEN_CAP);
+				handleEnvelope(env);
+			});
+			for (const failure of drained.failed) report("inbound", failure);
 		} catch (error) {
 			report("drain", error);
 		}
+		if (!self) return; // handling may have backed this session off
 		if (tickCount % 2 === 0) refreshTeam();
 		flushNotices();
 		ledger.expire(Date.now());
@@ -462,6 +500,21 @@ export default function telecom(pi: ExtensionAPI): void {
 	function refreshTeam(): void {
 		if (!self) return;
 		const peers = readPeers();
+		const mine = peers.find((p) => p.id === self?.id);
+		if (mine && mine.pid !== process.pid) {
+			// This same session is open in another live pi process (`pi -c` in two terminals). Two
+			// writers of one record and two readers of one inbox would garble both, so the younger
+			// process steps back and the older keeps the line.
+			const theirsOlder = mine.startedAt < self.startedAt || (mine.startedAt === self.startedAt && mine.pid < process.pid);
+			if (theirsOlder) {
+				backOff(`this session is also open in pi process ${mine.pid}, which keeps the telecom line`);
+				return;
+			}
+			publish();
+		} else if (!mine) {
+			// Our record vanished (a sweep raced a rewrite, or the runtime dir was cleaned): restore it.
+			publish();
+		}
 		const live = new Set(peers.map((p) => p.id));
 		ledger.failPeerGone((id) => !live.has(id));
 		const gone = new Set([...teamIds].filter((id) => !live.has(id)));
@@ -516,6 +569,45 @@ export default function telecom(pi: ExtensionAPI): void {
 		}
 	}
 
+	/** Leave the switchboard without touching the records, which belong to someone else now. */
+	function backOff(reason: string): void {
+		if (timer) clearInterval(timer);
+		timer = null;
+		self = null;
+		unavailable = reason;
+		try {
+			ctxRef?.ui.setStatus("telecom", "📡 off (session open elsewhere)");
+			ctxRef?.ui.notify(`📡 telecom: ${reason}`, "warning");
+		} catch {
+			/* no UI */
+		}
+	}
+
+	function parkForReload(): void {
+		if (!transport || !self) return;
+		const state: Handoff = {
+			pid: process.pid,
+			at: Date.now(),
+			callsign: self.callsign,
+			startedAt: self.startedAt,
+			claims: self.claims,
+			...(self.task ? { task: self.task } : {}),
+			...(self.taskAt ? { taskAt: self.taskAt } : {}),
+			inboundAsks: ledger.inbound().map(({ id, from, fromCallsign, text, at }) => ({ id, from, fromCallsign, text, at })),
+			contesters: [...contesters].map(([pattern, who]) => [pattern, [...who]]),
+		};
+		transport.writeHandoff(self.id, state);
+	}
+
+	function takeReloadHandoff(id: string): Handoff | null {
+		if (!transport) return null;
+		const raw = transport.takeHandoff(id) as Partial<Handoff> | null;
+		if (!raw || raw.pid !== process.pid || typeof raw.at !== "number" || Date.now() - raw.at > HANDOFF_MAX_AGE_MS) {
+			return null;
+		}
+		return raw as Handoff;
+	}
+
 	function persistCallsign(): void {
 		if (!self) return;
 		try {
@@ -527,9 +619,16 @@ export default function telecom(pi: ExtensionAPI): void {
 
 	// ------------------------------------------------------------------ session lifecycle
 
-	function stop(): void {
+	function stop(keepLine = false): void {
 		if (timer) clearInterval(timer);
 		timer = null;
+		if (keepLine) {
+			// A reload: the replacement runtime takes over this record and inbox within moments, so
+			// peers never see this agent leave and nothing sent meanwhile is lost.
+			parkForReload();
+			self = null;
+			return;
+		}
 		if (transport && self) {
 			try {
 				transport.removePresence(self.id);
@@ -574,7 +673,8 @@ export default function telecom(pi: ExtensionAPI): void {
 					if (typeof cs === "string" && CALLSIGN_PATTERN.test(cs)) remembered = cs;
 				}
 			}
-			const callsign = pickCallsign(taken, cfg.callsign ?? remembered);
+			const handoff = takeReloadHandoff(id);
+			const callsign = pickCallsign(taken, handoff?.callsign ?? cfg.callsign ?? remembered);
 			const now = Date.now();
 			const branch = readBranch(projectRoot);
 			self = {
@@ -587,16 +687,28 @@ export default function telecom(pi: ExtensionAPI): void {
 				projectRoot,
 				role: process.env.PI_SUBAGENT_CHILD === "1" ? "child" : "main",
 				state: "idle",
-				claims: [],
+				claims: handoff?.claims ?? [],
 				recent: [],
-				startedAt: now,
+				// A reloaded runtime keeps its seniority, so it never loses its callsign to a newcomer.
+				startedAt: handoff?.startedAt ?? now,
 				heartbeatAt: now,
 				...(branch ? { branch } : {}),
 				...(ctx.model?.id ? { model: ctx.model.id } : {}),
+				...(handoff?.task ? { task: handoff.task } : {}),
+				...(handoff?.taskAt ? { taskAt: handoff.taskAt } : {}),
 			};
+			for (const ask of handoff?.inboundAsks ?? []) ledger.noteInbound(ask);
+			for (const [pattern, who] of handoff?.contesters ?? []) contesters.set(pattern, new Map(who));
 			if (callsign !== remembered) persistCallsign();
 			publish();
 			peersCache = transport.readPeers();
+			// Two sessions starting in the same instant can both pick the same free word. Settle it
+			// now, before the first prompt, rather than on the first tick.
+			if (mustYield(self, peersCache)) {
+				self.callsign = pickCallsign(new Set(team().map((p) => p.callsign)));
+				persistCallsign();
+				publish();
+			}
 			teamIds = new Set(team().map((p) => p.id));
 			tickCount = 0;
 			const tickMs = Number(process.env.PI_TELECOM_TICK_MS) > 0 ? Number(process.env.PI_TELECOM_TICK_MS) : TICK_MS_DEFAULT;
@@ -608,8 +720,14 @@ export default function telecom(pi: ExtensionAPI): void {
 		}
 	});
 
-	pi.on("session_shutdown", () => {
-		stop();
+	pi.on("session_shutdown", (event) => {
+		stop(event?.reason === "reload");
+	});
+
+	pi.on("session_compact", () => {
+		awareness.markCompacted();
+		// The summary may have dropped the team picture: the next prompt gets a full brief.
+		if (briefState) briefState = { ...briefState, fullAt: 0 };
 	});
 
 	pi.on("session_info_changed", () => {
@@ -633,18 +751,15 @@ export default function telecom(pi: ExtensionAPI): void {
 			self.taskAt = Date.now();
 		}
 		publish();
-		const brief = renderBrief(self, readPeers());
-		if (!brief || brief.signature === lastBriefSignature) return;
-		lastBriefSignature = brief.signature;
-		const mates = team();
+		const brief = renderBrief(self, readPeers(), briefState);
+		briefState = brief.state;
+		if (!brief.text) return;
 		return {
 			message: {
 				customType: MESSAGE_TYPES.brief,
 				content: brief.text,
 				display: true,
-				details: {
-					summary: mates.map((p) => `${p.callsign} (${p.state}${p.task ? `: ${clip(p.task, 40)}` : ""})`).join(" · "),
-				} satisfies TelecomMessageDetails,
+				details: { summary: brief.summary } satisfies TelecomMessageDetails,
 			},
 		};
 	});
@@ -683,7 +798,8 @@ export default function telecom(pi: ExtensionAPI): void {
 		if (verdict.action === "block") return { block: true, reason: verdict.reason };
 		if (verdict.action === "warn") {
 			const prior = callNotes.get(toolCallId);
-			callNotes.set(toolCallId, prior ? `${prior}\n${verdict.note}` : verdict.note);
+			remember(callNotes, toolCallId, prior ? `${prior}\n${verdict.note}` : verdict.note);
+			if (verdict.staleChange) remember(staleOver, toolCallId, verdict.staleChange);
 		}
 		return undefined;
 	}
@@ -694,8 +810,14 @@ export default function telecom(pi: ExtensionAPI): void {
 		if (typeof raw !== "string" || !raw.trim()) return;
 		const path = canonicalPath(raw, ctx.cwd);
 		const peers = readPeers();
-		if (event.toolName === "write") existedBefore.set(event.toolCallId, awareness.hasView(path) || fileExists(path));
-		if (team(peers).length === 0 && !peers.some((p) => p.id !== self?.id && p.recent.some((r) => r.path === path))) {
+		if (event.toolName === "write") remember(existedBefore, event.toolCallId, awareness.hasView(path) || fileExists(path));
+		// Solo work pays nothing: with no teammate, no peer history for this path and no stale view
+		// of it, there is nothing to check.
+		if (
+			team(peers).length === 0 &&
+			!awareness.hasPeerContext(path) &&
+			!peers.some((p) => p.id !== self?.id && p.recent.some((r) => r.path === path))
+		) {
 			return;
 		}
 		const claim = awareness.checkClaims(path, cfg.guard, peers, self.id, root());
@@ -724,13 +846,15 @@ export default function telecom(pi: ExtensionAPI): void {
 		callNotes.delete(event.toolCallId);
 		const created = toolName === "write" ? existedBefore.get(event.toolCallId) === false : false;
 		existedBefore.delete(event.toolCallId);
+		const over = staleOver.get(event.toolCallId);
+		staleOver.delete(event.toolCallId);
 		if (typeof raw !== "string" || event.isError) return;
 		const path = canonicalPath(raw, ctx.cwd);
 		if (toolName === "read") {
 			awareness.noteRead(path);
 			return;
 		}
-		awareness.noteOwnWrite(path, toolName);
+		awareness.noteOwnWrite(path, toolName, over);
 		announceChange(path, toolName, event, created);
 		if (!note) return;
 		return {
@@ -758,23 +882,16 @@ export default function telecom(pi: ExtensionAPI): void {
 		name: TOOL,
 		label: "Telecom",
 		description: [
-			"Coordinate with the other pi agents working in parallel on this machine — by default those in this project. Each agent has a callsign (alpha, bravo, …).",
-			'"board": who is working here, on what, their claims and recently changed files. scope "machine" lists agents in every project.',
-			'"send": message one agent (`to` = callsign, name or id prefix). It reaches them at their next step, or wakes them when idle.',
-			'"ask": send a question and wait for the answer (blocks up to `timeoutSec`, default 300).',
-			'"reply": answer an inbound ask by its `askId` — the asker is blocked until you do.',
-			'"broadcast": tell every agent in the project something that affects them all (does not wake idle agents).',
-			'"status": set the one-line task peers see for you (`message`).',
-			'"claim": reserve `paths` (project-relative paths or globs; `message` = why) so peers stay out; peers editing there are held back once and you are told.',
-			'"release": give back `paths`, or every claim when omitted.',
+			"Coordinate with other pi agents working in parallel (this project by default). Agents have callsigns: alpha, bravo, ….",
+			"board: who works here, on what, their claims and recent changes (scope machine: all projects).",
+			"send: message an agent (to = callsign); wakes it if idle. ask: same, then wait for the answer. reply: answer an inbound ask (askId).",
+			"broadcast: tell the whole project (never wakes idle agents). status: set the task peers see (message).",
+			"claim: reserve paths/globs so peers stay out (message = why). release: give them back (all if paths omitted).",
 		].join("\n"),
 		promptSnippet: "Coordinate with parallel pi agents: team board, message/ask/reply, broadcast, claim paths",
 		promptGuidelines: [
-			"Other pi agents may work in this project at the same time. When they do, a 📡 Telecom brief names them, their tasks, claims and recent changes.",
-			"Before a large or multi-file change while peers are active, claim the area with telecom claim (and a reason); release it when done.",
-			"When a 📡 notice says a peer changed a file you are working with, re-read that file before editing it.",
-			"Answer a 📡 Ask promptly with telecom reply — the asker is blocked until you do.",
-			"Message peers for real coordination only (handoffs, requests, shared-interface changes); skip acknowledgements and small talk — each message costs the recipient a turn.",
+			"When 📡 telecom shows other agents in this project: claim an area before a large change and release it after; re-read a file a peer changed before editing it; reply to a peer's ask promptly (they are blocked).",
+			"Message peers only for real coordination (requests, handoffs, shared-interface changes) — no acknowledgements; each message costs the recipient a turn.",
 		],
 		parameters: Type.Object({
 			action: Type.Union(
@@ -790,18 +907,18 @@ export default function telecom(pi: ExtensionAPI): void {
 				],
 				{ description: "What to do." },
 			),
-			to: Type.Optional(Type.String({ description: "send/ask: the agent's callsign, session name, or an id prefix (4+ chars)." })),
+			to: Type.Optional(Type.String({ description: "send/ask: callsign, session name or id prefix." })),
 			message: Type.Optional(
-				Type.String({ description: "send/ask/reply/broadcast: the text. status: your task. claim: why you need the paths." }),
+				Type.String({ description: "The text; for status your task; for claim the reason." }),
 			),
-			askId: Type.Optional(Type.String({ description: "reply: the handle printed on the inbound ask." })),
+			askId: Type.Optional(Type.String({ description: "reply: the ask's handle (optional if only one is waiting)." })),
 			paths: Type.Optional(
-				Type.Array(Type.String(), { description: "claim/release: project-relative paths or globs (src/auth, src/**/*.test.ts)." }),
+				Type.Array(Type.String(), { description: "claim/release: project-relative paths or globs." }),
 			),
-			timeoutSec: Type.Optional(Type.Number({ description: "ask: how long to wait for the answer, in seconds (default 300)." })),
+			timeoutSec: Type.Optional(Type.Number({ description: "ask: seconds to wait (default 300)." })),
 			scope: Type.Optional(
 				Type.Union([Type.Literal("project"), Type.Literal("machine")], {
-					description: 'board/broadcast: "project" (default) or every agent on the "machine".',
+					description: 'board/broadcast: "project" (default) or "machine".',
 				}),
 			),
 		}),
@@ -1063,7 +1180,7 @@ export default function telecom(pi: ExtensionAPI): void {
 					me.callsign = wanted;
 					persistCallsign();
 					publish();
-					lastBriefSignature = "";
+					if (briefState) briefState = { ...briefState, fullAt: 0 };
 					updateStatus();
 					say(`you are now ${wanted}`);
 					return;

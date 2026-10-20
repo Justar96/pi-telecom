@@ -22,6 +22,7 @@
  */
 import {
 	lstatSync,
+	statSync,
 	mkdirSync,
 	readdirSync,
 	readFileSync,
@@ -32,12 +33,17 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { CALLSIGN_PATTERN } from "./callsign.ts";
 import { ENV } from "./config.ts";
 import { messageOf } from "./util.ts";
 
 export const WIRE_VERSION = 1;
 /** Largest envelope text, in UTF-8 bytes. */
 export const TEXT_CAP = 32 * 1024;
+/** Largest envelope file, everything included (text, structured data, headers). */
+export const ENVELOPE_CAP = 64 * 1024;
+/** Most envelopes handled per drain; the rest wait for the next tick, so a flood cannot stall. */
+export const DRAIN_BATCH = 64;
 const ID_PATTERN = /^[A-Za-z0-9._-]{1,128}$/;
 
 export type Result<T> = ({ ok: true } & T) | { ok: false; reason: string };
@@ -203,18 +209,31 @@ function num(value: unknown): value is number {
 	return typeof value === "number" && Number.isFinite(value);
 }
 
+/**
+ * Peer records are read by other agents and end up in their model context, so everything a peer
+ * controls is bounded here: a callsign must look like one, free text is flattened to one line and
+ * clipped, and lists are capped. A malformed or oversized record cannot inject text or bloat a
+ * prompt; it is trimmed or skipped.
+ */
+const LIMITS = { name: 60, task: 200, note: 160, model: 80, branch: 100, path: 4096, claims: 32, recent: 24 } as const;
+
+/** One line, at most `max` characters. */
+function line(value: unknown, max: number): string | undefined {
+	if (typeof value !== "string") return undefined;
+	const flat = value.replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, " ").replace(/\s+/g, " ").trim();
+	if (!flat) return undefined;
+	return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`;
+}
+
 function parseClaims(value: unknown): Claim[] {
 	if (!Array.isArray(value)) return [];
 	const out: Claim[] = [];
-	for (const raw of value) {
+	for (const raw of value.slice(0, LIMITS.claims)) {
 		const c = raw as Partial<Claim> | null;
-		if (!c || !str(c.pattern) || !num(c.since) || !num(c.expiresAt)) continue;
-		out.push({
-			pattern: c.pattern,
-			since: c.since,
-			expiresAt: c.expiresAt,
-			...(str(c.note) ? { note: c.note } : {}),
-		});
+		const pattern = line(c?.pattern, LIMITS.path);
+		if (!c || !pattern || !num(c.since) || !num(c.expiresAt)) continue;
+		const note = line(c.note, LIMITS.note);
+		out.push({ pattern, since: c.since, expiresAt: c.expiresAt, ...(note ? { note } : {}) });
 	}
 	return out;
 }
@@ -222,9 +241,11 @@ function parseClaims(value: unknown): Claim[] {
 function parseRecent(value: unknown): RecentFile[] {
 	if (!Array.isArray(value)) return [];
 	const out: RecentFile[] = [];
-	for (const raw of value) {
+	for (const raw of value.slice(0, LIMITS.recent)) {
 		const r = raw as Partial<RecentFile> | null;
-		if (!r || !str(r.path) || !num(r.at) || (r.op !== "edit" && r.op !== "write")) continue;
+		if (!r || !str(r.path) || r.path.length > LIMITS.path || !num(r.at) || (r.op !== "edit" && r.op !== "write")) {
+			continue;
+		}
 		out.push({ path: r.path, op: r.op, at: r.at });
 	}
 	return out;
@@ -233,12 +254,15 @@ function parseRecent(value: unknown): RecentFile[] {
 export function parsePresence(value: unknown): Presence | null {
 	if (typeof value !== "object" || value === null) return null;
 	const r = value as Record<string, unknown>;
-	if (r.v !== WIRE_VERSION || !isId(r.id) || !str(r.callsign) || !str(r.cwd) || !str(r.projectRoot)) {
-		return null;
-	}
+	if (r.v !== WIRE_VERSION || !isId(r.id) || !str(r.cwd) || !str(r.projectRoot)) return null;
+	if (typeof r.callsign !== "string" || !CALLSIGN_PATTERN.test(r.callsign)) return null;
 	if (!num(r.pid) || !(r.ticks === null || num(r.ticks)) || !num(r.startedAt) || !num(r.heartbeatAt)) {
 		return null;
 	}
+	const name = line(r.name, LIMITS.name);
+	const branch = line(r.branch, LIMITS.branch);
+	const model = line(r.model, LIMITS.model);
+	const task = line(r.task, LIMITS.task);
 	return {
 		v: WIRE_VERSION,
 		id: r.id,
@@ -253,10 +277,10 @@ export function parsePresence(value: unknown): Presence | null {
 		recent: parseRecent(r.recent),
 		startedAt: r.startedAt,
 		heartbeatAt: r.heartbeatAt,
-		...(str(r.name) ? { name: r.name } : {}),
-		...(str(r.branch) ? { branch: r.branch } : {}),
-		...(str(r.model) ? { model: r.model } : {}),
-		...(str(r.task) ? { task: r.task } : {}),
+		...(name ? { name } : {}),
+		...(branch ? { branch } : {}),
+		...(model ? { model } : {}),
+		...(task ? { task } : {}),
 		...(num(r.taskAt) ? { taskAt: r.taskAt } : {}),
 	};
 }
@@ -268,18 +292,20 @@ export function parseEnvelope(value: unknown): Envelope | null {
 	if (typeof r.kind !== "string" || !(KINDS as readonly string[]).includes(r.kind)) return null;
 	if (typeof r.text !== "string" || Buffer.byteLength(r.text, "utf8") > TEXT_CAP) return null;
 	if (r.kind === "answer" && !isId(r.answerTo)) return null;
-	if (r.kind === "event" && !str(r.topic)) return null;
+	if (r.kind === "event" && !(typeof r.topic === "string" && /^[a-z][a-z0-9._-]{0,63}$/.test(r.topic))) return null;
+	const fromCallsign =
+		typeof r.fromCallsign === "string" && CALLSIGN_PATTERN.test(r.fromCallsign) ? r.fromCallsign : r.from.slice(0, 8);
 	return {
 		v: WIRE_VERSION,
 		id: r.id,
 		ts: r.ts,
 		from: r.from,
-		fromCallsign: str(r.fromCallsign) ? r.fromCallsign : r.from.slice(0, 8),
+		fromCallsign,
 		to: r.to,
 		kind: r.kind as EnvelopeKind,
 		text: r.text,
 		...(isId(r.answerTo) ? { answerTo: r.answerTo } : {}),
-		...(str(r.topic) ? { topic: r.topic } : {}),
+		...(typeof r.topic === "string" ? { topic: r.topic } : {}),
 		...(r.data !== undefined ? { data: r.data } : {}),
 		...(r.human === true ? { human: true } : {}),
 	};
@@ -327,9 +353,17 @@ export interface Transport {
 	/** Remove the records (and inboxes) of sessions that are gone. Returns the ids removed. */
 	sweep(): string[];
 	deliver(envelope: Envelope): Result<object>;
-	/** Read and remove every envelope waiting for `id`, oldest first. */
-	drain(id: string): { envelopes: Envelope[]; refused: string[] };
+	/**
+	 * Hand every envelope waiting for `id` to `handle`, oldest first, at most `DRAIN_BATCH` per
+	 * call. A message file is removed only AFTER `handle` returns (or throws), so a process that
+	 * dies mid-delivery finds it again on restart — at-least-once; the caller dedupes by id.
+	 */
+	drain(id: string, handle: (envelope: Envelope) => void): { handled: number; refused: string[]; failed: string[] };
 	removeInbox(id: string): void;
+	/** Park state for the runtime that replaces this one (a `/reload`). */
+	writeHandoff(id: string, state: unknown): void;
+	/** Take (read and delete) the state a previous runtime of this session parked. */
+	takeHandoff(id: string): unknown;
 }
 
 export function openTransport(root: string): Transport {
@@ -423,6 +457,10 @@ export function openTransport(root: string): Transport {
 				return { ok: false, reason: `the message exceeds ${TEXT_CAP} bytes — shorten it or point at a file` };
 			}
 			if (!parseEnvelope(envelope)) return { ok: false, reason: "the envelope is malformed" };
+			const body = `${JSON.stringify(envelope)}\n`;
+			if (Buffer.byteLength(body, "utf8") > ENVELOPE_CAP) {
+				return { ok: false, reason: `the envelope exceeds ${ENVELOPE_CAP} bytes` };
+			}
 			const dir = join(inboxRoot, envelope.to);
 			try {
 				mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -430,32 +468,68 @@ export function openTransport(root: string): Transport {
 				return { ok: false, reason: `the inbox for ${envelope.to} cannot be created: ${messageOf(error)}` };
 			}
 			const seq = `${String(Date.now()).padStart(15, "0")}-${String(tmpCounter++).padStart(6, "0")}`;
-			return writeAtomic(dir, `${seq}-${envelope.id}.json`, `${JSON.stringify(envelope)}\n`);
+			return writeAtomic(dir, `${seq}-${envelope.id}.json`, body);
 		},
 
-		drain(id) {
+		drain(id, handle) {
+			const result = { handled: 0, refused: [] as string[], failed: [] as string[] };
+			if (!isId(id)) return result;
 			const dir = join(inboxRoot, id);
 			let names: string[];
 			try {
 				names = readdirSync(dir);
 			} catch {
-				return { envelopes: [], refused: [] };
+				return result;
 			}
-			const envelopes: Envelope[] = [];
-			const refused: string[] = [];
-			for (const name of names.filter((n) => !n.startsWith(".")).sort()) {
+			for (const name of names.filter((n) => !n.startsWith(".")).sort().slice(0, DRAIN_BATCH)) {
 				const path = join(dir, name);
-				const envelope = parseEnvelope(readJson(path));
-				rmSync(path, { force: true });
-				if (envelope) envelopes.push(envelope);
-				else refused.push(name);
+				let envelope: Envelope | null = null;
+				try {
+					if (statSync(path).size <= ENVELOPE_CAP) envelope = parseEnvelope(readJson(path));
+				} catch {
+					continue; // vanished: another drainer of the same id took it
+				}
+				if (!envelope) {
+					result.refused.push(name);
+					rmSync(path, { force: true });
+					continue;
+				}
+				try {
+					handle(envelope);
+					result.handled++;
+				} catch (error) {
+					result.failed.push(`${name}: ${messageOf(error)}`);
+				} finally {
+					// Removed even when the handler threw: a message that always throws must not
+					// wedge the inbox (poison message), and the failure is reported instead.
+					rmSync(path, { force: true });
+				}
 			}
-			return { envelopes, refused };
+			return result;
 		},
 
 		removeInbox(id) {
 			if (!isId(id)) return;
 			rmSync(join(inboxRoot, id), { recursive: true, force: true });
+		},
+
+		writeHandoff(id, state) {
+			if (!isId(id)) return;
+			const dir = join(root, "handoff");
+			try {
+				mkdirSync(dir, { recursive: true, mode: 0o700 });
+				writeAtomic(dir, `${id}.json`, `${JSON.stringify(state)}\n`);
+			} catch {
+				/* best effort: the next runtime starts fresh */
+			}
+		},
+
+		takeHandoff(id) {
+			if (!isId(id)) return null;
+			const path = join(root, "handoff", `${id}.json`);
+			const state = readJson(path);
+			rmSync(path, { force: true });
+			return state;
 		},
 	};
 }

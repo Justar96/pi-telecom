@@ -3,9 +3,10 @@
  * files on disk. Each scenario uses its own project directory so they cannot see each other.
  */
 import assert from "node:assert/strict";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, test } from "node:test";
+import { findProjectRoot } from "../src/project.ts";
 import { eventually, makeProject, Session, sleep } from "./harness.ts";
 
 const open: Session[] = [];
@@ -218,8 +219,9 @@ test("claims: overlap refused, path held back once with owner told, release tell
 	await eventually(() => assert.ok(b.sentOf("telecom-claim").some((m) => /alpha released/.test(m.content))));
 });
 
-test("team brief: given at the start of a prompt only when the team changed", async () => {
+test("team brief: full once, then only what changed, and nothing when nothing changed", async () => {
 	const proj = makeProject("p-brief");
+	writeFileSync(join(proj, "f.ts"), "x\n");
 	const a = await session(proj);
 	assert.equal(await a.prompt("solo work"), undefined, "no brief when alone");
 	const b = await session(proj);
@@ -228,8 +230,22 @@ test("team brief: given at the start of a prompt only when the team changed", as
 	assert.match(brief?.message?.content ?? "", /you are "alpha"\. 1 other agent is working/);
 	assert.match(brief?.message?.content ?? "", /bravo \[busy\].*\n\s+task: fix the flaky upload test/);
 	assert.equal(await a.prompt("and another"), undefined, "unchanged team → no repeat");
+	await b.edit("f.ts", "x", "y");
+	assert.equal(await a.prompt("again"), undefined, "a peer editing files is not team news (notices cover it)");
 	await b.tool({ action: "claim", paths: ["tests/upload"] });
-	assert.match((await a.prompt("again"))?.message?.content ?? "", /claims: tests\/upload/);
+	await b.prompt("now the retry logic");
+	const delta = (await a.prompt("again"))?.message?.content ?? "";
+	assert.match(delta, /team update/);
+	assert.match(delta, /bravo is now on: now the retry logic/);
+	assert.match(delta, /bravo claimed tests\/upload/);
+	assert.doesNotMatch(delta, /recently changed/, "a delta is short");
+	const c = await session(proj);
+	await c.prompt("docs");
+	assert.match((await a.prompt("again"))?.message?.content ?? "", /• joined: charlie/);
+	await b.stop();
+	assert.match((await a.prompt("again"))?.message?.content ?? "", /bravo left \(its claims tests\/upload are free\)/);
+	await a.fire("session_compact", {});
+	assert.match((await a.prompt("after compaction"))?.message?.content ?? "", /1 other agent is working/, "full brief after a compaction");
 });
 
 test("leaving: presence removed; a blocked ask to the departed peer fails fast", async () => {
@@ -295,4 +311,146 @@ test("an aborted ask is withdrawn from the peer's to-do list", async () => {
 	assert.ok((await pending).isError);
 	await eventually(() => assert.ok(b.sentOf("telecom-reply").some((m) => /withdrew their ask/.test(m.content))));
 	assert.equal(await b.settle(), undefined, "no reminder for a withdrawn ask");
+});
+
+test("durability: /reload keeps the line — no gap for peers, nothing lost, claims and asks restored", async () => {
+	const proj = makeProject("p-reload");
+	const a = await session(proj);
+	const b = await session(proj);
+	await a.tool({ action: "claim", paths: ["src/core"], message: "big refactor" });
+	await a.prompt("refactor the core");
+	const pending = b.tool({ action: "ask", to: "alpha", message: "can I touch src/core/x.ts?", timeoutSec: 10 });
+	await eventually(() => assert.equal(a.sentOf("telecom-ask").length, 1));
+
+	await a.stop("reload");
+	// During the reload window bravo still sees alpha, and a message sent now must not be lost.
+	assert.match((await b.tool({ action: "board" })).text, /alpha/);
+	const during = await b.tool({ action: "send", to: "alpha", message: "sent mid-reload" });
+	assert.ok(!during.isError, during.text);
+
+	const a2 = new Session(proj, { id: a.id });
+	await a2.start("reload");
+	open.push(a2);
+	await eventually(() => assert.equal(a2.sentOf("telecom-message").length, 1));
+	assert.match(a2.sentOf("telecom-message")[0]?.content ?? "", /sent mid-reload/);
+	const board = await a2.tool({ action: "board" });
+	assert.equal(board.details.callsign, "alpha", "callsign kept");
+	assert.match(board.text, /claims: src\/core — big refactor/);
+	assert.match(board.text, /task: refactor the core/);
+	// The inbound ask survived the reload and can still be answered.
+	const reply = await a2.tool({ action: "reply", message: "yes, go ahead" });
+	assert.ok(!reply.isError, reply.text);
+	assert.match((await pending).text, /yes, go ahead/);
+});
+
+test("durability: a redelivered envelope is handled once", async () => {
+	const proj = makeProject("p-dedupe");
+	const a = await session(proj);
+	const b = await session(proj);
+	const { openTransport } = await import("../src/transport.ts");
+	const t = openTransport(process.env.PI_TELECOM_DIR as string);
+	const env = { v: 1, id: "dup-1", ts: Date.now(), from: a.id, fromCallsign: "alpha", to: b.id, kind: "message" as const, text: "once" };
+	t.deliver(env);
+	await eventually(() => assert.equal(b.sentOf("telecom-message").length, 1));
+	t.deliver(env);
+	await sleep(150);
+	assert.equal(b.sentOf("telecom-message").length, 1);
+});
+
+test("durability: a lost presence record heals itself", async () => {
+	const proj = makeProject("p-heal");
+	const a = await session(proj);
+	const b = await session(proj);
+	rmSync(join(process.env.PI_TELECOM_DIR as string, "presence", `${a.id}.json`));
+	assert.doesNotMatch((await b.tool({ action: "board" })).text, /• alpha/);
+	await eventually(async () => assert.match((await b.tool({ action: "board" })).text, /• alpha/));
+});
+
+test("durability: the same session open in two pi processes — the younger steps back", async () => {
+	const proj = makeProject("p-dup-session");
+	const a = await session(proj);
+	const { openTransport, processStartTicks } = await import("../src/transport.ts");
+	const t = openTransport(process.env.PI_TELECOM_DIR as string);
+	// Another live process (our parent) claims to be this same session, and started earlier.
+	t.writePresence({
+		v: 1, id: a.id, callsign: "alpha", pid: process.ppid, ticks: processStartTicks(process.ppid),
+		cwd: proj, projectRoot: proj, role: "main", state: "idle", claims: [], recent: [],
+		startedAt: 1, heartbeatAt: Date.now(),
+	});
+	await eventually(() => assert.match(a.status ?? "", /off/));
+	const res = await a.tool({ action: "board" });
+	assert.ok(res.isError);
+	assert.match(res.text, /also open in pi process/);
+	assert.equal(t.readPeers().find((p) => p.id === a.id)?.pid, process.ppid, "the other process keeps its record");
+	t.removePresence(a.id);
+});
+
+test("guard: an edit over an unread peer change taints the view — a later write must re-read", async () => {
+	const proj = makeProject("p-taint");
+	writeFileSync(join(proj, "t.ts"), "a\nb\nc\n");
+	const a = await session(proj);
+	const b = await session(proj);
+	await b.read("t.ts");
+	await a.edit("t.ts", "a", "A");
+	await eventually(() => assert.equal(b.sentOf("telecom-change").length, 1), 3_000);
+	const warned = await b.edit("t.ts", "c", "C");
+	assert.match(warned.note ?? "", /⚠ telecom/);
+	const write = await b.write("t.ts", "a\nb\nC\n");
+	assert.match(write.blocked ?? "", /on top of alpha's change .*without re-reading it/);
+	await b.read("t.ts");
+	assert.equal((await b.write("t.ts", "A\nb\nC\nd\n")).blocked, undefined);
+});
+
+test("unresponsive peers: flagged on the board, their claims not enforced", async () => {
+	const proj = makeProject("p-hung");
+	writeFileSync(join(proj, "core.ts"), "x\n");
+	const a = await session(proj);
+	const { openTransport, processStartTicks } = await import("../src/transport.ts");
+	const t = openTransport(process.env.PI_TELECOM_DIR as string);
+	t.writePresence({
+		v: 1, id: "hung-session-0001", callsign: "zulu", pid: process.ppid, ticks: processStartTicks(process.ppid),
+		cwd: proj, projectRoot: findProjectRoot(proj),
+		role: "main", state: "busy",
+		claims: [{ pattern: "core.ts", since: Date.now() - 600_000, expiresAt: Date.now() + 600_000 }],
+		recent: [], startedAt: 1, heartbeatAt: Date.now() - 120_000,
+	});
+	const board = await a.tool({ action: "board" });
+	assert.match(board.text, /zulu \[unresponsive, last seen 2m ago\]/);
+	await a.read("core.ts");
+	const res = await a.edit("core.ts", "x", "y");
+	assert.equal(res.blocked, undefined, "a hung owner's claim does not block");
+	assert.match(res.note ?? "", /zulu has not checked in/);
+	const sent = await a.tool({ action: "send", to: "zulu", message: "you there?" });
+	assert.match(sent.text, /unresponsive since 2m ago/);
+	t.removePresence("hung-session-0001");
+});
+
+test("notices: files read before a compaction stop producing notices; the guard still protects them", async () => {
+	const proj = makeProject("p-compact");
+	writeFileSync(join(proj, "old.ts"), "1\n");
+	const a = await session(proj);
+	const b = await session(proj);
+	await b.read("old.ts");
+	await b.fire("session_compact", {});
+	await a.edit("old.ts", "1", "2");
+	await sleep(1_500);
+	assert.equal(b.sentOf("telecom-change").length, 0);
+	assert.match((await b.write("old.ts", "3\n")).blocked ?? "", /alpha edited old\.ts/);
+});
+
+test("PI_TELECOM_MAX_WAKES=0: peer messages never start a turn, asks still do", async () => {
+	const proj = makeProject("p-nowake");
+	const a = await session(proj);
+	process.env.PI_TELECOM_MAX_WAKES = "0";
+	const b = await session(proj);
+	delete process.env.PI_TELECOM_MAX_WAKES;
+	await a.tool({ action: "send", to: "bravo", message: "fyi" });
+	await eventually(() => assert.equal(b.sentOf("telecom-message").length, 1));
+	assert.equal(b.sentOf("telecom-message")[0]?.options, undefined);
+	assert.match(b.sentOf("telecom-message")[0]?.content ?? "", /wake-ups are off/);
+	const pending = a.tool({ action: "ask", to: "bravo", message: "q", timeoutSec: 5 });
+	await eventually(() => assert.equal(b.sentOf("telecom-ask").length, 1));
+	assert.deepEqual(b.sentOf("telecom-ask")[0]?.options, { triggerTurn: true });
+	await b.tool({ action: "reply", message: "a" });
+	await pending;
 });

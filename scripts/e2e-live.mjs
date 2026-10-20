@@ -29,6 +29,7 @@ const project = join(scratch, "proj");
 mkdirSync(join(project, ".git"), { recursive: true });
 writeFileSync(join(project, ".git", "HEAD"), "ref: refs/heads/main\n");
 writeFileSync(join(project, "shared.txt"), "line one: alpha\nline two: beta\n");
+writeFileSync(join(project, "auth.txt"), "auth v1\n");
 const env = { ...process.env, PI_TELECOM_DIR: join(scratch, "switchboard"), PI_TELECOM_TICK_MS: "100" };
 const extra = (process.env.TELECOM_LIVE_EXTENSIONS ?? "").split(",").map((p) => p.trim()).filter(Boolean);
 const args = ["--model", model, "--tools", "read,edit,write,telecom", ...extra.flatMap((p) => ["-e", p])];
@@ -123,6 +124,30 @@ try {
 	check(`A's ask returned ${csB}'s answer`, Boolean(answered) && /42/.test(textOf(answered.result.content)), JSON.stringify(asks.map((t) => textOf(t.result?.content))));
 	const replied = toolEnds(b.records, "telecom").some((t) => !t.isError && /replied to/.test(textOf(t.result?.content)));
 	check(`${csB} was woken by the ask and replied with the telecom tool`, replied);
+
+	// 5. A claims a file; B is asked to change it. B must be held back, A must be told, and the
+	//    two should sort it out between themselves (B asks, A answers) — or B retries knowingly.
+	await run(a, 'Use the telecom tool to claim ["auth.txt"] with message "rewriting auth". Do nothing else.');
+	const r5 = await run(
+		b,
+		'Append a line "b was here" to auth.txt using the edit tool. If a tool call is refused, follow the advice in the refusal.',
+		240_000,
+	);
+	const seq5 = r5.filter((r) => r.type === "tool_execution_end").map((r) => `${r.toolName}${r.isError ? "✗" : "✓"}`);
+	console.log(`    B's tool sequence: ${seq5.join(" → ")}`);
+	const claimBlock = toolEnds(r5, "edit").find((e) => e.isError && new RegExp(`inside ${csA}'s claim`).test(textOf(e.result?.content)));
+	check(`B's edit inside ${csA}'s claim was held back`, Boolean(claimBlock), JSON.stringify(toolEnds(r5, "edit").map((e) => textOf(e.result?.content))));
+	const told = await a
+		.waitFor((r) => r.type === "message_end" && r.message?.customType === "telecom-claim", 10_000)
+		.catch(() => null);
+	check(`${csA} was told that ${csB} needs its claimed file`, Boolean(told) && new RegExp(`${csB} needs a path you claimed`).test(textOf(told.message.content)));
+	const askedOwner = toolEnds(r5, "telecom").some((t) => /answered:|interrupted/.test(textOf(t.result?.content)));
+	console.log(`    ${csB} ${askedOwner ? `asked ${csA} and got an answer` : "did not ask (retried or stopped)"}; auth.txt is now: ${JSON.stringify(readFileSync(join(project, "auth.txt"), "utf8"))}`);
+	await new Promise((r) => setTimeout(r, 1_000));
+	check("both agents end the scenario settled (no runaway ping-pong)", ![a, b].some((p) => {
+		const last = p.records.filter((r) => r.type === "agent_start" || r.type === "agent_settled").at(-1);
+		return last?.type === "agent_start";
+	}));
 } catch (error) {
 	console.error(error);
 	failures++;

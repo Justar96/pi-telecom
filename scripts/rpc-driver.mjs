@@ -9,10 +9,11 @@ import { fileURLToPath } from "node:url";
 const here = dirname(fileURLToPath(import.meta.url));
 export const entry = resolve(here, "..", "src", "index.ts");
 
-export function startPi(name, { cwd, env, args = [] }) {
+export function startPi(name, { cwd, env, args = [], session = ["--no-session"], noTelecom = false }) {
+	const telecom = noTelecom ? [] : ["-e", entry];
 	const child = spawn(
 		"pi",
-		["--mode", "rpc", "--no-session", "--no-extensions", "--no-mcp", "--no-skills", "--no-context-files", "-e", entry, "--name", name, ...args],
+		["--mode", "rpc", ...session, "--no-extensions", "--no-mcp", "--no-skills", "--no-context-files", ...telecom, "--name", name, ...args],
 		{ cwd, env, stdio: ["pipe", "pipe", "pipe"] },
 	);
 	const records = [];

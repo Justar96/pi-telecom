@@ -36,13 +36,18 @@ interface View {
 	via: "read" | "edit" | "write";
 	/** A change notice for this file has been shown since the view was taken. */
 	notified: boolean;
+	/** The view is still in the model's context (false after a compaction summarised it away). */
+	inContext: boolean;
+	/** This agent edited the file AFTER a peer's change it never read: its bytes are current, but
+	 *  the model's picture of the file is not, so a whole-file write must still re-read first. */
+	tainted?: PeerChange;
 }
 
 export type Relation = "read" | "edited";
 
 export type Verdict =
 	| { action: "allow" }
-	| { action: "warn"; note: string }
+	| { action: "warn"; note: string; staleChange?: PeerChange }
 	| { action: "block"; reason: string; contested?: { owner: Presence; claim: Claim } };
 
 /** A peer change older than this, on a file this agent never looked at, is history, not news. */
@@ -51,6 +56,10 @@ const UNSEEN_WINDOW_MS = 30 * 60_000;
 const CLOCK_GRACE_MS = 1_500;
 /** A claim warning is shown once; the same agent retrying within this window goes through. */
 const CONTEST_WINDOW_MS = 10 * 60_000;
+/** A plain read older than this no longer earns a change notice (the guard still protects it). */
+const READ_RELEVANCE_MS = 60 * 60_000;
+/** A peer that has not refreshed its record for this long is treated as unresponsive. */
+export const UNRESPONSIVE_MS = 45_000;
 /** Consecutive stale blocks on one change before the guard steps aside (never loop forever). */
 const MAX_STALE_BLOCKS = 2;
 const CHANGE_CAP = 512;
@@ -62,17 +71,45 @@ export class Awareness {
 	private readonly staleBlocks = new Map<string, { changeAt: number; count: number }>();
 
 	noteRead(path: string): void {
-		this.views.set(path, { fingerprint: fileFingerprint(path), at: Date.now(), via: "read", notified: false });
+		this.views.set(path, {
+			fingerprint: fileFingerprint(path),
+			at: Date.now(),
+			via: "read",
+			notified: false,
+			inContext: true,
+		});
 		this.staleBlocks.delete(path);
 	}
 
-	noteOwnWrite(path: string, op: "edit" | "write"): void {
-		this.views.set(path, { fingerprint: fileFingerprint(path), at: Date.now(), via: op, notified: false });
+	/** Record this agent's own successful change. `staleOver` is the peer change it edited on top
+	 *  of without reading; a full rewrite of a stale file (`write`) clears the taint by definition. */
+	noteOwnWrite(path: string, op: "edit" | "write", staleOver?: PeerChange): void {
+		const prior = this.views.get(path);
+		const tainted = op === "edit" ? (staleOver ?? prior?.tainted) : undefined;
+		this.views.set(path, {
+			fingerprint: fileFingerprint(path),
+			at: Date.now(),
+			via: op,
+			notified: false,
+			inContext: true,
+			...(tainted ? { tainted } : {}),
+		});
 		this.staleBlocks.delete(path);
+	}
+
+	/** After a compaction the files read before it are no longer in the model's context, so a peer
+	 *  changing them is not news worth a notice. The guard keeps using the views. */
+	markCompacted(): void {
+		for (const view of this.views.values()) view.inContext = false;
 	}
 
 	hasView(path: string): boolean {
 		return this.views.has(path);
+	}
+
+	/** Has a peer ever touched this path as far as this agent knows, or is its view tainted? */
+	hasPeerContext(path: string): boolean {
+		return this.changes.has(path) || this.views.get(path)?.tainted !== undefined;
 	}
 
 	viewedPaths(): string[] {
@@ -93,7 +130,8 @@ export class Awareness {
 			this.changes.delete(oldest);
 		}
 		const view = this.views.get(change.path);
-		if (!view) return { relation: null, firstNotice: false };
+		if (!view || !view.inContext) return { relation: null, firstNotice: false };
+		if (view.via === "read" && Date.now() - view.at > READ_RELEVANCE_MS) return { relation: null, firstNotice: false };
 		const firstNotice = !view.notified;
 		view.notified = true;
 		return { relation: view.via === "read" ? "read" : "edited", firstNotice };
@@ -128,10 +166,14 @@ export class Awareness {
 		root: string,
 	): Verdict {
 		if (mode === "off") return { action: "allow" };
-		const change = this.latestPeerChange(path, peers, selfId);
-		if (!change) return { action: "allow" };
 		const view = this.views.get(path);
 		const shown = displayPath(path, root);
+		if (view?.tainted && tool === "write") {
+			const t = view.tainted;
+			return this.block(path, t, tool, mode, `you edited ${shown} on top of ${t.callsign}'s change (${ago(t.at)}) without re-reading it, so your picture of the file is out of date`, shown);
+		}
+		const change = this.latestPeerChange(path, peers, selfId);
+		if (!change) return { action: "allow" };
 		const who = `${change.callsign} ${change.op === "write" ? "rewrote" : "edited"} ${shown} ${ago(change.at)}`;
 		const detail = change.summary ? ` (${change.summary})` : "";
 
@@ -147,11 +189,16 @@ export class Awareness {
 			problem = `${who}${detail}, and you have not read it in this session`;
 		}
 
+		return this.block(path, change, tool, mode, problem, shown);
+	}
+
+	private block(path: string, change: PeerChange, tool: "edit" | "write", mode: GuardMode, problem: string, shown: string): Verdict {
 		const strict = mode === "strict";
 		const wouldBlock = tool === "write" || strict;
 		if (!wouldBlock) {
 			return {
 				action: "warn",
+				staleChange: change,
 				note: `⚠ telecom: ${problem}. Your edit applied because its anchors still matched, but re-read the file to make sure it fits with ${change.callsign}'s change.`,
 			};
 		}
@@ -160,6 +207,7 @@ export class Awareness {
 		if (count > MAX_STALE_BLOCKS) {
 			return {
 				action: "warn",
+				staleChange: change,
 				note: `⚠ telecom: ${problem}. Allowed after ${MAX_STALE_BLOCKS} warnings — tell ${change.callsign} what you overwrote.`,
 			};
 		}
@@ -193,6 +241,13 @@ export class Awareness {
 				const what = `${shown} is inside ${peer.callsign}'s claim "${claim.pattern}"${
 					claim.note ? ` (${claim.note})` : ""
 				}, held since ${ago(claim.since)}`;
+				if (now - peer.heartbeatAt > UNRESPONSIVE_MS) {
+					// A suspended or hung owner cannot answer, so its claim must not block anyone.
+					return {
+						action: "warn",
+						note: `⚠ telecom: ${what}, but ${peer.callsign} has not checked in for ${ago(peer.heartbeatAt).replace(" ago", "")}, so the claim is not enforced. Tell them what you changed when they are back.`,
+					};
+				}
 				const key = `${peer.id}\u0000${path}`;
 				const warnedAt = this.contested.get(key);
 				if (mode === "standard" && warnedAt !== undefined && now - warnedAt < CONTEST_WINDOW_MS) {

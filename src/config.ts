@@ -15,7 +15,8 @@ export interface TelecomConfig {
 	/** Default wait for `ask`, in milliseconds. */
 	askTimeoutMs: number;
 	/** Peer messages that may wake (start a turn in) this agent per rolling minute. Messages over
-	 *  the limit still arrive, passively, so a chatty peer cannot burn this agent's tokens. */
+	 *  the limit still arrive, passively, so a chatty peer cannot burn this agent's tokens. 0 = never
+	 *  wake (asks excepted: a peer is blocked on them). */
 	maxWakesPerMinute: number;
 	/** Fixed callsign for this session, instead of the next free NATO word. */
 	callsign: string | undefined;
@@ -46,6 +47,13 @@ function positive(raw: string | undefined, fallback: number): number {
 	return Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
+/** Like `positive`, but 0 is a meaningful value ("never"). */
+function nonNegative(raw: string | undefined, fallback: number): number {
+	if (raw === undefined || raw.trim() === "") return fallback;
+	const value = Number(raw);
+	return Number.isFinite(value) && value >= 0 ? value : fallback;
+}
+
 function truthy(raw: string | undefined): boolean {
 	return /^(1|true|yes|on)$/i.test(raw?.trim() ?? "");
 }
@@ -58,7 +66,7 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): TelecomConfig 
 	return {
 		guard,
 		askTimeoutMs: Math.min(positive(env[ENV.askTimeout], DEFAULT_ASK_TIMEOUT_MS), MAX_ASK_TIMEOUT_MS),
-		maxWakesPerMinute: Math.floor(positive(env[ENV.maxWakes], DEFAULT_MAX_WAKES)),
+		maxWakesPerMinute: Math.floor(nonNegative(env[ENV.maxWakes], DEFAULT_MAX_WAKES)),
 		callsign: callsign && /^[a-z0-9][a-z0-9_-]{0,31}$/.test(callsign) ? callsign : undefined,
 		disabled: truthy(env[ENV.disable]),
 		claimTtlMs: positive(env[ENV.claimTtl], DEFAULT_CLAIM_TTL_MIN) * 60_000,
