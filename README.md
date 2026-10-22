@@ -3,20 +3,21 @@
 [![npm](https://img.shields.io/npm/v/@justar_96/pi-telecom)](https://www.npmjs.com/package/@justar_96/pi-telecom)
 [![license](https://img.shields.io/npm/l/@justar_96/pi-telecom)](LICENSE)
 
-**Run several [pi](https://pi.dev) agents on one project at once, and have them work as a team.**
+A [pi](https://pi.dev) extension that connects pi sessions working in the same repository.
 
-When agents work in parallel on the same repository, problems show up fast. One agent rewrites
-a file another just changed. Two refactor the same module. A question meant for one terminal is
-typed into another. Telecom connects every pi session in a project, so each agent knows who else
-is working, on what, which areas are taken, and which files just changed. Agents can also ask
-each other questions directly.
+Each session gets a callsign and publishes what it is doing. The model is told who else is
+working, on what, which paths are claimed, and which files a peer just changed. Telecom also
+stops an edit that would overwrite a peer's change the agent hasn't read, and lets agents
+message and ask each other. Sessions in different git worktrees of one repository are one team,
+and subagents started with [pi-subagents](https://github.com/nicobailon/pi-subagents) are
+grouped with their parent.
 
 ![Two pi sessions working in one repository: alpha answers bravo's question while bravo gets a change notice with alpha's diff](https://raw.githubusercontent.com/Justar96/pi-telecom/main/docs/images/team.png)
 
-<sub>A real moment from two pi sessions in one repository: alpha on Claude Opus 5.5, bravo on GPT-6.1
-Sol. alpha made <code>login()</code> async and fixed the test that calls it. bravo had read that test, so it
-got a change notice with alpha's diff; asked to fix the test, it asked alpha first, and alpha
-answered. Captured with <code>npm run screenshots</code>.</sub>
+<sub>Two pi sessions in one repository: alpha on Claude Opus 5.5, bravo on GPT-6.1 Sol. alpha made
+<code>login()</code> async and fixed the test that calls it. bravo had read that test, so it got a change
+notice with alpha's diff. Asked to fix the test, bravo asked alpha first, and alpha answered.
+Captured with <code>npm run screenshots</code>.</sub>
 
 ## Quick start
 
@@ -24,9 +25,9 @@ answered. Captured with <code>npm run screenshots</code>.</sub>
 pi install npm:@justar_96/pi-telecom
 ```
 
-Open two or more pi sessions in the same repository. They find each other on their own: there is
-nothing to configure, and no server or port. Type `/telecom` to see the team. The footer shows
-who you are and who else is working:
+Open two or more pi sessions in the same repository. They find each other through a shared
+directory on this machine; there is no server, port or configuration. `/telecom` shows the team.
+The footer shows this session's callsign and its peers:
 
 ```
 📡 bravo · 1 peer (1 busy) · 1 claim
@@ -35,21 +36,18 @@ who you are and who else is working:
 Other ways to install:
 
 ```bash
-pi -e npm:@justar_96/pi-telecom                # try it for one session, without installing
+pi -e npm:@justar_96/pi-telecom                # for one session, without installing
 pi install -l npm:@justar_96/pi-telecom        # for one project (loads once the project is trusted)
-pi install npm:@justar_96/pi-telecom@0.1.1     # pin a version
+pi install npm:@justar_96/pi-telecom@0.1.1     # a pinned version
 pi install git:github.com/Justar96/pi-telecom  # from GitHub
 ```
 
-Requires pi ≥ 1.3 and Node ≥ 22.6, on Linux or macOS.
+Requires pi 1.3 or later and Node 22.6 or later, on Linux or macOS.
 
-## What the agents see
+## What the model receives
 
-Telecom talks to each model in short, plain messages. These examples are real output, lightly
-trimmed.
-
-**A team brief** when a prompt starts and other agents are present. The first one describes the
-whole team:
+**A team brief** at the start of a prompt when other agents are live. The first one describes
+them:
 
 ```
 📡 Telecom — you are "bravo". 1 other agent is working in this project right now:
@@ -57,9 +55,10 @@ whole team:
     task: refactor the auth module (2m ago)
     claims: src/auth/** — refactor
     recently changed: src/auth/session.ts (1m ago)
+Stay out of their claimed paths, re-read files they changed before editing, and use the telecom tool to coordinate when your work overlaps theirs.
 ```
 
-After that, a brief appears only when something changes, and it lists only the changes:
+Later briefs list only what changed, and nothing is sent when nothing changed:
 
 ```
 📡 Telecom — team update (you are "bravo"):
@@ -71,196 +70,302 @@ After that, a brief appears only when something changes, and it lists only the c
 
 ```
 📡 alpha changed a file you are working with
-  • src/auth/session.ts — edited, 2 edits from line 40 · you read this file earlier
+  • src/auth/session.ts — edited, 1 edit from line 1 · you read this file earlier
       -export function login(user) {
       +export async function login(user) {
 Re-read before you edit it; your earlier view is stale.
 ```
 
-**A refusal** when an agent tries to overwrite a peer's change it hasn't seen:
+**A refusal** when the agent tries to overwrite a peer's change it hasn't read:
 
 ```
-telecom: alpha edited shared.txt 5s ago (1 edit from line 1), after you last read it. Re-read
-shared.txt and re-apply your change on top of theirs (prefer `edit` over a whole-file `write`).
+telecom: alpha edited shared.txt 5s ago, after you last read it. Re-read shared.txt and re-apply
+your change on top of theirs (prefer `edit` over a whole-file `write`). If you must coordinate,
+telecom({ action: "ask", to: "alpha", message: "…" }).
 ```
-
-In live tests on Claude Opus 5.5 and GPT-6.1 Sol, both models re-read a file after its change
-notice instead of writing over it, so both changes were kept. Asked to edit inside a peer's claim,
-both contacted the owner first: one waited when told to, the other went ahead once the owner
-released the claim.
 
 ## Features
 
 ### Callsigns and presence
 
-Each agent gets a short, speakable name (`alpha`, `bravo`, … the first free word in the project).
-It survives a resume, and you can change it with `/telecom name ops`. Each agent publishes its
-state: busy or idle, its current task (the first line of the latest prompt, or one it sets), its
-git branch, its claims, and the files it changed recently.
+Each session gets a callsign: the first free word of `alpha`, `bravo`, `charlie`, … in the
+repository. It is kept across a resume, and `/telecom name ops` changes it. Each session
+publishes:
+
+- busy or idle, and its task: the first line of its latest prompt, or one set with `status`;
+- its checkout and git branch;
+- its claims;
+- the last 12 files it changed through pi's `edit` and `write` tools;
+- the sessions its open asks are waiting on.
 
 ### Team briefs
 
-The model is told about its teammates when a prompt starts. The first brief describes everyone.
-After that, a brief lists only what changed: someone joined or left, a task changed, a claim was
-added or released. A peer editing files isn't team news; change notices cover that. When nothing
-changed, nothing is sent, and working alone costs no tokens at all. A full brief comes again
-after a compaction, or every 30 minutes.
+The brief is added at the start of a prompt. The first one describes every peer. After that, a
+brief lists only changes: a peer joined or left, changed its callsign or task, or claimed or
+released a path. A peer editing files is not listed; change notices cover that. With no peers,
+or no changes, nothing is added. A full brief is sent again after a compaction, and at most every
+30 minutes otherwise.
+
+With more than three other agents (subagents not counted), a brief describes only the peers near
+this agent's work, at most six. A peer is near when it changed a file this agent is working with,
+holds a claim that covers such a file or overlaps one of this agent's claims, has the same parent
+session, or has exchanged messages with this agent. The other peers share one roster line:
+
+```
+Also here, not near your work so far: charlie [busy] the api layer (claims src/api); echo [busy] the build
+```
+
+In later briefs, task changes and new claims of peers that are not near are left out. The edit
+guard still stops an edit inside their claims. Joins, departures, callsign changes, and releases
+of claims the agent was told about are always listed. When a peer becomes near, it is described
+once (`• now working near you: echo …`), and changes that were left out while it was not near
+are listed then.
 
 ### Change notices
 
-When a peer edits a file this agent **read in the last hour or edited**, or a file inside this
-agent's **claim**, a notice arrives with the first few changed lines.
+A notice is sent when a peer edits a file this agent read in the last hour, a file it edited, or
+a file inside one of its claims. It includes the first changed lines.
 
-- Edits that land close together are combined into one notice per peer.
-- A file triggers only one notice until the agent reads it again.
-- Files read before a compaction don't trigger notices, since their content is no longer in
-  context.
-- A running agent gets the notice before its next step. An idle agent gets it with its next
+- Edits by one peer within about a second are combined into one notice.
+- A file produces one notice until the agent reads it again.
+- Files read before a compaction produce no notices, since their content is no longer in
+  context. The edit guard still checks them.
+- A busy agent receives the notice before its next step. An idle agent sees it with its next
   prompt. A notice never starts a turn.
 
 ### The edit guard
 
-The guard stops an agent from overwriting work it hasn't seen. It acts only on changes it can
-**attribute to a peer**. Changes from your own `bash` (formatters, `sed -i`) or from your editor
-are left alone, so working solo behaves exactly as it does without telecom.
+The guard checks `edit` and `write` calls against changes made by peers through their own `edit`
+and `write` tools. It does not track changes made by `bash` (formatters, `sed -i`, `git
+checkout`) or by an editor. With no peers and no peer history for a file, it does nothing.
 
 | Situation | `standard` (default) | `strict` | `off` |
 |---|---|---|---|
-| `write` over a peer's change you haven't read | **blocked** until you re-read | blocked | allowed |
-| `edit` over a peer's change you haven't read | allowed, with a ⚠ note | blocked | allowed |
-| `write` after an `edit` over a peer's change you never read | **blocked** until you re-read | blocked | allowed |
-| editing inside a peer's claim | blocked once, and the owner is told; retrying goes through | always blocked | allowed |
-| editing inside a claim whose owner is unresponsive | allowed, with a ⚠ note | allowed, with a ⚠ note | allowed |
+| `write` over a peer's change the agent hasn't read | blocked until the agent re-reads the file | blocked | allowed |
+| `edit` over a peer's change the agent hasn't read | allowed, with a ⚠ note | blocked | allowed |
+| `write` after an `edit` that was applied over an unread peer change | blocked until the agent re-reads the file | blocked | allowed |
+| editing inside a peer's claim | blocked once and the owner is told; a retry within 10 minutes goes through | blocked | allowed |
+| editing inside a claim whose owner hasn't checked in for 45 s | allowed, with a ⚠ note | allowed, with a ⚠ note | allowed |
+| editing this checkout's copy of a file inside a claim made in another worktree | allowed, with a ⚠ note; the owner is told | allowed, with a ⚠ note; the owner is told | allowed |
+| editing a file that a peer in another worktree also changed in its copy | allowed, with a ⚠ note, once per peer and file | allowed, with a ⚠ note, once per peer and file | allowed |
+| a subagent editing inside its parent's claim, or a parent inside its subagent's | allowed | allowed | allowed |
 
-Every refusal says what happened and what to do next. The same change is blocked at most twice,
-so an agent can never get stuck in a loop.
+A refusal states what happened and what to do next, including the exact `telecom` call when one
+helps. If the same unread change blocks a `write` twice, the third attempt is allowed with a ⚠
+note, so an agent cannot be blocked indefinitely.
 
 ### Claims
 
-Before a large change, an agent can reserve an area: `telecom claim src/auth/** "refactor"`. When
-a peer tries to edit there, the guard holds it back and tells the owner. Claims that overlap an
-existing one are refused. A claim ends when it's released, when its session ends, or after 2 hours
-with no activity inside it. When a claim is released, anyone who was held back is told.
+An agent reserves paths before a larger change:
+
+```
+telecom({ action: "claim", paths: ["src/auth/**"], message: "refactor" })
+```
+
+Patterns are project-relative paths or globs (`src/auth`, `src/**/*.test.ts`, `src/{api,db}/**`).
+A claim that overlaps a peer's claim in the same checkout is refused. Overlaps with a claim in
+another worktree are allowed, with a note, and a subagent may claim part of its parent's claim.
+A claim ends when it is released, when its session ends, or after 2 hours without an edit inside
+it (`PI_TELECOM_CLAIM_TTL_MIN`). When a claim ends, peers that were held back by it are told.
+
+### Worktrees
+
+Sessions in the main checkout and in git worktrees of the same repository (checkouts that share a
+git common directory) are one team. Callsigns are unique across the repository, and the board
+shows each session's checkout:
+
+```
+• bravo [idle] on lane-b  in worktree /home/me/repo-lane  id 9d41c07a
+```
+
+Each checkout has its own files, so a peer's edit in another worktree doesn't make this agent's
+copy stale, and the guard doesn't block it. Two cases are reported because the changes will meet
+when the branches merge:
+
+- If a peer in another worktree edits a file this agent also changed in its own checkout, the
+  agent gets one notice, and the peer gets a ⚠ note on its edit.
+- A claim made in another worktree is advisory for this checkout's copy of those files: the edit
+  goes through with a ⚠ note, and the owner is told once the edit has succeeded (at most once
+  every 10 minutes per file).
+
+An edit that reaches into another checkout's own files, through an absolute path or a worktree
+nested inside the main checkout, is treated like an edit in that checkout: claims bind and the
+guard checks it. A submodule is its own repository, and a folder outside git is its own project.
+
+### Subagents
+
+Subagents started with [pi-subagents](https://github.com/nicobailon/pi-subagents) are recognized
+in both modes. A foreground subagent runs inside the parent's pi process and is found through its
+session header. A background subagent runs in a separate runner process and is found through the
+runner's `PI_SUBAGENT_*` environment variables. Processes started from inside a subagent, such as a
+test suite or another `pi`, are not counted as subagents.
+
+- **Names.** A subagent is named after its parent: `alpha-1`, `alpha-2`, …. It ignores a
+  `PI_TELECOM_CALLSIGN` inherited from the parent. The board lists it under its parent as
+  `(subagent of alpha)`.
+- **Briefs.** Subagents don't produce join or leave notices. In other agents' briefs they are
+  shown inside their parent's entry, with their claims. A parent gets no brief about its own
+  subagents, and a subagent gets none about its parent. Sibling subagents see each other.
+- **Claims.** A subagent is not held back by its parent's claims, or a parent by its subagent's.
+  Siblings hold each other back like any two peers.
+- **Asks to a blocked parent.** A parent is blocked while its foreground subagent runs, so an
+  `ask` to that parent, or to a foreground ancestor further up, is refused at once. The refusal
+  suggests deciding without an answer, or pi-subagents' `contact_supervisor`.
+- **Leaving.** A subagent record that stays silent for 5 minutes while another session in the
+  same process keeps checking in is removed.
+
+Background subagents load the installed extensions, so they load telecom. Foreground subagents
+load only the extensions their agent lists. To load telecom in every subagent, add it to the pi
+settings (`~/.pi/agent/settings.json`):
+
+```json
+{
+  "subagents": {
+    "defaultSubagentOnlyExtensions": ["~/.pi/agent/npm/node_modules/@justar_96/pi-telecom/src/index.ts"]
+  }
+}
+```
+
+Or list it under `subagentOnlyExtensions` in one agent's definition. Each subagent with telecom
+pays the tool's fixed prompt cost (about 950 tokens, cached), so read-only subagents may not need
+it.
 
 ### Messaging
 
+The `telecom` tool:
+
 | action | parameters | what it does |
 |---|---|---|
-| `board` | `scope?` | Shows who works here, on what, their claims and recent changes, and asks waiting on you. `scope: "machine"` covers every project. |
-| `send` | `to`, `message` | Messages one agent by callsign, session name or id. It wakes the agent if it's idle. |
-| `ask` | `to`, `message`, `timeoutSec?` | Sends a question and waits for the answer (default 300 s). A late answer still arrives as a message. |
-| `reply` | `message`, `askId?` | Answers an inbound ask. `askId` can be left out when only one ask is waiting. |
-| `broadcast` | `message`, `scope?` | Tells every agent in the project. It never wakes idle agents. |
-| `status` | `message` | Sets the one-line task your peers see. |
-| `claim` | `paths`, `message?` | Reserves paths or globs (`src/auth`, `src/**/*.test.ts`, `src/{api,db}/**`). |
+| `board` | `scope?` | Lists the agents in this repository: state, task, claims, recent changes, and asks waiting on this agent. `scope: "machine"` lists every agent on the machine. |
+| `send` | `to` or `paths`, `message` | Sends a message to one agent. Starts a turn if the agent is idle (see the wake limit below). |
+| `ask` | `to` or `paths`, `message`, `timeoutSec?` | Sends a question and waits for the answer (default 300 s, at most 1 h). An answer that arrives after the wait ended is delivered as a message. |
+| `reply` | `message`, `askId?` | Answers an inbound ask. `askId` can be omitted when only one ask is waiting. |
+| `broadcast` | `message`, `paths?`, `scope?` | Sends a message to every agent in the repository. Never starts a turn. |
+| `status` | `message` | Sets the task peers see. |
+| `claim` | `paths`, `message?` | Reserves paths or globs. |
 | `release` | `paths?` | Releases those claims, or all of them. |
 
-These rules keep agents from talking each other into endless loops:
+`to` is a callsign, session name or id as the board shows it.
 
-- **Wake limit.** Peer messages can start at most 6 turns per minute. Messages beyond that still
-  arrive, without starting a turn. Set `PI_TELECOM_MAX_WAKES=0` to never wake from a message.
-- **Asks always wake.** Someone is blocked waiting for the answer. An agent about to stop with an
+**`send` and `ask` by path.** With `paths` instead of `to`, the message goes to the agent that
+claims those paths: one in this checkout first, then one in another worktree. If nobody claims
+them, it goes to the agent that most recently changed a file there. If several agents claim them,
+or nobody claimed or changed them, the call is refused with the candidates and the call to use:
+
+```
+telecom({ action: "ask", paths: ["src/db/**"], message: "Is users.email unique?" })
+```
+
+**`broadcast` with paths.** Agents that read, changed or claim a file under `paths` receive the
+broadcast right away. The others receive it when their next run starts, not during their current
+one. A broadcast without `paths` goes to everyone right away.
+
+Delivery rules:
+
+- **Wake limit.** Direct messages and late answers start at most 6 turns per minute per agent
+  (`PI_TELECOM_MAX_WAKES`). Beyond that, they arrive without starting a turn.
+- **Asks always start a turn**, since the asker is waiting. An agent about to stop with an
   unanswered ask is reminded once.
-- **Simultaneous asks.** If two agents ask each other at the same moment, both waits are
-  interrupted, so neither sits waiting until the timeout. Each side sees the other's question.
-- **Cancelled and lost asks.** Pressing Esc on an ask withdraws it from the peer. If the peer's
+- **Wait cycles.** Each agent publishes which sessions its asks are waiting on. An ask to an agent
+  that is itself waiting interrupts that wait only if it closes a cycle: the two agents ask each
+  other, or alpha waits on bravo, bravo on charlie, and charlie asks alpha. The interrupted agent
+  sees the question, answers it, and the other asks then complete. Any other ask waits until the
+  agent's own ask has completed. The board and `send` results show who is waiting on whom:
+  `alpha [busy, waiting on bravo (asked 40s ago)]`.
+- **Cycles through a subagent.** If alpha is inside a foreground subagent run that waits on bravo,
+  alpha cannot read anything until that run ends. An ask from bravo to alpha is then refused at
+  once, and the refusal names the waiting ask bravo should answer.
+- **Cancelled asks.** Pressing Esc during an ask withdraws it from the peer. If the peer's
   session ends, the ask fails at once.
-- **Unresponsive peers.** A peer that hasn't checked in for 45 s is marked `unresponsive`.
-  Messages to it wait in its inbox, and its claims stop blocking anyone.
+- **Unresponsive peers.** A peer that hasn't checked in for 45 s is shown as `unresponsive`.
+  Messages to it wait in its inbox, and its claims don't block anyone.
 
 ## The `/telecom` command
 
 ```
-/telecom                     the team board for this project
+/telecom                     the board for this repository
 /telecom all                 every agent on this machine
-/telecom msg <agent> <text>  message an agent as its human (wakes it if it's idle)
-/telecom broadcast <text>    tell every agent in this project
-/telecom name <callsign>     rename this agent
+/telecom msg <agent> <text>  message an agent as its human (starts a turn if it's idle)
+/telecom broadcast <text>    message every agent in this repository
+/telecom name <callsign>     rename this session
 /telecom widget              show a live board above the editor
-/telecom release             release every claim this agent holds
+/telecom release             release every claim this session holds
 ```
 
 ## Configuration
 
-Telecom is configured with environment variables, so each terminal can have its own settings.
+Environment variables, read when a session starts:
 
 | variable | default | |
 |---|---|---|
 | `PI_TELECOM_GUARD` | `standard` | `strict`, `standard` or `off` (see [the edit guard](#the-edit-guard)) |
-| `PI_TELECOM_CALLSIGN` | next free | a fixed callsign for this session |
-| `PI_TELECOM_ASK_TIMEOUT_MS` | `300000` | how long `ask` waits by default (at most 1 h) |
-| `PI_TELECOM_MAX_WAKES` | `6` | peer messages per minute that may start a turn; `0` means never (asks still wake) |
-| `PI_TELECOM_CLAIM_TTL_MIN` | `120` | minutes without activity before a claim expires |
-| `PI_TELECOM_DIR` | see [How it works](#how-it-works) | where the shared directory lives |
+| `PI_TELECOM_CALLSIGN` | first free word | a fixed callsign for this session |
+| `PI_TELECOM_ASK_TIMEOUT_MS` | `300000` | default wait for `ask` (at most 1 h) |
+| `PI_TELECOM_MAX_WAKES` | `6` | messages per minute that may start a turn; `0` means none (asks still do) |
+| `PI_TELECOM_CLAIM_TTL_MIN` | `120` | minutes without an edit inside a claim before it expires |
+| `PI_TELECOM_DIR` | see [How it works](#how-it-works) | the shared directory |
 | `PI_TELECOM_DISABLE` | unset | `1` turns telecom off for this session |
 
-## Guarantees
+## Behavior under failure
 
-### Your prompt cache is unchanged
+### Prompt cache
 
-Telecom never changes the system prompt or tool definitions while a session runs. Everything it
-sends is appended to the end of the conversation, and it never rewrites a message that has
-already been sent. This was measured, not just designed: `npm run e2e:cache` records every request
-the model receives while a peer sends the agent a change notice, a broadcast, a team brief, and a
-message mid-run, then runs the same prompts without telecom.
+Telecom doesn't change the system prompt or the tool definitions while a session runs. Its
+messages are appended to the end of the conversation, and messages already sent are never
+rewritten, so the cached prefix of each request stays valid. The tool and its guidelines add
+about 950 prompt tokens to every session.
 
-| | system prompt or tools changed | earlier messages rewritten | cache hit rate* |
-|---|---|---|---|
-| Claude Opus 5.5, with telecom | never | never | **96.7 %** |
-| Claude Opus 5.5, without | never | never | **97.1 %** |
-| GPT-6.1 Sol, with telecom | never | never | **73.8 %** |
-| GPT-6.1 Sol, without | never | never | **74.8 %** |
+### Delivery
 
-<sub>* Prompt tokens served from cache, from the second request on. The first request is warm or
-cold depending on what ran before it, not on telecom. OpenAI's caching is best-effort, which
-explains the lower rates with and without telecom.</sub>
+- A message is removed from the inbox only after it is handled. After a crash it is delivered
+  again, and a duplicate is handled once.
+- `/reload` keeps the session's presence record and inbox, so peers don't see it leave, and
+  messages sent during the reload wait in the inbox. The new runtime keeps the callsign, claims,
+  task, unanswered inbound asks, and the asks whose answers may still arrive late.
+- If the same session is open in two pi processes (`pi -c` in two terminals), the younger process
+  stops using telecom and its footer shows `📡 off (session open elsewhere)`.
+- A session whose presence record disappears writes it again within about a second.
 
-The fixed cost is about 900 prompt tokens for the tool and its guidelines, cached after the
-first request.
+### Errors
 
-### Nothing is lost
-
-- **At-least-once delivery.** A message is removed from the inbox only after it's handled. After a
-  crash it's delivered again, and a duplicate is recognized and handled once.
-- **`/reload` is invisible to peers.** Messages sent during a reload wait in the inbox. The new
-  runtime keeps the callsign, claims, task and unanswered asks.
-- **One session, two terminals.** If the same session is open twice (`pi -c` in two terminals),
-  the second process steps back instead of both garbling one inbox. Its footer reads `📡 off`.
-- **Self-repair.** If a session's record disappears, the session rewrites it within a second.
-
-### Telecom never gets in your way
-
-- **A telecom bug never blocks your work.** In pi, a hook that throws blocks the tool it's
-  watching. Every telecom hook catches its own errors, reports them, and lets the tool run.
-- **Peers can't flood the model.** A peer's callsign, name and task end up in other models'
-  context, so they are validated, flattened to one line, and length-capped. Messages are capped
-  at 32 KB of text and 64 KB in total.
+- pi treats a throwing `tool_call` hook as a block. Telecom's hooks catch their own errors, report
+  them once, and let the tool run.
+- Telecom's background loop catches errors in each step, so one failing step doesn't stop the
+  heartbeat or ask timeouts. When pi disposes a session without the usual shutdown, telecom
+  removes its record.
+- Data from peers (callsign, name, task, claim notes, paths, event data) is validated, flattened
+  to one line, and length-capped before it reaches a model. Messages are limited to 32 KB of text
+  and 64 KB in total.
 
 ## How it works
 
-- **Same project** means the same project root: the nearest folder above the working directory
-  that contains `.git`, or the working directory itself when there is none. Each git worktree is
-  its own project. Use `scope: "machine"` or `/telecom all` to see agents in other projects.
-- **Shared directory.** Sessions coordinate through a directory: `$XDG_RUNTIME_DIR/pi-telecom`, or
-  `<tmpdir>/pi-telecom-<uid>` where that variable isn't set (macOS). It holds one presence record
-  and one inbox per session. Every file is written under a temporary name and then renamed, so a
-  reader never sees a half-written one. Telecom refuses to use the directory unless it's private
-  to your user (mode `0700`).
-- **Liveness** comes from the process table, not from heartbeats. On Linux a record's process must
-  also still have the same start time, so a reused process id isn't mistaken for a live agent.
-  Records left by crashed sessions are cleaned up.
-- **Paths** are compared in one canonical form: `@` and `~` handled the way pi's tools handle
-  them, resolved against the session's directory, with symlinks followed.
+- **Team.** A session's checkout is the nearest folder above its working directory that contains
+  `.git`, or the working directory when there is none. Checkouts that share a git common directory
+  form one repository, and the sessions in one repository form a team. `scope: "machine"` and
+  `/telecom all` show agents in other repositories.
+- **Shared directory.** `$XDG_RUNTIME_DIR/pi-telecom`, or `<tmpdir>/pi-telecom-<uid>` where that
+  variable isn't set (macOS). It holds one presence record and one inbox per session. Files are
+  written under a temporary name and then renamed, so a reader never sees a partial file. Telecom
+  doesn't use the directory unless it is private to the user (mode `0700`).
+- **Liveness.** A record is live while its process is. On Linux the process start time must also
+  match, so a reused process id isn't mistaken for a live session. Records of exited sessions are
+  removed. Subagents share their host's process, so they are also checked by heartbeat (see
+  [Subagents](#subagents)). A suspended process stops all of its sessions at once, so their
+  records are kept.
+- **Paths** are compared in canonical form: `@` and `~` are handled as pi's tools handle them,
+  relative paths are resolved against the session's directory, and symlinks are followed.
 
 ### Limits
 
-- Only changes made through pi's `edit` and `write` tools are tracked. A peer's `bash` changes
-  (`git checkout`, code generators) are not announced.
-- Any process running as your user can write to your inbox. That's the same trust boundary as
-  your files. Still, a peer's message is text from another model, and the model should treat it
-  that way.
-- Subagents started with pi-subagents join the team too, marked `(subagent)`, when telecom is in
-  their extension list.
+- Only changes made through pi's `edit` and `write` tools are tracked. Changes made by a peer's
+  `bash` (`git checkout`, code generators) produce no notice.
+- Whether a peer is near this agent's work is judged from the files this agent read or changed
+  and from claims. A peer working on related code in other files is not considered near.
+- A broadcast held for an agent's next run is not shown until that run starts.
+- Any process running as the same user can write to the inbox, the same trust boundary as the
+  user's files. A peer's message is text written by another model and should be treated that way.
+- Checks across worktrees compare paths, not contents: two worktrees changing different parts of
+  one file get a note even when git would merge them cleanly.
 
 ## Contributing
 
@@ -272,9 +377,8 @@ keep, and the release process. In short: `npm install && npm run check`.
 The message transport and the ask/reply bookkeeping are derived from
 [`@tinoy/pi-ipc`](https://github.com/tinoy1336/pi-extensions/tree/main/packages/ipc) and
 [`@tinoy/pi-ext-lib`](https://github.com/tinoy1336/pi-extensions/tree/main/packages/ext-lib) by
-Tinoy Thomas (MIT). Telecom adds the team layer (projects, callsigns, briefs, change notices,
-claims and the edit guard), macOS support, the separate `reply` action, and a fix for agents that
-ask each other at the same moment.
+Tinoy Thomas (MIT). Telecom adds the team layer (callsigns, briefs, change notices, claims and the
+edit guard), macOS support, the separate `reply` action, and wait-cycle detection.
 
 ## License
 

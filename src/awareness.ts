@@ -7,6 +7,11 @@
  * answers the question every parallel agent needs answered before it touches a file: "did
  * someone else move this since I looked at it?"
  *
+ * Views and changes are per CHECKOUT: a peer in another worktree of the repository edits its own
+ * copy of a file, so nothing here goes stale. What two lanes share is the merge, so a lane change
+ * to a file this agent also changed is noted once (`checkLanes`, `noteLaneChange`), and a claim
+ * made in another lane is advisory: the edit goes through with a note, and the owner is told.
+ *
  * Only changes attributable to a PEER are acted on. A file that moved for another reason — this
  * agent's own `bash` (a formatter, `sed -i`), the human's editor — is left alone, exactly as pi
  * would leave it without this extension. Telecom adds teamwork; it does not add a second opinion
@@ -17,7 +22,7 @@
  */
 import type { GuardMode } from "./config.ts";
 import { matchesClaim } from "./glob.ts";
-import { displayPath } from "./project.ts";
+import { displayPath, inCheckout, laneName, sameRepo } from "./project.ts";
 import type { Claim, Presence } from "./transport.ts";
 import { ago, fileFingerprint, setBounded } from "./util.ts";
 
@@ -45,10 +50,22 @@ interface View {
 
 export type Relation = "read" | "edited";
 
+/** A claim a peer ran into: its owner is told. `lane` when the peer is in another checkout. */
+export interface Contest {
+	owner: Presence;
+	claim: Claim;
+	lane?: boolean;
+}
+
+/**
+ * A guard verdict. A warning's one-time parts (`laneNotes`, a lane `contested`) are only proposed:
+ * the caller commits them once the call has succeeded (`commitLaneNotes`, `noteContested`), so a
+ * call that is blocked later or fails does not use them up.
+ */
 export type Verdict =
 	| { action: "allow" }
-	| { action: "warn"; note: string; staleChange?: PeerChange }
-	| { action: "block"; reason: string; contested?: { owner: Presence; claim: Claim } };
+	| { action: "warn"; note: string; staleChange?: PeerChange; contested?: Contest; laneNotes?: string[] }
+	| { action: "block"; reason: string; contested?: Contest };
 
 /** A peer change older than this, on a file this agent never looked at, is history, not news. */
 const UNSEEN_WINDOW_MS = 30 * 60_000;
@@ -69,6 +86,8 @@ export class Awareness {
 	private readonly changes = new Map<string, PeerChange>();
 	private readonly contested = new Map<string, number>();
 	private readonly staleBlocks = new Map<string, { changeAt: number; count: number }>();
+	/** Peer and path pairs already told about a change in another lane: once is enough. */
+	private readonly laneNoted = new Map<string, true>();
 
 	noteRead(path: string): void {
 		this.views.set(path, {
@@ -116,6 +135,15 @@ export class Awareness {
 		return [...this.views.keys()];
 	}
 
+	/** The files this agent works with: the ones a peer's change to would earn a notice. */
+	focusPaths(now = Date.now()): Set<string> {
+		const paths = new Set<string>();
+		for (const [path, view] of this.views) {
+			if (view.inContext && (view.via !== "read" || now - view.at <= READ_RELEVANCE_MS)) paths.add(path);
+		}
+		return paths;
+	}
+
 	/**
 	 * Record a peer's change. Returns how this agent relates to the file and whether this is the
 	 * first notice since this agent last looked at it — further edits by the peer do not change
@@ -129,6 +157,64 @@ export class Awareness {
 		const firstNotice = !view.notified;
 		view.notified = true;
 		return { relation: view.via === "read" ? "read" : "edited", firstNotice };
+	}
+
+	/**
+	 * A peer in another checkout changed its copy of the file at `path` (this agent's copy). Worth
+	 * a notice once per peer and file, and only when this agent changed its own copy: a read is no
+	 * conflict, since the files are separate. Never recorded as a peer change to `path` — its
+	 * bytes did not move, so the guard has nothing to say about it.
+	 */
+	noteLaneChange(peerId: string, path: string): boolean {
+		const view = this.views.get(path);
+		if (!view || view.via === "read") return false;
+		return this.firstLaneNote(peerId, path);
+	}
+
+	private firstLaneNote(peerId: string, path: string): boolean {
+		const key = `${peerId}\u0000${path}`;
+		if (this.laneNoted.has(key)) return false;
+		setBounded(this.laneNoted, key, true, CHANGE_CAP);
+		return true;
+	}
+
+	/** The lane notes a successful call showed: each is told once. */
+	commitLaneNotes(keys: readonly string[]): void {
+		for (const key of keys) setBounded(this.laneNoted, key, true, CHANGE_CAP);
+	}
+
+	/** A claim's owner was told about an edit to `path`: not again within the contest window. */
+	noteContested(ownerId: string, path: string): void {
+		this.contested.set(`${ownerId}\u0000${path}`, Date.now());
+	}
+
+	/**
+	 * Has a peer in another checkout of the repository changed this same file there? Nothing is
+	 * stale here, so this never blocks; it notes, once per peer and file, that the two changes
+	 * will meet when the branches merge.
+	 */
+	checkLanes(path: string, peers: readonly Presence[], self: Presence): Verdict {
+		const lines: string[] = [];
+		const keys: string[] = [];
+		let first: string | null = null;
+		for (const peer of peers) {
+			if (peer.id === self.id || peer.projectRoot === self.projectRoot || !sameRepo(peer, self)) continue;
+			const theirs = inCheckout(path, self.projectRoot, peer.projectRoot);
+			// The very same file (a checkout nested in the other): the stale check covers it.
+			if (theirs === path) continue;
+			const hit = theirs ? peer.recent.find((r) => r.path === theirs) : undefined;
+			const key = `${peer.id}\u0000${path}`;
+			if (!hit || this.laneNoted.has(key)) continue;
+			keys.push(key);
+			first ??= peer.callsign;
+			lines.push(`${peer.callsign} ${hit.op === "write" ? "rewrote" : "edited"} its copy ${ago(hit.at)}, in ${laneName(peer)}`);
+		}
+		if (!first) return { action: "allow" };
+		return {
+			action: "warn",
+			note: `⚠ telecom: ${displayPath(path, self.projectRoot)} — ${lines.join("; ")}. Your checkouts are separate, so this went through, but the two changes meet when the branches merge. If they may conflict, agree on one owner: telecom({ action: "send", to: "${first}", message: "…" }).`,
+			laneNotes: keys,
+		};
 	}
 
 	/** The latest peer change to `path`, from pushed events or from live peers' records. */
@@ -216,31 +302,46 @@ export class Awareness {
 
 	/**
 	 * Is `path` inside a live peer's claim? Standard mode blocks the first attempt and lets a
-	 * retry through (the owner is told either way); strict blocks every attempt.
+	 * retry through (the owner is told either way); strict blocks every attempt. A claim made in
+	 * another checkout of the repository is advisory: a note, and the owner told once. Claims of
+	 * this agent's lineal family (`exempt`: its parent chain and its subagents) never apply.
 	 */
 	checkClaims(
 		path: string,
 		mode: GuardMode,
 		peers: readonly Presence[],
-		selfId: string,
-		root: string,
+		self: Presence,
+		exempt: ReadonlySet<string>,
 	): Verdict {
 		if (mode === "off") return { action: "allow" };
 		const now = Date.now();
+		const root = self.projectRoot;
+		// Advisory matches are kept aside while the scan goes on: a binding claim further down the
+		// list (a responsive owner in this checkout) must still hold the edit back.
+		let lane: { peer: Presence; claim: Claim; what: string } | null = null;
+		let unenforced: string | null = null;
 		for (const peer of peers) {
-			if (peer.id === selfId || peer.projectRoot !== root) continue;
+			if (peer.id === self.id || exempt.has(peer.id) || !sameRepo(peer, self)) continue;
+			// A claim is written against its owner's checkout. `theirs` is the file there that this
+			// edit stands for: the target itself when it physically lies in the owner's checkout
+			// (then the claim binds, from any lane), else this lane's copy (then it is advisory).
+			const theirs = inCheckout(path, root, peer.projectRoot);
+			if (theirs === null) continue;
+			const otherLane = theirs !== path;
 			for (const claim of peer.claims) {
-				if (claim.expiresAt <= now || !matchesClaim(path, claim.pattern, root)) continue;
+				if (claim.expiresAt <= now || !matchesClaim(theirs, claim.pattern, peer.projectRoot)) continue;
 				const shown = displayPath(path, root);
 				const what = `${shown} is inside ${peer.callsign}'s claim "${claim.pattern}"${
 					claim.note ? ` (${claim.note})` : ""
 				}, held since ${ago(claim.since)}`;
+				if (otherLane) {
+					lane ??= { peer, claim, what };
+					continue;
+				}
 				if (now - peer.heartbeatAt > UNRESPONSIVE_MS) {
 					// A suspended or hung owner cannot answer, so its claim must not block anyone.
-					return {
-						action: "warn",
-						note: `⚠ telecom: ${what}, but ${peer.callsign} has not checked in for ${ago(peer.heartbeatAt).replace(" ago", "")}, so the claim is not enforced. Tell them what you changed when they are back.`,
-					};
+					unenforced ??= `⚠ telecom: ${what}, but ${peer.callsign} has not checked in for ${ago(peer.heartbeatAt).replace(" ago", "")}, so the claim is not enforced. Tell them what you changed when they are back.`;
+					continue;
 				}
 				const key = `${peer.id}\u0000${path}`;
 				const warnedAt = this.contested.get(key);
@@ -261,6 +362,25 @@ export class Awareness {
 				};
 			}
 		}
-		return { action: "allow" };
+		const advisory = lane ? this.laneClaim(path, lane.peer, lane.claim, lane.what, now) : null;
+		if (!unenforced) return advisory ?? { action: "allow" };
+		return {
+			action: "warn",
+			note: advisory ? `${unenforced}\n${advisory.note}` : unenforced,
+			...(advisory?.contested ? { contested: advisory.contested } : {}),
+		};
+	}
+
+	/** A claim from another checkout: advisory. The owner is told (by the caller, on success). */
+	private laneClaim(path: string, peer: Presence, claim: Claim, what: string, now: number): Verdict & { action: "warn" } {
+		const warnedAt = this.contested.get(`${peer.id}\u0000${path}`);
+		const tell = warnedAt === undefined || now - warnedAt >= CONTEST_WINDOW_MS;
+		return {
+			action: "warn",
+			note: `⚠ telecom: ${what}, in ${laneName(peer)}. Your checkout is separate, so this went through, but the two changes meet when the branches merge${
+				tell ? ` — ${peer.callsign} has been told` : ""
+			}. If they may conflict, agree on one owner: telecom({ action: "send", to: "${peer.callsign}", message: "…" }).`,
+			...(tell ? { contested: { owner: peer, claim, lane: true } } : {}),
+		};
 	}
 }

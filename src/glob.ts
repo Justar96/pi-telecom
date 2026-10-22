@@ -7,7 +7,7 @@
  *   - `{a,b}` alternates: `src/{api,db}/**`
  * A trailing `/` or `/**` on a plain directory means the same thing as the bare directory.
  */
-import { isAbsolute, join, normalize } from "node:path";
+import { isAbsolute, join, normalize, relative } from "node:path";
 import { isWithin } from "./project.ts";
 
 const GLOB_CHARS = /[*?[{]/;
@@ -63,19 +63,39 @@ export function absolutePattern(pattern: string, root: string): string {
 	return normalize(joined).replace(/\/+$/, "").replace(/\/\*\*$/, "") || "/";
 }
 
+/**
+ * A claim as it reads from another checkout of the same repository: relative to its owner's
+ * checkout, so the same pattern names the same files of the repository in every lane. `null` for
+ * an absolute pattern outside the owner's checkout.
+ */
+export function laneRelativePattern(pattern: string, ownerRoot: string): string | null {
+	const trimmed = pattern.trim().replace(/^\.\//, "");
+	if (!isAbsolute(trimmed)) return trimmed;
+	const rel = relative(ownerRoot, trimmed);
+	if (rel === "") return ".";
+	return rel.startsWith("..") || isAbsolute(rel) ? null : rel;
+}
+
 /** Does an absolute file path fall inside a claim pattern? */
 export function matchesClaim(path: string, pattern: string, root: string): boolean {
+	return claimMatcher(pattern, root)(path);
+}
+
+/** `matchesClaim` with the pattern compiled once, for testing many paths against one claim. */
+export function claimMatcher(pattern: string, root: string): (path: string) => boolean {
 	const anchored = absolutePattern(pattern, root);
-	if (!GLOB_CHARS.test(anchored)) return isWithin(path, anchored);
+	if (!GLOB_CHARS.test(anchored)) return (path) => isWithin(path, anchored);
 	const regex = globToRegExp(anchored);
-	if (regex.test(path)) return true;
-	// A glob naming directories (`src/*/internal`) also claims what is under them.
-	let dir = path;
-	while (dir.includes("/")) {
-		dir = dir.slice(0, dir.lastIndexOf("/"));
-		if (dir && regex.test(dir)) return true;
-	}
-	return false;
+	return (path) => {
+		if (regex.test(path)) return true;
+		// A glob naming directories (`src/*/internal`) also claims what is under them.
+		let dir = path;
+		while (dir.includes("/")) {
+			dir = dir.slice(0, dir.lastIndexOf("/"));
+			if (dir && regex.test(dir)) return true;
+		}
+		return false;
+	};
 }
 
 /** Do two claim patterns overlap? Exact for plain paths; conservative for globs. */

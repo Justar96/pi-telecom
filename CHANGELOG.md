@@ -6,6 +6,80 @@ All notable changes to `@justar_96/pi-telecom`. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Worktrees are lanes of one team.** Agents in the main checkout and in git worktrees of the
+  same repository (sharing a git common directory) now see each other, with each agent's lane on
+  the board. Callsigns are unique across the repository. The edit guard still works within a
+  checkout. Across lanes, an agent is told once when a peer edits a file it also changed in its own
+  checkout, since the two changes meet at merge. A claim made in another worktree is advisory:
+  the edit goes through with a note, the owner is told once, and overlapping claims are allowed
+  with a note.
+- **Subagents join as family.** pi-subagents children are recognized whether they run in the
+  foreground (inside the parent's pi process, found through the session header) or in the
+  background (a runner process, found through `PI_SUBAGENT_CHILD`, `PI_SUBAGENT_PARENT_SESSION`
+  and `PI_SUBAGENT_RUNNER_PID`). Processes a background subagent starts, such as a test suite
+  or another `pi`, are not subagents.
+  - A subagent is named after its parent (`alpha-1`), listed under it, and ignores the parent's
+    inherited `PI_TELECOM_CALLSIGN`.
+  - It is never held back by its parent's claims and may claim part of them. Siblings still hold
+    each other back.
+  - Subagents don't trigger join or leave notices. Other agents' briefs fold them into their
+    parent's entry, and a parent and its own subagents get no briefs about each other.
+- **Briefs scale past a handful of agents.** With more than three other agents, a brief describes
+  in full only the peers near this agent's work: those that changed a file it is working with,
+  hold a claim over its files or overlapping its claims, share its parent, or have messaged with
+  it. The rest share one roster line, and their task changes and new claims are held back from
+  later briefs (the guard still stops an edit inside their claims). Joins, departures and
+  releases are always reported. A peer that comes near is described when it does, and news held
+  back meanwhile is reported then.
+- **Wait cycles are found, not guessed.** Each agent publishes whom its open asks wait on. An
+  ask to an agent that is itself waiting now interrupts that wait only when the two waits form a
+  cycle, for example A waits on B, B on C, and C asks A. Before, any ask interrupted any wait, so
+  with three agents a plain queue broke up and an answer that was coming was abandoned. The
+  board and `send` results show who is waiting on whom.
+- **Asking by path.** `send` and `ask` take `paths` instead of `to`, and reach the agent that
+  claims those paths, or else the one that changed a file there last. If that's ambiguous, or
+  nobody fits, the call is refused with the choices.
+- **Broadcasts that don't interrupt.** A `broadcast` with `paths` reaches agents working there
+  at once. The others get it when their next run starts, not in the middle of their current one.
+- An ask that would close a wait cycle at an agent inside a foreground subagent run (which can't
+  read anything until that run ends) is refused at once, naming the waiting ask to answer instead.
+- Presence records carry optional `repo`, `parent`, `waitingOn` and `waitingSince` fields,
+  broadcasts an optional `paths` list, and `claim.contested` an optional `lane` flag. Older
+  sessions ignore them, group by checkout as before, and are treated as unknown in the wait
+  graph, so an ask from or through one interrupts as it always did.
+
+### Fixed
+
+- An ask that stopped waiting (timed out or interrupted) lost its late answer's wake-up after a
+  `/reload`: the answer arrived as an ordinary reply, without starting a turn.
+- When two agents asked each other at once, both waits were interrupted, and each answer came
+  back later as a separate message instead of as the ask's result. Now only one side stops
+  waiting, answers, and the other gets that answer as its result.
+- A foreground subagent that asked its parent waited out the whole ask timeout, because the
+  parent was blocked waiting for that subagent. The ask is now refused at once, with what to do
+  instead, and so is an ask to any foreground ancestor further up. Peers messaging a parent that
+  is waiting on a subagent are told so.
+- An error inside telecom's background loop could crash the process hosting the session, which
+  for a subagent is the parent's pi or the runner. The loop now catches its own errors, step by
+  step, so one failing step never stops the heartbeat or ask timeouts.
+- A directory inside an inbox raised an error on every tick. It is now removed like any other
+  unreadable entry.
+- A session that pi disposed without `session_shutdown` kept heartbeating as a live peer for as
+  long as its process lived. Telecom now notices and leaves the switchboard. A subagent record
+  that stays silent for 5 minutes while another session in its process keeps checking in is
+  dropped. A suspended process keeps all its sessions.
+- When a session ended, peers held back by its claims were never told those claims were free.
+  They now get the same notice as for a release.
+- A peer's checkout path reached other models without validation. Records whose `cwd` or
+  `projectRoot` contain control characters are now ignored.
+
+### Changed
+
+- Checked against pi 1.4.0, whose extension API is unchanged from 1.3; the pi devDependency is
+  now 1.4.0.
+
 ## [0.1.1] - 2026-10-21
 
 ### Fixed

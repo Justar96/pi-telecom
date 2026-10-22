@@ -5,7 +5,12 @@
  * A session takes the first NATO word no live peer in its project holds. Two sessions that start
  * in the same instant can pick the same word; the younger one notices on its next tick and moves
  * to the next free word, so the set converges without a lock.
+ *
+ * Callsigns are unique across a repository, not just a checkout: agents in sibling worktrees are
+ * one team. A subagent is named after its parent (`alpha-1`, `alpha-2`), so a family reads as one
+ * at a glance and children never use up the words top-level sessions start with.
  */
+import { sameRepo } from "./project.ts";
 import type { Presence } from "./transport.ts";
 
 export const NATO = [
@@ -28,15 +33,27 @@ export function pickCallsign(taken: ReadonlySet<string>, wanted?: string): strin
 	}
 }
 
+/** Longest stem of a child callsign: room for `-` and a five-digit number within 32 characters. */
+const CHILD_STEM_CAP = 26;
+
+/** The first free callsign for a subagent of `parent`: `alpha-1`, `alpha-2`, … */
+export function childCallsign(parent: string, taken: ReadonlySet<string>): string {
+	const stem = parent.slice(0, CHILD_STEM_CAP);
+	for (let n = 1; ; n++) {
+		const candidate = `${stem}-${n}`;
+		if (!taken.has(candidate)) return candidate;
+	}
+}
+
 /**
- * Does this session have to give its callsign up? Yes when an OLDER live peer in the same project
- * holds the same one (older = started first; the session id breaks a tie).
+ * Does this session have to give its callsign up? Yes when an OLDER live peer in the same
+ * repository holds the same one (older = started first; the session id breaks a tie).
  */
 export function mustYield(self: Presence, peers: readonly Presence[]): boolean {
 	return peers.some(
 		(peer) =>
 			peer.id !== self.id &&
-			peer.projectRoot === self.projectRoot &&
+			sameRepo(peer, self) &&
 			peer.callsign === self.callsign &&
 			(peer.startedAt < self.startedAt || (peer.startedAt === self.startedAt && peer.id < self.id)),
 	);

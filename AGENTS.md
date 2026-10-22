@@ -27,7 +27,12 @@ TELECOM_LIVE_PROVIDER=<provider> npm run screenshots       # docs/images/team.pn
 **Models.** Live tests, results and docs use exactly the models in `scripts/lab-models.mjs`:
 Claude Opus 5.5 and GPT-6.1 Sol. Don't name other models in docs or examples. When a lab ships a
 newer model, replace its entry there, re-run `e2e:matrix`, `e2e:cache` and `screenshots`, and
-update the numbers in the README.
+update the README where it names them.
+
+**No measured numbers in the README.** Cache hit rates and live-test timings depend on the
+provider, proxy and machine the tests ran on, not on telecom, so they don't belong in user-facing
+docs. `e2e:cache` and `e2e:matrix` are checks that pass or fail; report their results in the
+pull request or release notes, not in the README.
 
 The scripts exit `0` on pass, `1` when a check fails, and `2` when a precondition is missing (for
 example, no model configured). Never treat `2` as a pass. The live scripts load only this
@@ -51,11 +56,12 @@ what ran before it.
 | `src/tool.ts` | The static half of the `telecom` tool: schema, description, guidelines, renderers, `ok`/`fail`. Fixed at registration (rule 1). |
 | `src/notices.ts` | Change-notice text: the summary sent about an own edit, and the notice shown about a peer's. Pure. |
 | `src/transport.ts` | The wire: root directory, liveness, presence records, envelopes, typed event payloads (`parseEvent`), `deliver`/`drain`, reload handoff, and **all validation of peer data**. |
-| `src/awareness.ts` | What this agent has seen (views), what peers changed, and the guard's verdicts. Pure decisions; the caller acts on them. |
-| `src/ledger.ts` | Asks this agent is waiting on, and asks it owes an answer. |
-| `src/board.ts` | Board text and team briefs (full, then only the changes). |
+| `src/awareness.ts` | What this agent has seen (views), what peers changed, and the guard's verdicts (stale files, claims, lane overlaps). Pure decisions; the caller acts on them. |
+| `src/family.ts` | pi-subagents children: detecting a session's parent (`detectLineage`), its lineal family (`lineOf`), and foreground children (`isForegroundChild`). |
+| `src/ledger.ts` | Asks this agent is waiting on, asks it owes an answer, and the wait-for graph (`closesCycle`). |
+| `src/board.ts` | Board text and team briefs (full, then only the changes; with many agents, only the relevant peers in full). |
 | `src/glob.ts` | Claim patterns: matching and overlap. |
-| `src/project.ts` | Project root, git branch, canonical paths. |
+| `src/project.ts` | Checkout (project root), repository (`findRepo`: the git common dir), lanes (`sameRepo`, `laneName`, `inCheckout`), git branch, canonical paths. |
 | `src/callsign.ts` | Callsign choice and collision handling. |
 | `src/config.ts` | Every `PI_TELECOM_*` variable, read at session start (never at import). |
 | `src/render.ts` | TUI renderers for telecom messages. |
@@ -67,21 +73,39 @@ what ran before it.
 | `reference/` | Gitignored. A clone of tinoy1336/pi-extensions at `6a71be3`, the code the transport was derived from. Recreate it with `git clone https://github.com/tinoy1336/pi-extensions.git reference/pi-extensions`. |
 
 Runtime imports are acyclic: `index → board, notices → awareness → glob → project`, `index →
-tool → util`, and `transport → config → callsign`. `callsign.ts` imports only *types* from
-`transport.ts` (erased at load), which is what keeps that pair from forming a cycle. Keep it acyclic: an ESM import cycle can hand
-a module an uninitialized binding.
+tool → util`, `index, board → family → transport`, `transport → ledger → util`, and `transport → config →
+callsign → project`. `callsign.ts` imports only *types* from `transport.ts` (erased at load), which is what
+keeps that pair from forming a cycle. Keep it acyclic: an ESM import cycle can hand a module an
+uninitialized binding.
 
 ## How it fits together
 
+- **Team, lanes, family.** The team is every session in one repository: checkouts that share a
+  git common directory (`findRepo`). Each checkout is a lane. Views, stale checks and change
+  notices are per checkout (a peer in another worktree edits its own copy); claims and
+  overlapping edits are compared across lanes by repository-relative path, and are advisory there.
+  `repo` is optional on the wire, so a peer without it is grouped by `projectRoot` alone
+  (`sameRepo`). A pi-subagents child publishes `role: "child"` and `parent`; its lineal family
+  (`lineOf`) is exempt from each other's claims, and briefs fold it into its parent.
 - **Shared directory** (`transport.ts`): `presence/<session>.json` (each written only by its
   owner) and `inbox/<session>/<seq>-<id>.json`. Every write goes to a temporary name and is then
-  renamed. Presence records are checked against the process table, not heartbeats.
-- **The loop** (`tick()` in `index.ts`, every 500 ms, `unref`'d): drain the inbox → refresh the
+  renamed. Presence records are checked against the process table, not heartbeats, except
+  that a child record that fell `CHILD_SILENT_MS` behind another record of its own process is
+  gone (children share their host's pid; `hostBeats`). A suspended process falls behind as a
+  whole, so its children stay.
+- **The loop** (`tick()` in `index.ts`, every 500 ms, `unref`'d, never throws: a throw from a
+  timer would crash the host process): leave if pi disposed the runtime → drain the inbox → refresh the
   team every 2nd tick (repair our own record, detect the same session open twice, resolve callsign
   collisions, notice joins and leaves) → flush pending change notices → expire asks → heartbeat
   every 15 s (expire claims, re-read the branch, sweep dead records).
+- **The guard's one-time parts** (a lane note, telling a lane claim's owner) are proposed by the
+  verdict and committed in `tool_result` only when the call succeeded, so a call blocked by a
+  later check, or one that fails, does not use them up. A claim that blocks is told at once. An
+  advisory match (another lane, an unresponsive owner) never hides a binding claim later in the
+  scan.
 - **Envelope kinds:** `message`, `broadcast`, `ask`, `answer`, and `event`. Event topics are
-  `file.changed`, `claim.contested`, `claim.released` and `ask.withdrawn`.
+  `file.changed`, `claim.contested` (with `lane: true` when the edit was in another checkout and
+  nothing was held back), `claim.released` and `ask.withdrawn`.
 - **Delivery to the model** (`inject` modes):
 
   | mode | used for | when busy | when idle |
@@ -89,6 +113,28 @@ a module an uninitialized binding.
   | `wake` | direct messages, late answers | steered in | starts a turn (wake-limited) |
   | `wake-always` | asks (a peer is blocked) | steered in | starts a turn |
   | `passive` | notices, broadcasts, claim news | steered in | appended, no turn |
+  | `later` | broadcasts about paths away from this agent's work | held for the next run (`deliverAs: "nextTurn"`) | held for the next run |
+
+- **Asks and the wait-for graph.** A session publishes `waitingOn` (the sessions its open asks
+  wait on, at most `WAITS_CAP`) before it delivers an ask and again when the wait ends. An
+  inbound ask interrupts this agent's own wait only when `closesCycle` says this agent already
+  waits, directly or through others, on the asker. A busy foreground subagent counts as an edge
+  from its parent. New sessions always publish `waitingOn`, possibly empty. A record without it
+  is an older telecom, and a list at the cap may have been cut: either way the graph is unknown
+  (`null`) and the ask interrupts, as it always did. An asker whose record no longer waits on us
+  has stopped waiting, and closes no cycle. A peer inside a foreground subagent run cannot be
+  interrupted at all, so `askAction` refuses an ask that would close a cycle there, and names the
+  inbound ask to answer instead.
+- **Addressing by path** (`ownerOf`): `send`/`ask` with `paths` and no `to` go to the one agent
+  claiming them (this checkout first, then other lanes), else the latest to change a file there.
+  Several claimants, or none at all, is a refusal with the exact calls.
+- **Briefs with many agents.** Up to `DESCRIBE_ALL_UP_TO` other units (a top-level agent with its
+  subagents folded in), a brief describes everyone. Beyond that it describes only units that
+  touch this agent's focus (`Focus`: `awareness.focusPaths()` and the sessions it messaged
+  with), and the rest share a roster line. Deltas hold back a far unit's task changes and new
+  claims, but always report joins, departures, callsign changes and releases of told claims.
+  `BriefState` stores what the model was TOLD, so held-back news is reported once the unit is
+  near again; `holders` (current, per claim) decides which claims a departure frees.
 
 ## Rules the code must keep
 
@@ -129,7 +175,9 @@ Each rule has a test or an e2e check. Read the reason before bending a rule.
     `details` (`outputSchema`: `{ ok, ... }`). Keep `annotations` accurate. Keep the description
     short, since every session pays for it in tokens.
 
-## pi API facts this code relies on (pi 1.3)
+## pi API facts this code relies on (pi 1.3 and 1.4)
+
+The extension types are identical in 1.3.0 and 1.4.0; the devDependency tracks 1.4.0.
 
 - `pi.sendMessage(msg)` with no options **steers** the message in while the agent is streaming,
   and appends it without a turn while idle. With `{ triggerTurn: true }` it steers while
@@ -147,8 +195,28 @@ Each rule has a test or an e2e check. Read the reason before bending a rule.
 - Session ids are UUIDv7: the first 8 characters are a timestamp that every session started in
   the same minute shares. Show ids with `shortId()` (the random tail) and match them with
   `idMatches()`; never `id.slice(0, 8)`.
+- Disposing a session invalidates its extension API: every later `pi.*` call throws ("ctx is
+  stale"). `tick()` probes `pi.getSessionName()` and leaves the switchboard when it throws.
 - RPC mode (`pi --mode rpc`) runs extension commands with no model call. The e2e scripts drive it
   and read `extension_ui_request` records (`notify`, `setStatus`).
+
+## pi-subagents facts this code relies on (0.80)
+
+- A **foreground** child is an SDK session inside the parent's own pi process (same pid), while
+  the parent waits in its `subagent` tool call. Nothing in the environment marks it; its session
+  header's `parentSession` is the parent's session file. It loads only the extensions its agent
+  lists (`extensions`, `subagentOnlyExtensions`, `subagents.defaultSubagentOnlyExtensions`).
+- A **background** child runs in a detached runner process with `PI_SUBAGENT_CHILD=1`,
+  `PI_SUBAGENT_PARENT_SESSION=<root parent id>` and `PI_SUBAGENT_RUNNER_PID=<runner pid>`; it
+  loads the ambient extensions. One runner can host several children, so they share a pid. Every
+  process the runner starts (a child's `bash`, a test suite, another `pi`) inherits all three, so
+  only a process whose pid equals `PI_SUBAGENT_RUNNER_PID` hosts children.
+- Children get `session_start` with reason `startup`, and `session_shutdown` with reason `quit`
+  raced against a timeout before `dispose()`.
+- `worktree: true` runs a child in `<dirname(repo)>/worktrees/<repo>/pi-worktree-<run>-<n>`, a
+  real `git worktree add`.
+- A foreground child that calls `contact_supervisor` detaches its run, so the parent can answer;
+  telecom's `ask` cannot, which is why an ask to a foreground parent is refused.
 
 The docs ship with pi: `<pi install>/node_modules/@earendil-works/pi-coding-agent/docs/`, mainly
 `extensions.md`, `packages.md` and `tui.md`, plus `examples/extensions/README.md` (Key Patterns).
@@ -178,6 +246,9 @@ The exact types are in `dist/core/extensions/types.d.ts`.
   - The harness sets `PI_TELECOM_TICK_MS=20` and a scratch `PI_TELECOM_DIR` *before* importing
     the extension.
   - To simulate a different live process, write a presence record with `pid: process.ppid`.
+  - Every harness session shares the test's pid, so `new Session(dir, { parentSession:
+    a.sessionFile() })` is a foreground subagent of `a`. `session.disposed = true` simulates pi
+    disposing it.
 - **Coverage:** a new behavior needs a scenario test, and a fix needs a test that fails without
   it. Anything that depends on pi's real lifecycle (reload, RPC, session ids) also needs a check
   in `scripts/e2e-rpc.mjs`.

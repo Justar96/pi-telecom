@@ -27,7 +27,12 @@ export const TOOL_PARAMETERS = Type.Object({
 	to: Type.Optional(Type.String({ description: "send/ask: callsign, session name or id (as the board shows it)." })),
 	message: Type.Optional(Type.String({ description: "The text; for status your task; for claim the reason." })),
 	askId: Type.Optional(Type.String({ description: "reply: the ask's handle (optional if only one is waiting)." })),
-	paths: Type.Optional(Type.Array(Type.String(), { description: "claim/release: project-relative paths or globs." })),
+	paths: Type.Optional(
+		Type.Array(Type.String(), {
+			description:
+				"Project-relative paths or globs. claim/release: what to reserve. send/ask without `to`: reach whoever claims or last changed them. broadcast: what it is about.",
+		}),
+	),
 	timeoutSec: Type.Optional(Type.Number({ description: "ask: seconds to wait (default 300)." })),
 	scope: Type.Optional(
 		StringEnum(["project", "machine"] as const, { description: 'board/broadcast: "project" (default) or "machine".' }),
@@ -66,8 +71,8 @@ export const TOOL_SPEC = {
 	description: [
 		"Coordinate with other pi agents working in parallel (this project by default). Agents have callsigns: alpha, bravo, ….",
 		"board: who works here, on what, their claims and recent changes (scope machine: all projects).",
-		"send: message an agent (to = callsign); wakes it if idle. ask: same, then wait for the answer. reply: answer an inbound ask (askId).",
-		"broadcast: tell the whole project (never wakes idle agents). status: set the task peers see (message).",
+		"send: message an agent (to = callsign, or paths = whoever owns them); wakes it if idle. ask: same, then wait for the answer. reply: answer an inbound ask (askId).",
+		"broadcast: tell the whole project (never wakes idle agents); with paths, agents working elsewhere get it at their next prompt. status: set the task peers see (message).",
 		"claim: reserve paths/globs so peers stay out (message = why). release: give them back (all if paths omitted).",
 	].join("\n"),
 	promptSnippet: "Coordinate with parallel pi agents: team board, message/ask/reply, broadcast, claim paths",

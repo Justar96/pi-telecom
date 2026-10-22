@@ -2,8 +2,8 @@
  * pi-telecom — parallel pi agents in one project, working as a team.
  *
  * Every pi session that loads this extension joins a machine-local switchboard (see
- * `transport.ts`). Sessions whose working directory resolves to the same project root form a
- * team, and each member gets:
+ * `transport.ts`). Sessions working in one repository form a team — in the same checkout, or in
+ * sibling git worktrees (each checkout is a LANE; see `project.ts`) — and each member gets:
  *
  *   - a CALLSIGN (alpha, bravo, …) peers and humans can address it by;
  *   - a live PRESENCE record: busy/idle, current task (taken from the prompt, or set by the
@@ -20,6 +20,9 @@
  *   - the `/telecom` COMMAND for the human: the board, renaming, messaging an agent directly,
  *     and a live board widget.
  *
+ * pi-subagents children join as FAMILY (see `family.ts`): named after their parent (`alpha-1`),
+ * listed under it, folded into it in briefs, and never held back by their parent's claims.
+ *
  * Messaging is derived from @tinoy/pi-ipc (MIT, github.com/tinoy1336/pi-extensions); the team
  * layer — projects, callsigns, briefs, change notices, claims and the guard — is new.
  */
@@ -31,14 +34,15 @@ import type {
 	ToolCallEventResult,
 	ToolResultEvent,
 } from "@earendil-works/pi-coding-agent";
-import { Awareness, type PeerChange, UNRESPONSIVE_MS, type Verdict } from "./awareness.ts";
+import { Awareness, type Contest, type PeerChange, UNRESPONSIVE_MS, type Verdict } from "./awareness.ts";
 import { type BriefState, renderBoard, renderBrief } from "./board.ts";
-import { CALLSIGN_PATTERN, mustYield, NATO, pickCallsign } from "./callsign.ts";
+import { CALLSIGN_PATTERN, childCallsign, mustYield, NATO, pickCallsign } from "./callsign.ts";
 import { MAX_ASK_TIMEOUT_MS, readConfig, type TelecomConfig } from "./config.ts";
-import { absolutePattern, claimsOverlap, matchesClaim } from "./glob.ts";
-import { type AskOutcome, createAskLedger, type InboundAsk } from "./ledger.ts";
+import { blockedOnMe, detectLineage, isForegroundChild, lineOf, parentOf } from "./family.ts";
+import { absolutePattern, claimMatcher, claimsOverlap, laneRelativePattern, matchesClaim } from "./glob.ts";
+import { type AskOutcome, closesCycle, createAskLedger, type InboundAsk, WAITS_CAP, waitedOn } from "./ledger.ts";
 import { type PendingNotice, renderNotice, summarizeOwnChange } from "./notices.ts";
-import { canonicalPath, displayPath, findProjectRoot, readBranch } from "./project.ts";
+import { canonicalPath, displayPath, findProjectRoot, findRepo, inCheckout, isWithin, laneName, readBranch, sameRepo } from "./project.ts";
 import { MESSAGE_TYPES, registerRenderers, type TelecomMessageDetails } from "./render.ts";
 import { fail, ok, TOOL_SPEC, type ToolAction, type ToolParams, type ToolResult } from "./tool.ts";
 import {
@@ -77,6 +81,8 @@ const CLAIM_NOTE_CAP = 120;
 const CALL_MAP_CAP = 256;
 /** Envelope ids already handled, so an at-least-once redelivery is not handled twice. */
 const SEEN_CAP = 2_048;
+/** Sessions this agent has talked with directly; they stay relevant in its briefs. */
+const CONTACTS_CAP = 256;
 /** A reload handoff older than this belongs to a runtime that did not come back. */
 const HANDOFF_MAX_AGE_MS = 5 * 60_000;
 
@@ -91,6 +97,8 @@ interface Handoff {
 	taskAt?: number;
 	inboundAsks: Array<{ id: string; from: string; fromCallsign: string; text: string; at: number }>;
 	contesters: Array<[string, Array<[string, string]>]>;
+	/** Asks whose answer now arrives late: it must still wake the replacement runtime. */
+	abandonedAsks?: Array<[string, { toCallsign: string; text: string }]>;
 }
 
 /** What the guard learns at `tool_call` and needs again at the matching `tool_result`. */
@@ -101,11 +109,16 @@ interface CallState {
 	existedBefore?: boolean;
 	/** The peer change a warned (stale) edit was applied over. */
 	staleOver?: PeerChange;
+	/** Lane notes shown with this call: spent only if it succeeds. */
+	laneNotes?: string[];
+	/** A claim in another checkout this call edits inside: its owner is told only if it succeeds. */
+	laneContest?: Contest;
 }
 
-type InjectMode = "wake" | "passive" | "wake-always";
+type InjectMode = "wake" | "passive" | "wake-always" | "later";
 type MessageDetails = TelecomMessageDetails & Record<string, unknown>;
-type Target = { ok: true; peer: Presence } | { ok: false; reason: string };
+/** `via`: how a target found by path was picked ("claims …", "changed … ago"), for the result. */
+type Target = { ok: true; peer: Presence; via?: string } | { ok: false; reason: string };
 
 /** One `telecom` tool call, with the session state it acts on already checked present. */
 interface ActionCall {
@@ -128,7 +141,8 @@ export default function telecom(pi: ExtensionAPI): void {
 	let tickCount = 0;
 	let lastHeartbeat = 0;
 	let peersCache: Presence[] = [];
-	let teamIds = new Set<string>();
+	/** The team as of the last refresh, with each member's role (subagents come and go quietly). */
+	let teamIds = new Map<string, Presence["role"]>();
 	let briefState: BriefState | null = null;
 	let widgetOn = false;
 	let unavailable: string | null = null;
@@ -142,6 +156,7 @@ export default function telecom(pi: ExtensionAPI): void {
 	/** Who was held back by each of our claims (pattern → peer id → callsign), so a release can tell them. */
 	const contesters = new Map<string, Map<string, string>>();
 	const seen = new Map<string, true>();
+	const contacts = new Map<string, true>();
 	const reported = new Set<string>();
 
 	registerRenderers(pi);
@@ -217,9 +232,30 @@ export default function telecom(pi: ExtensionAPI): void {
 		return peersCache;
 	}
 
-	/** Live peers in this project, this session excluded. */
+	/** Live peers in this repository (this checkout or a sibling worktree), this session excluded. */
 	function team(peers: readonly Presence[] = peersCache): Presence[] {
-		return peers.filter((p) => self && p.id !== self.id && p.projectRoot === self.projectRoot);
+		return peers.filter((p) => self && p.id !== self.id && sameRepo(p, self));
+	}
+
+	/** A fresh callsign: the parent's, numbered, for a subagent whose parent is live; else a word. */
+	function freshCallsign(peers: readonly Presence[], taken: ReadonlySet<string>): string {
+		const parent = self ? parentOf(self, peers) : undefined;
+		return parent ? childCallsign(parent.callsign, taken) : pickCallsign(taken);
+	}
+
+	/** Remember a peer this agent talked with: its work stays relevant in this agent's briefs. */
+	function noteContact(id: string): void {
+		setBounded(contacts, id, true, CONTACTS_CAP);
+	}
+
+	/** Publish whom this agent is blocked on, so peers can tell a wait cycle from a mere queue. */
+	function publishWaits(): void {
+		if (!self) return;
+		const waits = ledger.waits();
+		self.waitingOn = waits.on.slice(0, WAITS_CAP);
+		if (waits.since !== undefined) self.waitingSince = waits.since;
+		else delete self.waitingSince;
+		publish();
 	}
 
 	function allowWake(): boolean {
@@ -241,7 +277,8 @@ export default function telecom(pi: ExtensionAPI): void {
 		try {
 			pi.sendMessage(
 				{ customType, content: content + note, display: true, details },
-				wake ? { triggerTurn: true } : undefined,
+				// `later`: held until this agent's next run starts, never steered into the current one.
+				wake ? { triggerTurn: true } : mode === "later" ? { deliverAs: "nextTurn" } : undefined,
 			);
 		} catch (error) {
 			report("deliver", error);
@@ -282,9 +319,12 @@ export default function telecom(pi: ExtensionAPI): void {
 			const fg = (color: "accent" | "dim" | "warning", text: string) => (u.theme ? u.theme.fg(color, text) : text);
 			const mates = team();
 			const asks = ledger.inbound().length;
-			const busy = mates.filter((p) => p.state === "busy").length;
+			const peers = mates.filter((p) => p.role !== "child");
+			const subagents = mates.length - peers.length;
+			const busy = peers.filter((p) => p.state === "busy").length;
 			const parts = [fg("accent", `📡 ${self.callsign}`)];
-			parts.push(fg("dim", mates.length === 0 ? "solo" : `${plural(mates.length, "peer")}${busy ? ` (${busy} busy)` : ""}`));
+			const who = peers.length === 0 ? "solo" : `${plural(peers.length, "peer")}${busy ? ` (${busy} busy)` : ""}`;
+			parts.push(fg("dim", subagents > 0 ? `${who} + ${plural(subagents, "subagent")}` : who));
 			if (self.claims.length > 0) parts.push(fg("dim", plural(self.claims.length, "claim")));
 			if (asks > 0) parts.push(fg("warning", `${plural(asks, "ask")} waiting`));
 			u.setStatus("telecom", parts.join(fg("dim", " · ")));
@@ -306,6 +346,72 @@ export default function telecom(pi: ExtensionAPI): void {
 	// ------------------------------------------------------------------ addressing
 
 	/**
+	 * Is anything at `patterns` (written in the sender's checkout) part of this agent's work: a file
+	 * it is working with or changed, or one of its claims?
+	 */
+	function concernsMe(patterns: readonly string[], senderId: string): boolean {
+		if (!self) return false;
+		const sender = peersCache.find((p) => p.id === senderId);
+		const lane = sender !== undefined && sender.projectRoot !== self.projectRoot;
+		const work = [...awareness.focusPaths(), ...self.recent.map((r) => r.path)];
+		for (const raw of patterns) {
+			const pattern = lane ? laneRelativePattern(raw, sender.projectRoot) : raw;
+			if (pattern === null) continue;
+			if (self.claims.some((c) => claimsOverlap(c.pattern, pattern, self?.projectRoot ?? ""))) return true;
+			const inside = claimMatcher(pattern, self.projectRoot);
+			if (work.some(inside)) return true;
+		}
+		return false;
+	}
+
+	/**
+	 * The agent to reach about `patterns`: whoever claims them (in this checkout first), else
+	 * whoever changed a file there most recently. Refused, with the choices, when several claim.
+	 */
+	function ownerOf(patterns: readonly string[], action: string, peers: readonly Presence[]): Target {
+		if (!self) return { ok: false, reason: "telecom is not running" };
+		const me = self;
+		const now = Date.now();
+		const claimants: Array<{ peer: Presence; pattern: string; lane: boolean }> = [];
+		for (const peer of team(peers)) {
+			const lane = peer.projectRoot !== me.projectRoot;
+			const claim = peer.claims.find((c) => {
+				if (c.expiresAt <= now) return false;
+				const pattern = lane ? laneRelativePattern(c.pattern, peer.projectRoot) : c.pattern;
+				return pattern !== null && patterns.some((p) => claimsOverlap(p, pattern, me.projectRoot));
+			});
+			if (claim) claimants.push({ peer, pattern: claim.pattern, lane });
+		}
+		const local = claimants.filter((c) => !c.lane);
+		const pool = local.length > 0 ? local : claimants;
+		const only = pool[0];
+		if (pool.length === 1 && only) {
+			return { ok: true, peer: only.peer, via: `claims "${only.pattern}"${only.lane ? ` in ${laneName(only.peer)}` : ""}` };
+		}
+		if (pool.length > 1) {
+			return {
+				ok: false,
+				reason: `${patterns.join(", ")} spans the claims of ${pool.map((c) => `${c.peer.callsign} ("${c.pattern}")`).join(", ")}. Pick one: telecom({ action: "${action}", to: "${pool[0]?.peer.callsign}", message: "…" }).`,
+			};
+		}
+		const inside = patterns.map((p) => claimMatcher(p, me.projectRoot));
+		let latest: { peer: Presence; path: string; at: number } | null = null;
+		for (const peer of team(peers)) {
+			for (const r of peer.recent) {
+				const mine = inCheckout(r.path, peer.projectRoot, me.projectRoot);
+				if (mine && inside.some((match) => match(mine)) && (!latest || r.at > latest.at)) latest = { peer, path: mine, at: r.at };
+			}
+		}
+		if (latest) {
+			return { ok: true, peer: latest.peer, via: `changed ${displayPath(latest.path, me.projectRoot)} ${ago(latest.at)}` };
+		}
+		return {
+			ok: false,
+			reason: `no other agent claims or recently changed ${patterns.join(", ")}. telecom({ action: "board" }) shows who works on what; telecom({ action: "broadcast", paths: [${patterns.map((p) => JSON.stringify(p)).join(", ")}], message: "…" }) reaches whoever works there.`,
+		};
+	}
+
+	/**
 	 * Who `raw` names, most specific match first: a callsign in this project, a callsign anywhere,
 	 * a session name, a full id, then part of an id (its start, or the short form the board shows).
 	 * An ambiguous match is refused with the choices.
@@ -314,7 +420,7 @@ export default function telecom(pi: ExtensionAPI): void {
 		const to = raw.trim().replace(/^@/, "");
 		const lower = to.toLowerCase();
 		const others = peers.filter((p) => p.id !== self?.id);
-		const sameProject = others.filter((p) => p.projectRoot === root());
+		const sameProject = others.filter((p) => self !== null && sameRepo(p, self));
 		const pick = (list: Presence[], what: string): Target | null => {
 			if (list.length === 1) return { ok: true, peer: list[0] as Presence };
 			if (list.length > 1) {
@@ -348,7 +454,20 @@ export default function telecom(pi: ExtensionAPI): void {
 		if (Date.now() - peer.heartbeatAt > UNRESPONSIVE_MS) {
 			return `unresponsive since ${ago(peer.heartbeatAt)} — it waits in their inbox until they are back`;
 		}
-		return peer.state === "busy" ? "busy — it reaches them before their next step" : "idle — this wakes them";
+		if (peer.state === "busy") {
+			if (peer.waitingOn?.length) {
+				const on = peer.waitingOn.map((id) => (id === self?.id ? "you" : (peersCache.find((p) => p.id === id)?.callsign ?? shortId(id))));
+				if (on.includes("you")) return `busy waiting on your answer — an ask from you reaches it now (a wait cycle), anything else after you answer`;
+				return `busy waiting on ${on.join(", ")}${peer.waitingSince ? ` (asked ${ago(peer.waitingSince)})` : ""} — it reads this when that wait ends`;
+			}
+			// A session waiting on a foreground subagent is inside one long tool call: nothing
+			// reaches its model until that subagent's run ends.
+			if (self && blockedOnMe(self, peer, peersCache)) return "busy waiting for your run to end — it reads this after you finish";
+			const child = peersCache.find((c) => c.state === "busy" && isForegroundChild(c, peer));
+			if (child) return `busy waiting on its subagent ${child.callsign} — it reads this when that run ends`;
+			return "busy — it reaches them before their next step";
+		}
+		return "idle — this wakes them";
 	}
 
 	// ------------------------------------------------------------------ inbound
@@ -357,6 +476,7 @@ export default function telecom(pi: ExtensionAPI): void {
 		const from = env.fromCallsign;
 		const human = env.human ? " (from their human)" : "";
 		const base: MessageDetails = { from: env.from, fromCallsign: from, id: env.id };
+		if (env.kind === "message" || env.kind === "ask" || env.kind === "answer") noteContact(env.from);
 		switch (env.kind) {
 			case "message":
 				inject(
@@ -366,9 +486,14 @@ export default function telecom(pi: ExtensionAPI): void {
 					"wake",
 				);
 				return;
-			case "broadcast":
-				inject(MESSAGE_TYPES.broadcast, `**📡 Broadcast from ${from}${human}**\n\n${env.text}`, base, "passive");
+			case "broadcast": {
+				// A broadcast about paths away from this agent's work waits for its next run instead
+				// of breaking into the current one.
+				const about = env.paths?.length ? ` — about ${env.paths.map((p) => clip(p, 80)).join(", ")}` : "";
+				const near = !env.paths?.length || concernsMe(env.paths, env.from);
+				inject(MESSAGE_TYPES.broadcast, `**📡 Broadcast from ${from}${human}${about}**\n\n${env.text}`, base, near ? "passive" : "later");
 				return;
+			}
 			case "ask": {
 				const ask: Omit<InboundAsk, "reminded"> = {
 					id: env.id,
@@ -378,8 +503,12 @@ export default function telecom(pi: ExtensionAPI): void {
 					at: env.ts,
 				};
 				ledger.noteInbound(ask);
-				// A peer asking us while we wait on an ask would deadlock both; see ledger.ts.
-				ledger.interruptAll({ ...ask, reminded: false });
+				// Stop waiting only when this ask closes a cycle (we, directly or through others,
+				// wait on the asker): then nobody on it could ever answer. Any other ask waits
+				// until our own wait ends. Unknown graph (an older peer on the way): interrupt.
+				if (self && ledger.outboundCount() > 0 && closesCycle(env.from, { ...self, waitingOn: ledger.waits().on }, readPeers()) !== false) {
+					ledger.interruptAll({ ...ask, reminded: false });
+				}
 				inject(
 					MESSAGE_TYPES.ask,
 					`**📡 Ask from ${from}${human}** — they are blocked until you reply\n\n${env.text}\n\nReply with telecom({ action: "reply", askId: "${env.id}", message: "<your answer>" }).`,
@@ -420,6 +549,18 @@ export default function telecom(pi: ExtensionAPI): void {
 				return;
 			case "claim.contested": {
 				const { path, pattern } = event.data;
+				if (event.data.lane) {
+					// Nothing was held back (their checkout is separate), so there is no one to tell
+					// on release: this is news about the merge ahead.
+					const sender = peersCache.find((p) => p.id === env.from);
+					inject(
+						MESSAGE_TYPES.claim,
+						`**📡 ${env.fromCallsign} changed a path you claimed, in another checkout**\n\n${env.fromCallsign} edited ${displayPath(path, sender?.projectRoot ?? root())} in ${sender ? laneName(sender) : "another checkout of this repository"}, inside your claim "${pattern}". Nothing was held back, since your checkouts are separate, but the two changes meet when the branches merge. If they may conflict, agree on one owner: telecom({ action: "send", to: "${env.fromCallsign}", message: "…" }).`,
+						{ ...peer, tone: "warning" },
+						"passive",
+					);
+					return;
+				}
 				const waiting = contesters.get(pattern) ?? new Map<string, string>();
 				waiting.set(env.from, env.fromCallsign);
 				contesters.set(pattern, waiting);
@@ -467,6 +608,32 @@ export default function telecom(pi: ExtensionAPI): void {
 			at: env.ts,
 			...(data.summary ? { summary: data.summary } : {}),
 		};
+		// A sender that joined since the last team refresh is not cached yet: look again before
+		// telling its own copy of a file from this agent's. Gone already: go by where the path lies.
+		const sender = peersCache.find((p) => p.id === env.from) ?? readPeers().find((p) => p.id === env.from);
+		const mine = !sender
+			? isWithin(data.path, self.projectRoot)
+				? data.path
+				: null
+			: sender.projectRoot !== self.projectRoot && sameRepo(sender, self)
+				? inCheckout(data.path, sender.projectRoot, self.projectRoot)
+				: data.path;
+		// `mine === data.path` from another lane: the peer reached into this checkout (nested in
+		// its own) and changed this agent's very file, so it is an ordinary peer change below.
+		if (mine !== data.path) {
+			// A peer in another worktree changed ITS copy: this agent's file did not move, so it is
+			// not a peer change here (the guard must not see one), only news about the merge.
+			if (!sender || !mine || !awareness.noteLaneChange(env.from, mine)) return;
+			if (notices.size === 0) noticeSince = Date.now();
+			notices.set(`${env.from}\u0000${mine}`, {
+				change: { ...change, path: mine },
+				count: 1,
+				relation: "lane",
+				lane: laneName(sender),
+				...(data.excerpt ? { excerpt: data.excerpt } : {}),
+			});
+			return;
+		}
 		const { relation, firstNotice } = awareness.notePeerChange(change);
 		const claim = self.claims.find((c) => matchesClaim(data.path, c.pattern, root()));
 		if (!claim && !(relation && firstNotice)) return;
@@ -500,24 +667,53 @@ export default function telecom(pi: ExtensionAPI): void {
 
 	// ------------------------------------------------------------------ the loop
 
+	/**
+	 * pi invalidates an extension's API when it disposes the session (every `pi.*` call throws
+	 * from then on). A host that disposes without `session_shutdown` — or stops waiting for it, as
+	 * pi-subagents does with a finished child after a timeout — would otherwise leave this timer
+	 * heartbeating a dead session for as long as the process lives.
+	 */
+	function runtimeDisposed(): boolean {
+		try {
+			pi.getSessionName();
+			return false;
+		} catch {
+			return true;
+		}
+	}
+
 	function tick(): void {
 		if (!transport || !self) return;
+		if (runtimeDisposed()) {
+			stop();
+			return;
+		}
 		tickCount++;
-		try {
-			const drained = transport.drain(self.id, (env) => {
+		// A throw from a timer is an uncaught exception, and the process it would take down may be
+		// the parent's pi or a runner hosting other subagents. Each step is caught on its own: a
+		// step that keeps failing (an unreadable inbox) must not stop the heartbeat, without which
+		// peers stop honoring this agent's claims, or the ask timeouts, without which an ask hangs.
+		step("inbound", () => {
+			const drained = transport?.drain(self?.id ?? "", (env) => {
 				if (seen.has(env.id)) return;
 				setBounded(seen, env.id, true, SEEN_CAP);
 				handleEnvelope(env);
 			});
-			for (const failure of drained.failed) report("inbound", failure);
-		} catch (error) {
-			report("drain", error);
-		}
+			for (const failure of drained?.failed ?? []) report("inbound", failure);
+		});
 		if (!self) return; // handling may have backed this session off
-		if (tickCount % TEAM_REFRESH_TICKS === 0) refreshTeam();
-		flushNotices();
-		ledger.expire(Date.now());
-		if (Date.now() - lastHeartbeat >= HEARTBEAT_MS) heartbeat();
+		if (tickCount % TEAM_REFRESH_TICKS === 0) step("team", refreshTeam);
+		step("notices", () => flushNotices());
+		step("asks", () => ledger.expire(Date.now()));
+		if (Date.now() - lastHeartbeat >= HEARTBEAT_MS) step("heartbeat", heartbeat);
+	}
+
+	function step(where: string, run: () => void): void {
+		try {
+			run();
+		} catch (error) {
+			report(where, error);
+		}
 	}
 
 	function refreshTeam(): void {
@@ -540,7 +736,7 @@ export default function telecom(pi: ExtensionAPI): void {
 		}
 		const live = new Set(peers.map((p) => p.id));
 		ledger.failPeerGone((id) => !live.has(id));
-		const gone = new Set([...teamIds].filter((id) => !live.has(id)));
+		const gone = new Set([...teamIds.keys()].filter((id) => !live.has(id)));
 		if (gone.size > 0) ledger.dropInboundFrom(gone);
 		if (mustYield(self, peers)) {
 			const old = self.callsign;
@@ -548,9 +744,10 @@ export default function telecom(pi: ExtensionAPI): void {
 			notifyUser(`📡 callsign ${old} was taken; you are now ${self.callsign}`);
 		}
 		const mates = team(peers);
-		const ids = new Set(mates.map((p) => p.id));
-		const joined = mates.filter((p) => !teamIds.has(p.id));
-		const left = [...teamIds].filter((id) => !ids.has(id));
+		const ids = new Map(mates.map((p) => [p.id, p.role]));
+		// Subagents come and go with every delegation; their arrivals are not news for the human.
+		const joined = mates.filter((p) => !teamIds.has(p.id) && p.role !== "child");
+		const left = [...teamIds].filter(([id, role]) => !ids.has(id) && role !== "child");
 		if (tickCount > STARTUP_TICKS && (joined.length > 0 || left.length > 0)) {
 			const parts: string[] = [];
 			if (joined.length) parts.push(`${joined.map((p) => p.callsign).join(", ")} joined`);
@@ -564,7 +761,7 @@ export default function telecom(pi: ExtensionAPI): void {
 	/** Converge on unique callsigns: the younger of two sessions with the same word moves. */
 	function yieldCallsign(peers: readonly Presence[]): void {
 		if (!self) return;
-		self.callsign = pickCallsign(new Set(team(peers).map((p) => p.callsign)));
+		self.callsign = freshCallsign(peers, new Set(team(peers).map((p) => p.callsign)));
 		persistCallsign();
 		publish();
 	}
@@ -620,6 +817,7 @@ export default function telecom(pi: ExtensionAPI): void {
 			...(self.taskAt ? { taskAt: self.taskAt } : {}),
 			inboundAsks: ledger.inbound().map(({ id, from, fromCallsign, text, at }) => ({ id, from, fromCallsign, text, at })),
 			contesters: [...contesters].map(([pattern, who]) => [pattern, [...who]]),
+			abandonedAsks: ledger.lateCandidates(),
 		};
 		transport.writeHandoff(self.id, state);
 	}
@@ -668,6 +866,9 @@ export default function telecom(pi: ExtensionAPI): void {
 		}
 		if (transport && self) {
 			try {
+				// Leaving frees every claim; whoever was held back by one should not wait for a
+				// release that will never come. Subagents leave all the time, so this matters.
+				tellReleased(self, self.claims.map((c) => c.pattern));
 				transport.removePresence(self.id);
 				transport.removeInbox(self.id);
 			} catch {
@@ -701,11 +902,30 @@ export default function telecom(pi: ExtensionAPI): void {
 			transport = openTransport(rootResult.path);
 			transport.sweep();
 			const projectRoot = findProjectRoot(ctx.cwd);
+			const repo = findRepo(projectRoot);
 			const peers = transport.readPeers().filter((p) => p.id !== id);
-			const taken = new Set(peers.filter((p) => p.projectRoot === projectRoot).map((p) => p.callsign));
+			const lineage = detectLineage({
+				env: process.env,
+				// Optional call: a host without session headers simply has no foreground children.
+				parentSessionFile: ctx.sessionManager.getHeader?.()?.parentSession,
+				peers,
+				pid: process.pid,
+				selfId: id,
+			});
+			const taken = new Set(peers.filter((p) => sameRepo(p, { projectRoot, repo })).map((p) => p.callsign));
 			const remembered = rememberedCallsign(ctx);
 			const handoff = takeReloadHandoff(id);
-			const callsign = pickCallsign(taken, handoff?.callsign ?? cfg.callsign ?? remembered);
+			const parent = lineage.parent ? peers.find((p) => p.id === lineage.parent) : undefined;
+			// A subagent inherits its parent's environment, PI_TELECOM_CALLSIGN included: that name
+			// is the parent's, so a child is named after its parent instead.
+			// A child forked from its parent's context also inherits the parent's remembered callsign,
+			// which the parent holds: then it is named after the parent too, not given a free word.
+			const wanted =
+				lineage.role === "child"
+					? ((remembered && !taken.has(remembered) ? remembered : undefined) ??
+						(parent ? childCallsign(parent.callsign, taken) : undefined))
+					: (cfg.callsign ?? remembered);
+			const callsign = pickCallsign(taken, handoff?.callsign ?? wanted);
 			const now = Date.now();
 			const branch = readBranch(projectRoot);
 			self = {
@@ -716,7 +936,10 @@ export default function telecom(pi: ExtensionAPI): void {
 				ticks: processStartTicks(process.pid),
 				cwd: ctx.cwd,
 				projectRoot,
-				role: process.env.PI_SUBAGENT_CHILD === "1" ? "child" : "main",
+				repo,
+				role: lineage.role,
+				...(lineage.parent ? { parent: lineage.parent } : {}),
+				waitingOn: [],
 				state: "idle",
 				claims: handoff?.claims ?? [],
 				recent: [],
@@ -729,6 +952,7 @@ export default function telecom(pi: ExtensionAPI): void {
 				...(handoff?.taskAt ? { taskAt: handoff.taskAt } : {}),
 			};
 			for (const ask of handoff?.inboundAsks ?? []) ledger.noteInbound(ask);
+			if (Array.isArray(handoff?.abandonedAsks)) ledger.restoreAbandoned(handoff.abandonedAsks);
 			for (const [pattern, who] of handoff?.contesters ?? []) contesters.set(pattern, new Map(who));
 			if (callsign !== remembered) persistCallsign();
 			publish();
@@ -736,7 +960,7 @@ export default function telecom(pi: ExtensionAPI): void {
 			// Two sessions starting in the same instant can both pick the same free word. Settle it
 			// now, before the first prompt, rather than on the first tick.
 			if (mustYield(self, peersCache)) yieldCallsign(peersCache);
-			teamIds = new Set(team().map((p) => p.id));
+			teamIds = new Map(team().map((p) => [p.id, p.role]));
 			tickCount = 0;
 			timer ??= setInterval(tick, cfg.tickMs);
 			timer.unref?.();
@@ -777,7 +1001,10 @@ export default function telecom(pi: ExtensionAPI): void {
 			self.taskAt = Date.now();
 		}
 		publish();
-		const brief = renderBrief(self, readPeers(), briefState);
+		const brief = renderBrief(self, readPeers(), briefState, {
+			paths: awareness.focusPaths(),
+			contacts: new Set(contacts.keys()),
+		});
 		briefState = brief.state;
 		if (!brief.text) return;
 		return {
@@ -832,6 +1059,8 @@ export default function telecom(pi: ExtensionAPI): void {
 			noteCall(toolCallId, (state) => {
 				state.note = state.note ? `${state.note}\n${verdict.note}` : verdict.note;
 				if (verdict.staleChange) state.staleOver = verdict.staleChange;
+				if (verdict.laneNotes) state.laneNotes = [...(state.laneNotes ?? []), ...verdict.laneNotes];
+				if (verdict.contested?.lane) state.laneContest = verdict.contested;
 			});
 		}
 		return undefined;
@@ -858,8 +1087,10 @@ export default function telecom(pi: ExtensionAPI): void {
 		) {
 			return;
 		}
-		const claim = awareness.checkClaims(path, cfg.guard, peers, self.id, root());
+		const claim = awareness.checkClaims(path, cfg.guard, peers, self, lineOf(self, peers));
 		if (claim.action === "block") {
+			// Held back in this checkout: the owner hears that someone needs the path. (A claim in
+			// another checkout never holds anyone back; its owner hears once the edit has landed.)
 			if (claim.contested) {
 				sendEvent(
 					claim.contested.owner,
@@ -871,7 +1102,10 @@ export default function telecom(pi: ExtensionAPI): void {
 		}
 		verdictToResult(claim, event.toolCallId);
 		const stale = awareness.checkStale(path, event.toolName, cfg.guard, peers, self.id, root());
-		return verdictToResult(stale, event.toolCallId);
+		const blocked = verdictToResult(stale, event.toolCallId);
+		if (blocked) return blocked;
+		if (cfg.guard !== "off") verdictToResult(awareness.checkLanes(path, peers, self), event.toolCallId);
+		return undefined;
 	});
 
 	on("tool_result", (event, ctx) => {
@@ -889,6 +1123,17 @@ export default function telecom(pi: ExtensionAPI): void {
 		}
 		awareness.noteOwnWrite(path, toolName, state.staleOver);
 		announceChange(path, toolName, event, toolName === "write" && state.existedBefore === false);
+		// The edit landed: spend the one-time lane notes it showed, and tell a lane claim's owner.
+		if (state.laneNotes) awareness.commitLaneNotes(state.laneNotes);
+		if (state.laneContest) {
+			const { owner, claim } = state.laneContest;
+			awareness.noteContested(owner.id, path);
+			sendEvent(
+				owner,
+				{ topic: "claim.contested", data: { path, pattern: claim.pattern, lane: true } },
+				`${self.callsign} changed ${displayPath(path, root())}`,
+			);
+		}
 		if (!state.note) return;
 		// Append to the current result only; earlier messages are never rewritten (cache rule).
 		return {
@@ -917,6 +1162,14 @@ export default function telecom(pi: ExtensionAPI): void {
 	function releaseClaims(me: Presence, patterns: readonly string[]): string[] {
 		me.claims = me.claims.filter((c) => !patterns.includes(c.pattern));
 		publish();
+		const told = tellReleased(me, patterns);
+		updateStatus();
+		return told;
+	}
+
+	/** Tell the peers held back by `patterns` that they are free; returns their callsigns. */
+	function tellReleased(me: Presence, patterns: readonly string[]): string[] {
+		if (patterns.length === 0) return [];
 		const waiting = new Map<string, string>();
 		for (const pattern of patterns) {
 			for (const [id, callsign] of contesters.get(pattern) ?? []) waiting.set(id, callsign);
@@ -933,7 +1186,6 @@ export default function telecom(pi: ExtensionAPI): void {
 				);
 			}
 		}
-		updateStatus();
 		return [...waiting.values()];
 	}
 
@@ -970,11 +1222,20 @@ export default function telecom(pi: ExtensionAPI): void {
 		return ok(`status set — peers now see ${me.callsign}: ${me.task}`);
 	}
 
-	/** The checks `send` and `ask` share: a target and a message. */
+	/** The checks `send` and `ask` share: a target (`to`, or whoever owns `paths`) and a message. */
 	function messageTarget({ params, message }: ActionCall): Target {
-		if (!params.to?.trim()) return { ok: false, reason: `"${params.action}" needs \`to\`: a callsign from the board` };
+		const paths = (params.paths ?? []).map((p) => p.trim()).filter(Boolean);
+		if (!params.to?.trim() && paths.length === 0) {
+			return { ok: false, reason: `"${params.action}" needs \`to\` (a callsign from the board), or \`paths\` to reach whoever claims or last changed them` };
+		}
 		if (!message) return { ok: false, reason: `"${params.action}" needs a \`message\`` };
-		return resolveTarget(params.to, readPeers());
+		const peers = readPeers();
+		return params.to?.trim() ? resolveTarget(params.to, peers) : ownerOf(paths, params.action, peers);
+	}
+
+	/** "bravo", or `bravo, which claims "src/db/**"` for a target found by path. */
+	function targetName(target: Target & { ok: true }): string {
+		return target.via ? `${target.peer.callsign}, which ${target.via}` : target.peer.callsign;
 	}
 
 	function sendAction(call: ActionCall): ToolResult {
@@ -982,7 +1243,8 @@ export default function telecom(pi: ExtensionAPI): void {
 		if (!target.ok) return fail(target.reason);
 		const sent = call.net.deliver(envelope(target.peer.id, "message", call.message));
 		if (!sent.ok) return fail(sent.reason);
-		return ok(`sent to ${target.peer.callsign} (${stateHint(target.peer)})`, { to: target.peer.callsign });
+		noteContact(target.peer.id);
+		return ok(`sent to ${targetName(target)} (${stateHint(target.peer)})`, { to: target.peer.callsign });
 	}
 
 	async function askAction(call: ActionCall): Promise<ToolResult> {
@@ -990,24 +1252,63 @@ export default function telecom(pi: ExtensionAPI): void {
 		if (!target.ok) return fail(target.reason);
 		const { me, net, params, message, signal, onUpdate } = call;
 		const peer = target.peer;
+		const peers = readPeers();
+		if (blockedOnMe(me, peer, peers)) {
+			// The parent (or a foreground ancestor further up) is inside its `subagent` tool call,
+			// waiting for this very run: an ask could only reach it after this run ends, so waiting
+			// for the answer would deadlock.
+			const parent = parentOf(me, peers);
+			const who = parent?.id === peer.id ? "your parent session" : "above you in a chain of foreground subagents";
+			return fail(
+				`${peer.callsign} is ${who}, and it is blocked waiting for your run to end, so it cannot read an ask until you finish. Decide yourself and state the assumption in your final answer, or end your run with the question. If you have pi-subagents' contact_supervisor tool, it reaches ${parent?.callsign ?? "your parent"} mid-run: contact_supervisor({ reason: "need_decision", message: "…" }).`,
+			);
+		}
+		// A peer inside a foreground subagent run reads nothing until that run ends. If the run
+		// waits, through any chain of asks, on this agent, the ask would close a cycle that only
+		// this agent can break, by answering what waits on it.
+		const running = peers.find((c) => c.state === "busy" && isForegroundChild(c, peer));
+		if (running) {
+			const asking = { ...me, waitingOn: [...new Set([...ledger.waits().on, peer.id])] };
+			const graph = peers.map((p) => (p.id === me.id ? asking : p));
+			if (closesCycle(me.id, peer, graph) === true) {
+				// The asks waiting on this agent from sessions on the cycle come first: answering
+				// one of those is what unblocks the run.
+				const cycle = waitedOn(peer, graph);
+				const owed = ledger.inbound().sort((x, y) => Number(cycle.has(y.from)) - Number(cycle.has(x.from)));
+				const first = owed[0];
+				return fail(
+					`${peer.callsign} is inside its subagent ${running.callsign}'s run, which is waiting, directly or through others, on you, so ${peer.callsign} cannot read an ask until you unblock it: waiting for an answer would deadlock. ${
+						first
+							? `Answer what waits on you first: telecom({ action: "reply", askId: "${first.id}", message: "…" })${owed.length > 1 ? ` (all waiting: ${listAsks(owed)})` : ""}. Or decide yourself.`
+							: `Decide yourself, or leave the question for later: telecom({ action: "send", to: "${peer.callsign}", message: "…" }).`
+					}`,
+				);
+			}
+		}
 		const requested = params.timeoutSec && params.timeoutSec > 0 ? params.timeoutSec * 1000 : cfg.askTimeoutMs;
 		const timeoutMs = Math.min(requested, MAX_ASK_TIMEOUT_MS);
 		const env = envelope(peer.id, "ask", message);
 		// Wait before delivering, so an answer that arrives at once has an ask to settle.
 		const waiting = ledger.awaitAnswer(env.id, { to: peer.id, toCallsign: peer.callsign, text: message }, timeoutMs, signal);
+		// Published before the ask is delivered, so the peer sees the wait when the ask arrives.
+		publishWaits();
 		const sent = net.deliver(env);
 		if (!sent.ok) {
 			ledger.abandon(env.id, sent.reason);
 			await waiting;
+			publishWaits();
 			return fail(sent.reason);
 		}
+		noteContact(peer.id);
 		onUpdate?.({
-			content: [{ type: "text", text: `waiting for ${peer.callsign} (${stateHint(peer)})…` }],
+			content: [{ type: "text", text: `waiting for ${targetName(target)} (${stateHint(peer)})…` }],
 			details: { waiting: peer.callsign },
 		});
 		const answer: AskOutcome = await waiting;
+		publishWaits();
 		if (answer.ok) {
-			return ok(`${answer.fromCallsign} answered:\n\n${answer.text}`, { from: answer.fromCallsign, askId: env.id });
+			const asked = target.via ? `${answer.fromCallsign} (it ${target.via}) answered` : `${answer.fromCallsign} answered`;
+			return ok(`${asked}:\n\n${answer.text}`, { from: answer.fromCallsign, askId: env.id });
 		}
 		if (answer.interruptedBy) {
 			const by = answer.interruptedBy;
@@ -1055,6 +1356,7 @@ export default function telecom(pi: ExtensionAPI): void {
 		}
 		const sent = net.deliver(envelope(to.id, "answer", message, { answerTo: askId }));
 		if (!sent.ok) return fail(sent.reason);
+		noteContact(to.id);
 		updateStatus();
 		return ok(`replied to ${to.callsign}`, { to: to.callsign, askId });
 	}
@@ -1062,34 +1364,50 @@ export default function telecom(pi: ExtensionAPI): void {
 	function broadcastAction({ me, net, params, message }: ActionCall): ToolResult {
 		if (!message) return fail('"broadcast" needs a `message`');
 		const scope = params.scope ?? "project";
-		const peers = readPeers().filter((p) => p.id !== me.id && (scope === "machine" || p.projectRoot === me.projectRoot));
+		const peers = readPeers().filter((p) => p.id !== me.id && (scope === "machine" || sameRepo(p, me)));
 		if (peers.length === 0) return fail(`no other agent is live ${scope === "machine" ? "on this machine" : "in this project"}`);
-		const { reached, failed } = broadcastTo(net, peers, message);
+		const paths = (params.paths ?? []).map((p) => p.trim()).filter(Boolean);
+		const { reached, failed } = broadcastTo(net, peers, message, paths.length > 0 ? { paths } : {});
+		const about = paths.length > 0 ? ` — about ${paths.join(", ")}: agents working there get it now, the rest at their next prompt` : "";
 		return ok(
-			`broadcast to ${reached.join(", ") || "nobody"}${failed.length ? ` (failed: ${failed.join(", ")})` : ""}`,
+			`broadcast to ${reached.join(", ") || "nobody"}${failed.length ? ` (failed: ${failed.join(", ")})` : ""}${about}`,
 			{ reached, failed },
 		);
 	}
 
-	function claimConflicts(me: Presence, patterns: readonly string[], now: number): string[] {
+	/**
+	 * Peers' claims that overlap `patterns`: in this checkout they conflict; in another lane they
+	 * are only worth a note (the files are separate until the merge). This agent's lineal family
+	 * never conflicts: a subagent may claim part of its parent's claim, and the other way round.
+	 */
+	function claimConflicts(me: Presence, patterns: readonly string[], now: number): { conflicts: string[]; lanes: string[] } {
 		const conflicts: string[] = [];
-		for (const peer of team(readPeers())) {
+		const lanes: string[] = [];
+		const peers = readPeers();
+		const family = lineOf(me, peers);
+		for (const peer of team(peers)) {
+			if (family.has(peer.id)) continue;
+			const otherLane = peer.projectRoot !== me.projectRoot;
 			for (const theirs of peer.claims) {
 				if (theirs.expiresAt <= now) continue;
+				const pattern = otherLane ? laneRelativePattern(theirs.pattern, peer.projectRoot) : theirs.pattern;
+				if (pattern === null) continue;
 				for (const mine of patterns) {
-					if (!claimsOverlap(mine, theirs.pattern, me.projectRoot)) continue;
-					conflicts.push(`"${mine}" overlaps ${peer.callsign}'s claim "${theirs.pattern}"${theirs.note ? ` (${theirs.note})` : ""}`);
+					if (!claimsOverlap(mine, pattern, me.projectRoot)) continue;
+					const what = `"${mine}" overlaps ${peer.callsign}'s claim "${theirs.pattern}"${theirs.note ? ` (${theirs.note})` : ""}`;
+					if (otherLane) lanes.push(`${what} in ${laneName(peer)}`);
+					else conflicts.push(what);
 				}
 			}
 		}
-		return conflicts;
+		return { conflicts, lanes };
 	}
 
 	function claimAction({ me, params, message }: ActionCall): ToolResult {
 		const patterns = (params.paths ?? []).map((p) => p.trim()).filter(Boolean);
 		if (patterns.length === 0) return fail('"claim" needs `paths` — project-relative paths or globs');
 		const now = Date.now();
-		const conflicts = claimConflicts(me, patterns, now);
+		const { conflicts, lanes } = claimConflicts(me, patterns, now);
 		if (conflicts.length > 0) {
 			return fail(`${conflicts.join("; ")}. Agree on a split first: telecom({ action: "ask", to: "…", message: "…" }).`);
 		}
@@ -1103,9 +1421,13 @@ export default function telecom(pi: ExtensionAPI): void {
 		}
 		publish();
 		updateStatus();
+		const overlap =
+			lanes.length > 0
+				? ` Note: ${lanes.join("; ")}. Your checkouts are separate, so both claims stand, but the work meets when the branches merge; agree on one owner if it may conflict.`
+				: "";
 		return ok(
-			`claimed ${patterns.join(", ")}${note ? ` — ${note}` : ""}. Peers editing there are held back and you are told. Release with telecom({ action: "release" }) when done; idle claims expire after ${claimTtlMinutes()} min.`,
-			{ claims: me.claims.map((c) => c.pattern) },
+			`claimed ${patterns.join(", ")}${note ? ` — ${note}` : ""}. Peers editing there are held back and you are told. Release with telecom({ action: "release" }) when done; idle claims expire after ${claimTtlMinutes()} min.${overlap}`,
+			{ claims: me.claims.map((c) => c.pattern), ...(lanes.length > 0 ? { laneOverlaps: lanes.length } : {}) },
 		);
 	}
 

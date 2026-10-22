@@ -3,14 +3,15 @@
  * files on disk. Each scenario uses its own project directory so they cannot see each other.
  */
 import assert from "node:assert/strict";
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { basename, join } from "node:path";
 import { after, test } from "node:test";
-import { findProjectRoot } from "../src/project.ts";
-import { eventually, makeProject, Session, sleep } from "./harness.ts";
+import { findProjectRoot, findRepo } from "../src/project.ts";
+import { openTransport, processStartTicks, WIRE_VERSION } from "../src/transport.ts";
+import { eventually, makeProject, SCRATCH, Session, sleep } from "./harness.ts";
 
 const open: Session[] = [];
-async function session(cwd: string, opts: { name?: string } = {}): Promise<Session> {
+async function session(cwd: string, opts: { name?: string; parentSession?: string } = {}): Promise<Session> {
 	const s = await new Session(cwd, opts).start();
 	open.push(s);
 	return s;
@@ -76,18 +77,83 @@ test("ask blocks until reply; reply infers the single outstanding ask", async ()
 	assert.match(answer.text, /bravo answered:\n\n5173/);
 });
 
-test("simultaneous asks do not deadlock", async () => {
+test("simultaneous asks do not deadlock: one side stops waiting, answers, and the other gets the answer", async () => {
 	const proj = makeProject("p-deadlock");
 	const a = await session(proj);
 	const b = await session(proj);
 	const fromA = a.tool({ action: "ask", to: "bravo", message: "A asks" });
 	const fromB = b.tool({ action: "ask", to: "alpha", message: "B asks" });
-	const [ra, rb] = await Promise.all([fromA, fromB]);
-	// Each side is interrupted by the other's question instead of waiting for a timeout.
-	assert.ok(ra.details.interrupted || rb.details.interrupted, `${ra.text}\n---\n${rb.text}`);
-	const interrupted = ra.details.interrupted ? a : b;
-	const res = await interrupted.tool({ action: "reply", askId: (ra.details.interrupted ? ra : rb).details.inboundAskId, message: "answer" });
+	const first = await Promise.race([
+		fromA.then((r) => ({ who: a, r, other: fromB })),
+		fromB.then((r) => ({ who: b, r, other: fromA })),
+	]);
+	assert.ok(first.r.details.interrupted, first.r.text);
+	const res = await first.who.tool({ action: "reply", askId: first.r.details.inboundAskId, message: "answer" });
 	assert.ok(!res.isError, res.text);
+	// The side that stopped waiting published it, so the other kept waiting and got its answer.
+	const other = await first.other;
+	assert.ok(!other.isError, other.text);
+	assert.match(other.text, /answered:\n\nanswer/);
+});
+
+test("three agents: an ask that closes no cycle waits its turn; the board shows who waits on whom", async () => {
+	const proj = makeProject("p-queue3");
+	const a = await session(proj);
+	const b = await session(proj);
+	const c = await session(proj);
+	await a.prompt("wire the cache");
+	let aDone = false;
+	const fromA = a.tool({ action: "ask", to: "bravo", message: "which cache key?" }).then((r) => {
+		aDone = true;
+		return r;
+	});
+	await eventually(() => assert.equal(b.sentOf("telecom-ask").length, 1));
+	const board = (await c.tool({ action: "board" })).text;
+	assert.match(board, /alpha \[busy, waiting on bravo \(asked [^)]*\)\]/);
+	const hint = await c.tool({ action: "send", to: "alpha", message: "fyi" });
+	assert.match(hint.text, /busy waiting on bravo .*it reads this when that wait ends/);
+	const fromC = c.tool({ action: "ask", to: "alpha", message: "can I take src/db?" });
+	await eventually(() => assert.equal(a.sentOf("telecom-ask").length, 1));
+	await new Promise((r) => setImmediate(r));
+	assert.equal(aDone, false, "bravo can still answer alpha: no cycle, so alpha keeps waiting");
+	assert.match((await b.tool({ action: "board" })).text, /alpha \[busy, waiting on you/);
+	await b.tool({ action: "reply", message: "the tenant id" });
+	assert.match((await fromA).text, /bravo answered:\n\nthe tenant id/);
+	await a.tool({ action: "reply", message: "yes, take it" });
+	assert.match((await fromC).text, /alpha answered:\n\nyes, take it/);
+	assert.doesNotMatch((await c.tool({ action: "board" })).text, /waiting on/, "waits are cleared when they end");
+});
+
+test("three agents: a wait cycle (alpha → bravo → charlie → alpha) is broken where it closes", async () => {
+	const proj = makeProject("p-cycle3");
+	const a = await session(proj);
+	const b = await session(proj);
+	const c = await session(proj);
+	const fromA = a.tool({ action: "ask", to: "bravo", message: "A?" });
+	await eventually(() => assert.equal(b.sentOf("telecom-ask").length, 1));
+	let bDone = false;
+	const fromB = b.tool({ action: "ask", to: "charlie", message: "B?" }).then((r) => {
+		bDone = true;
+		return r;
+	});
+	await eventually(() => assert.equal(c.sentOf("telecom-ask").length, 1));
+	let cDone = false;
+	const fromC = c.tool({ action: "ask", to: "alpha", message: "C?" }).then((r) => {
+		cDone = true;
+		return r;
+	});
+	const ra = await fromA;
+	assert.equal(ra.details.interrupted, true, ra.text);
+	assert.match(ra.text, /charlie asks: C\?/);
+	await new Promise((r) => setImmediate(r));
+	assert.equal(bDone || cDone, false, "only the agent where the cycle closed stopped waiting");
+	await a.tool({ action: "reply", askId: ra.details.inboundAskId, message: "from alpha" });
+	assert.match((await fromC).text, /alpha answered:\n\nfrom alpha/);
+	await c.tool({ action: "reply", message: "from charlie" });
+	assert.match((await fromB).text, /charlie answered:\n\nfrom charlie/);
+	// bravo now answers alpha's ask, which alpha stopped waiting on: it arrives as a late reply.
+	await b.tool({ action: "reply", message: "from bravo" });
+	await eventually(() => assert.match(a.sentOf("telecom-reply")[0]?.content ?? "", /Late reply from bravo/));
 });
 
 test("ask times out with a useful reason; a late answer still arrives", async () => {
@@ -280,6 +346,70 @@ test("team brief: full once, then only what changed, and nothing when nothing ch
 	assert.match((await a.prompt("again"))?.message?.content ?? "", /bravo left \(its claims tests\/upload are free\)/);
 	await a.fire("session_compact", {});
 	assert.match((await a.prompt("after compaction"))?.message?.content ?? "", /1 other agent is working/, "full brief after a compaction");
+});
+
+test("briefs with many agents: peers near your work are described, the rest are one roster line", async () => {
+	const proj = makeProject("p-relevance");
+	writeFileSync(join(proj, "a.ts"), "x\n");
+	writeFileSync(join(proj, "b.ts"), "x\n");
+	const a = await session(proj);
+	const [b, c, d, e] = [await session(proj), await session(proj), await session(proj), await session(proj)];
+	await a.read("a.ts");
+	await b.edit("a.ts", "x", "y");
+	await b.prompt("refactor a.ts");
+	await c.tool({ action: "claim", paths: ["src/api"] });
+	await c.prompt("the api layer");
+	await d.prompt("release notes");
+	await e.prompt("the build");
+	await a.tool({ action: "send", to: "delta", message: "ping me when the notes are in" });
+	const full = (await a.prompt("work on a.ts"))?.message?.content ?? "";
+	assert.match(full, /4 other agents are working/);
+	assert.match(full, /• bravo \[busy\][^\n]*\n\s+task: refactor a\.ts/, "it changed a file this agent read");
+	assert.match(full, /• delta \[busy\][^\n]*\n\s+task: release notes/, "this agent talked with it");
+	assert.match(full, /Also here, not near your work so far: charlie \[busy\] the api layer \(claims src\/api\); echo \[busy\] the build/);
+	assert.doesNotMatch(full, /• charlie|• echo/);
+
+	// Deltas: a far peer's new task and claims are not news (the guard covers its claims).
+	await c.prompt("now the api tests");
+	await c.tool({ action: "claim", paths: ["test/api"] });
+	await b.prompt("now b.ts");
+	const delta = (await a.prompt("next"))?.message?.content ?? "";
+	assert.match(delta, /bravo is now on: now b\.ts/);
+	assert.doesNotMatch(delta, /charlie/);
+	// ...until a claim covers this agent's files: then it is near, and described as it is now.
+	await c.tool({ action: "claim", paths: ["a.ts"] });
+	const claimed = (await a.prompt("next"))?.message?.content ?? "";
+	assert.match(claimed, /• now working near you: charlie \[busy\][^\n]*\n\s+task: now the api tests[^\n]*\n\s+claims: [^\n]*a\.ts/);
+	await c.tool({ action: "release", paths: ["a.ts"] });
+	assert.match((await a.prompt("next"))?.message?.content ?? "", /charlie released a\.ts/);
+
+	// A far peer that starts touching this agent's files is described once, when it does.
+	await e.edit("a.ts", "y", "z");
+	const near = (await a.prompt("again"))?.message?.content ?? "";
+	assert.match(near, /• now working near you: echo \[busy\][^\n]*\n\s+task: the build/);
+	await e.prompt("still the build, and a.ts");
+	assert.match((await a.prompt("again"))?.message?.content ?? "", /echo is now on: still the build, and a\.ts/);
+	assert.equal(await a.prompt("again"), undefined, "nothing changed");
+});
+
+test("briefs: news held back while a peer was far is told once it is near again", async () => {
+	const proj = makeProject("p-relevance-told");
+	const a = await session(proj);
+	const [b, c, d] = [await session(proj), await session(proj), await session(proj)];
+	await b.prompt("task one");
+	assert.match((await a.prompt("start"))?.message?.content ?? "", /bravo \[busy\][^\n]*\n\s+task: task one/, "three peers: all described");
+	const e = await session(proj);
+	await e.prompt("echo's work");
+	assert.match((await a.prompt("x"))?.message?.content ?? "", /• joined: echo/);
+	await b.prompt("task two");
+	await b.tool({ action: "claim", paths: ["src/b"] });
+	assert.equal(await a.prompt("y"), undefined, "four peers, none near: bravo's news waits");
+	await e.stop();
+	const back = (await a.prompt("z"))?.message?.content ?? "";
+	assert.match(back, /echo left/);
+	assert.match(back, /bravo is now on: task two/);
+	assert.match(back, /bravo claimed src\/b/);
+	assert.ok(c && d);
 });
 
 test("leaving: presence removed; a blocked ask to the departed peer fails fast", async () => {
@@ -576,4 +706,456 @@ test("ids: agents started together get distinct ids on the board, and those ids 
 	assert.ok(!sent.isError, sent.text);
 	await eventually(() => assert.ok(b.sentOf("telecom-message").some((m) => /by id/.test(m.content))));
 	assert.equal(c.sentOf("telecom-message").length, 0);
+});
+
+// ---------------------------------------------------------------- lanes: worktrees of one repository
+
+/** A git worktree of `main`, laid out the way `git worktree add` does it. */
+function makeWorktree(main: string, name: string, branch: string, at?: string): string {
+	const gitDir = join(main, ".git", "worktrees", name);
+	mkdirSync(gitDir, { recursive: true });
+	writeFileSync(join(gitDir, "HEAD"), `ref: refs/heads/${branch}\n`);
+	writeFileSync(join(gitDir, "commondir"), "../..\n");
+	const dir = at ?? join(SCRATCH, `${basename(main)}-${name}`);
+	mkdirSync(dir, { recursive: true });
+	writeFileSync(join(dir, ".git"), `gitdir: ${gitDir}\n`);
+	return dir;
+}
+
+test("lanes: agents in worktrees of one repository are one team; the guard stays within a checkout", async () => {
+	const proj = makeProject("p-lanes");
+	const wt = makeWorktree(proj, "wt", "lane-b");
+	for (const dir of [proj, wt]) writeFileSync(join(dir, "x.ts"), "x\n");
+	const a = await session(proj);
+	const b = await session(wt);
+	const board = (await a.tool({ action: "board" })).text;
+	assert.match(board, /and other checkouts of its repository/);
+	assert.match(board, new RegExp(`• bravo \\[idle\\] on lane-b  in worktree ${wt}`), board);
+	assert.equal((await b.tool({ action: "board" })).details.callsign, "bravo", "callsigns are unique across the repository");
+
+	await a.edit("x.ts", "x", "from main");
+	await b.read("x.ts");
+	const write = await b.write("x.ts", "from the lane\n");
+	assert.equal(write.blocked, undefined, "separate files: nothing to guard");
+	assert.match(write.note ?? "", /alpha edited its copy .*in the main checkout .*meet when the branches merge/);
+	assert.equal((await b.write("x.ts", "again\n")).note, undefined, "told once");
+	// alpha changed its own copy too, so it hears about bravo's — as merge news, not a stale view.
+	await eventually(() => assert.equal(a.sentOf("telecom-change").length, 1), 3_000);
+	const notice = a.sentOf("telecom-change")[0]?.content ?? "";
+	assert.match(notice, /x\.ts — rewrote in worktree .* you changed your copy too/);
+	assert.match(notice, /nothing in yours is stale/);
+	assert.doesNotMatch(notice, /Re-read/);
+	assert.equal((await a.write("x.ts", "main again\n")).blocked, undefined, "alpha's own copy never went stale");
+});
+
+test("lanes: a claim made in another worktree is advisory — noted, the owner told once, overlapping claims allowed", async () => {
+	const proj = makeProject("p-lane-claims");
+	const wt = makeWorktree(proj, "wt", "lane-b");
+	mkdirSync(join(wt, "src"), { recursive: true });
+	writeFileSync(join(wt, "src", "y.ts"), "y\n");
+	const a = await session(proj);
+	const b = await session(wt);
+	await a.tool({ action: "claim", paths: ["src/**"], message: "auth rewrite" });
+	await b.read("src/y.ts");
+	const first = await b.edit("src/y.ts", "y", "Y");
+	assert.equal(first.blocked, undefined, "another lane is never held back");
+	assert.match(first.note ?? "", /inside alpha's claim "src\/\*\*" \(auth rewrite\).* in the main checkout .* alpha has been told/);
+	await eventually(() => assert.equal(a.sentOf("telecom-claim").length, 1));
+	assert.match(a.sentOf("telecom-claim")[0]?.content ?? "", /bravo changed a path you claimed, in another checkout\*\*\n\nbravo edited src\/y\.ts in worktree/);
+	const again = await b.edit("src/y.ts", "Y", "YY");
+	assert.doesNotMatch(again.note ?? "", /has been told/);
+	await sleep(150);
+	assert.equal(a.sentOf("telecom-claim").length, 1, "the owner is told once, not on every edit");
+	const claim = await b.tool({ action: "claim", paths: ["src/y.ts"] });
+	assert.ok(!claim.isError, claim.text);
+	assert.match(claim.text, /Note: "src\/y\.ts" overlaps alpha's claim "src\/\*\*" .* both claims stand/);
+});
+
+test("lanes: a claim in another worktree never hides a binding claim in this checkout", async () => {
+	const proj = makeProject("p-lane-mask");
+	const wt = makeWorktree(proj, "wt", "lane-b");
+	mkdirSync(join(proj, "src"), { recursive: true });
+	writeFileSync(join(proj, "src", "a.ts"), "a\n");
+	const lane = await session(wt);
+	const owner = await session(proj);
+	const editor = await session(proj);
+	await lane.tool({ action: "claim", paths: ["src/**"] });
+	assert.ok(!(await owner.tool({ action: "claim", paths: ["src/a.ts"] })).isError, "an overlap across lanes is only a note");
+	await editor.read("src/a.ts");
+	const res = await editor.edit("src/a.ts", "a", "A");
+	assert.match(res.blocked ?? "", /inside bravo's claim "src\/a\.ts"/);
+	await eventually(() => assert.equal(owner.sentOf("telecom-claim").length, 1));
+	assert.equal(lane.sentOf("telecom-claim").length, 0, "the lane owner hears nothing about an edit that did not happen");
+});
+
+test("lanes: one-time notes and the claim owner's notice are spent only by an edit that lands", async () => {
+	const proj = makeProject("p-lane-once");
+	const wt = makeWorktree(proj, "wt", "lane-b");
+	for (const dir of [proj, wt]) {
+		mkdirSync(join(dir, "src"), { recursive: true });
+		writeFileSync(join(dir, "src", "y.ts"), "y\n");
+	}
+	const a = await session(proj);
+	const b = await session(wt);
+	await a.tool({ action: "claim", paths: ["src/**"] });
+	await a.read("src/y.ts");
+	await a.edit("src/y.ts", "y", "main");
+	await b.read("src/y.ts");
+	// An edit that fails (its anchor did not match) shows the notes, but must not spend them.
+	const input = { path: "src/y.ts", edits: [{ oldText: "nope", newText: "x" }] };
+	await b.fire("tool_call", { toolName: "edit", toolCallId: "failing-1", input });
+	await b.fire("tool_result", { toolName: "edit", toolCallId: "failing-1", input, content: [{ type: "text", text: "no match" }], isError: true });
+	const landed = await b.edit("src/y.ts", "y", "lane");
+	assert.match(landed.note ?? "", /alpha edited its copy/);
+	assert.match(landed.note ?? "", /inside alpha's claim "src\/\*\*".* alpha has been told/);
+	await eventually(() => assert.equal(a.sentOf("telecom-claim").length, 1));
+});
+
+test("lanes: a worktree inside the main checkout — a change to its files from the main checkout is a change to the very file", async () => {
+	const proj = makeProject("p-lane-nested");
+	const wt = makeWorktree(proj, "wt", "lane-b", join(proj, ".worktrees", "wt"));
+	writeFileSync(join(wt, "f.ts"), "f\n");
+	const a = await session(proj);
+	const b = await session(wt);
+	await b.read("f.ts");
+	await a.read(join(wt, "f.ts"));
+	await a.edit(join(wt, "f.ts"), "f", "F");
+	await eventually(() => assert.equal(b.sentOf("telecom-change").length, 1), 3_000);
+	const notice = b.sentOf("telecom-change")[0]?.content ?? "";
+	assert.match(notice, /alpha changed a file you are working with/);
+	assert.doesNotMatch(notice, /its copy|another checkout/);
+	assert.match((await b.write("f.ts", "mine")).blocked ?? "", /edited f\.ts/, "the guard protects it like any peer change");
+});
+
+// ---------------------------------------------------------------- subagents
+
+test("subagents: a foreground child is found from its session header, named after its parent, and listed under it", async () => {
+	const proj = makeProject("p-family");
+	const a = await session(proj);
+	const child = await session(proj, { parentSession: a.sessionFile() });
+	const b = await session(proj);
+	assert.equal((await child.tool({ action: "board" })).details.callsign, "alpha-1");
+	assert.match((await a.tool({ action: "board" })).text, /• alpha-1 \(your subagent\)/);
+	const board = (await b.tool({ action: "board" })).text;
+	assert.match(board, /• alpha \[idle\][^\n]*\n• alpha-1 \(subagent of alpha\)/, "a family reads as one block");
+	await eventually(() => assert.match(a.status ?? "", /1 peer \+ 1 subagent/));
+	await child.stop();
+	await sleep(100);
+	assert.ok(!a.notified.some((n) => /alpha-1|agent left/.test(n)), `subagents come and go quietly: ${a.notified.join(" | ")}`);
+});
+
+test("subagents: a background child is found from the runner's environment, and ignores its parent's PI_TELECOM_CALLSIGN", async () => {
+	const proj = makeProject("p-family-bg");
+	const a = await session(proj);
+	Object.assign(process.env, {
+		PI_SUBAGENT_CHILD: "1",
+		PI_SUBAGENT_PARENT_SESSION: a.id,
+		PI_SUBAGENT_RUNNER_PID: String(process.pid),
+		PI_TELECOM_CALLSIGN: "ops",
+	});
+	let child: Session;
+	try {
+		child = await session(proj);
+	} finally {
+		for (const key of ["PI_SUBAGENT_CHILD", "PI_SUBAGENT_PARENT_SESSION", "PI_SUBAGENT_RUNNER_PID", "PI_TELECOM_CALLSIGN"]) delete process.env[key];
+	}
+	assert.equal((await child.tool({ action: "board" })).details.callsign, "alpha-1");
+	assert.match((await a.tool({ action: "board" })).text, /alpha-1 \(your subagent\)/);
+});
+
+test("subagents: a fork is not a subagent, even when its origin is live in another process", async () => {
+	const proj = makeProject("p-fork");
+	const a = await session(proj);
+	const { openTransport, processStartTicks } = await import("../src/transport.ts");
+	const t = openTransport(process.env.PI_TELECOM_DIR as string);
+	const origin = new Session(proj, { id: "origin-session-0001" });
+	t.writePresence({
+		v: 1, id: origin.id, callsign: "kilo", pid: process.ppid, ticks: processStartTicks(process.ppid),
+		cwd: proj, projectRoot: findProjectRoot(proj), role: "main", state: "idle", claims: [], recent: [],
+		startedAt: 1, heartbeatAt: Date.now(),
+	});
+	const fork = await session(proj, { parentSession: origin.sessionFile() });
+	const board = await fork.tool({ action: "board" });
+	assert.equal(board.details.callsign, "bravo");
+	assert.doesNotMatch(board.text, /subagent/);
+	assert.ok(a);
+	t.removePresence(origin.id);
+});
+
+test("subagents: a parent's claim never holds its own subagent back; a sibling's claim does", async () => {
+	const proj = makeProject("p-family-claims");
+	mkdirSync(join(proj, "src"), { recursive: true });
+	for (const f of ["a.ts", "b.ts"]) writeFileSync(join(proj, "src", f), "x\n");
+	const a = await session(proj);
+	await a.tool({ action: "claim", paths: ["src/**"], message: "refactor" });
+	const c1 = await session(proj, { parentSession: a.sessionFile() });
+	const c2 = await session(proj, { parentSession: a.sessionFile() });
+	await c1.read("src/a.ts");
+	const own = await c1.edit("src/a.ts", "x", "y");
+	assert.equal(own.blocked, undefined, "delegated work inside the parent's claim");
+	assert.doesNotMatch(own.note ?? "", /claim/);
+	const sub = await c1.tool({ action: "claim", paths: ["src/a.ts"], message: "c1 owns this" });
+	assert.ok(!sub.isError, `a subagent may claim part of its parent's claim: ${sub.text}`);
+	await c2.read("src/a.ts");
+	const sibling = await c2.edit("src/a.ts", "y", "z");
+	assert.match(sibling.blocked ?? "", /inside alpha-1's claim "src\/a\.ts"/, "siblings work in parallel: held back like peers");
+	assert.equal(a.sentOf("telecom-claim").length, 0, "the parent was never told its own subagent contested it");
+	const b = await session(proj);
+	await b.read("src/b.ts");
+	assert.match((await b.edit("src/b.ts", "x", "y")).blocked ?? "", /inside alpha's claim/);
+});
+
+test("subagents: a foreground child cannot deadlock by asking its blocked parent; peers are told the parent is waiting", async () => {
+	const proj = makeProject("p-family-ask");
+	const a = await session(proj);
+	const child = await session(proj, { parentSession: a.sessionFile() });
+	await a.prompt("delegate the migration");
+	await child.prompt("write the migration");
+	const started = Date.now();
+	const ask = await child.tool({ action: "ask", to: "alpha", message: "which table?", timeoutSec: 30 });
+	assert.ok(ask.isError);
+	assert.ok(Date.now() - started < 1_000, "refused at once, not after the timeout");
+	assert.match(ask.text, /blocked waiting for your run to end/);
+	assert.match(ask.text, /contact_supervisor\(\{ reason: "need_decision"/);
+	assert.equal(a.sentOf("telecom-ask").length, 0);
+	const b = await session(proj);
+	const sent = await b.tool({ action: "send", to: "alpha", message: "ping" });
+	assert.match(sent.text, /busy waiting on its subagent alpha-1/);
+	const fromChild = await child.tool({ action: "send", to: "alpha", message: "fyi" });
+	assert.match(fromChild.text, /reads this after you finish/);
+});
+
+test("briefs: a lone parent's subagents cost nothing; peers see them folded into the parent; siblings see each other", async () => {
+	const proj = makeProject("p-family-brief");
+	const a = await session(proj);
+	const c1 = await session(proj, { parentSession: a.sessionFile() });
+	assert.equal(await a.prompt("split the work"), undefined, "own subagents are not news");
+	assert.equal(await c1.prompt("part one"), undefined, "neither is one's own parent");
+	const c2 = await session(proj, { parentSession: a.sessionFile() });
+	const siblings = (await c2.prompt("part two"))?.message?.content ?? "";
+	assert.match(siblings, /you are "alpha-2", a subagent of alpha\. 1 other agent is working/);
+	assert.match(siblings, /• alpha-1 \(subagent of alpha\) \[busy\]/);
+	const b = await session(proj);
+	const full = (await b.prompt("docs"))?.message?.content ?? "";
+	assert.match(full, /1 other agent \(and 2 subagents\) are working/);
+	assert.match(full, /• alpha \[busy\][^\n]*\n\s+task: split the work[^\n]*\n\s+subagents: alpha-1 \[busy\] part one; alpha-2 \[busy\] part two/);
+	await c1.stop();
+	assert.equal(await b.prompt("more docs"), undefined, "a subagent finishing is not team news");
+	await c2.tool({ action: "claim", paths: ["lib/**"] });
+	assert.match((await b.prompt("again"))?.message?.content ?? "", /• alpha claimed lib\/\*\* \(by alpha-2\)/, "their claims are");
+});
+
+// ---------------------------------------------------------------- robustness
+
+test("robustness: a session pi disposed without session_shutdown leaves the switchboard instead of haunting it", async () => {
+	const proj = makeProject("p-disposed");
+	const a = await session(proj);
+	const child = await session(proj, { parentSession: a.sessionFile() });
+	assert.match((await a.tool({ action: "board" })).text, /alpha-1/);
+	child.disposed = true; // pi invalidated its API: every pi.* call throws now
+	await eventually(async () => assert.doesNotMatch((await a.tool({ action: "board" })).text, /alpha-1/));
+	assert.ok(!a.notified.some((n) => /telecom tick/.test(n)), "no error escaped the loop");
+});
+
+test("leaving frees claims: peers held back by them are told", async () => {
+	const proj = makeProject("p-leave-claims");
+	writeFileSync(join(proj, "db.ts"), "export {}\n");
+	const a = await session(proj);
+	const b = await session(proj);
+	await a.tool({ action: "claim", paths: ["db.ts"] });
+	await b.read("db.ts");
+	assert.ok((await b.edit("db.ts", "export {}", "export const y = 1;")).blocked);
+	await eventually(() => assert.equal(a.sentOf("telecom-claim").length, 1));
+	await a.stop();
+	await eventually(() => assert.ok(b.sentOf("telecom-claim").some((m) => /alpha released db\.ts/.test(m.content))));
+});
+
+test("subagents: a child forked from its parent's context is still named after the parent", async () => {
+	const proj = makeProject("p-family-forked");
+	const a = await session(proj);
+	const child = new Session(proj, { parentSession: a.sessionFile() });
+	// pi-subagents' context: "fork" copies the parent's entries, its remembered callsign included.
+	child.entries.push({ type: "custom", customType: "telecom-callsign", data: { callsign: "alpha" } });
+	open.push(await child.start());
+	assert.equal((await child.tool({ action: "board" })).details.callsign, "alpha-1");
+});
+
+test("subagents: a nested foreground subagent cannot deadlock by asking its blocked grandparent", async () => {
+	const proj = makeProject("p-family-nested");
+	const p = await session(proj);
+	const c1 = await session(proj, { parentSession: p.sessionFile() });
+	const c2 = await session(proj, { parentSession: c1.sessionFile() });
+	await p.prompt("design the schema");
+	await c1.prompt("draft the tables");
+	assert.equal((await c2.tool({ action: "board" })).details.callsign, "alpha-1-1");
+	const res = await c2.tool({ action: "ask", to: "alpha", message: "which schema?", timeoutSec: 5 });
+	assert.ok(res.isError);
+	assert.match(res.text, /alpha is above you in a chain of foreground subagents, and it is blocked waiting for your run to end/);
+	assert.match(res.text, /it reaches alpha-1 mid-run: contact_supervisor/);
+	assert.match((await c2.tool({ action: "send", to: "alpha", message: "fyi" })).text, /busy waiting for your run to end/);
+});
+
+test("briefs: when a parent leaves and its subagent stays, the subagent's claims are not called free", async () => {
+	const proj = makeProject("p-family-orphan");
+	const a = await session(proj);
+	const b = await session(proj);
+	const child = await session(proj, { parentSession: b.sessionFile() });
+	await child.tool({ action: "claim", paths: ["src/**"] });
+	await b.prompt("the migration");
+	assert.match((await a.prompt("start"))?.message?.content ?? "", /claims: src\/\*\* \(by bravo-1\)|subagent claims: src\/\*\*/);
+	await b.stop();
+	const delta = (await a.prompt("again"))?.message?.content ?? "";
+	assert.match(delta, /• carries on after bravo left: bravo-1/);
+	assert.match(delta, /• bravo left$/m);
+	assert.doesNotMatch(delta, /are free|joined/);
+});
+
+test("robustness: a directory planted in the inbox stops neither delivery nor ask timeouts", async () => {
+	const proj = makeProject("p-inbox-dir");
+	const a = await session(proj);
+	const b = await session(proj);
+	mkdirSync(join(process.env.PI_TELECOM_DIR as string, "inbox", a.id, "0000-planted.json"), { recursive: true });
+	const res = await a.tool({ action: "ask", to: "bravo", message: "there?", timeoutSec: 0.2 });
+	assert.match(res.text, /did not answer within/);
+	await b.tool({ action: "send", to: "alpha", message: "still reachable" });
+	await eventually(() => assert.ok(a.sentOf("telecom-message").some((m) => /still reachable/.test(m.content))));
+});
+
+// ---------------------------------------------------------------- audit regressions
+
+test("subagents: an ask that would close a wait cycle at a parent stuck in a subagent run is refused, with what to answer", async () => {
+	const proj = makeProject("p-cycle-fg");
+	const p = await session(proj);
+	const b = await session(proj);
+	const c = await session(proj);
+	const child = await session(proj, { parentSession: p.sessionFile() });
+	await p.prompt("delegate the schema");
+	await child.prompt("draft the schema");
+	// An older ask from off the cycle: answering it would unblock nothing.
+	const fromC = c.tool({ action: "ask", to: "bravo", message: "lunch?", timeoutSec: 5 });
+	await eventually(() => assert.equal(b.sentOf("telecom-ask").length, 1));
+	const fromChild = child.tool({ action: "ask", to: "bravo", message: "which ids?", timeoutSec: 5 });
+	await eventually(() => assert.equal(b.sentOf("telecom-ask").length, 2));
+	const askId = b.sentOf("telecom-ask")[1]?.details.id as string;
+	const started = Date.now();
+	const res = await b.tool({ action: "ask", to: "alpha", message: "what did you decide?", timeoutSec: 5 });
+	assert.ok(res.isError && Date.now() - started < 1_000, res.text);
+	assert.match(res.text, /alpha is inside its subagent alpha-1's run, which is waiting, directly or through others, on you/);
+	assert.match(res.text, new RegExp(`telecom\\(\\{ action: "reply", askId: "${askId}"`));
+	await b.tool({ action: "reply", askId, message: "uuids" });
+	assert.match((await fromChild).text, /uuids/);
+	await b.tool({ action: "reply", message: "sure" });
+	assert.match((await fromC).text, /sure/);
+});
+
+test("lanes: an edit that reaches into another checkout's real file is bound by its claims there, and its owner hears of it", async () => {
+	const proj = makeProject("p-lane-reach");
+	const wt = makeWorktree(proj, "wt", "lane-b");
+	mkdirSync(join(proj, "src"), { recursive: true });
+	writeFileSync(join(proj, "src", "x.ts"), "x\n");
+	const a = await session(proj);
+	const b = await session(wt);
+	await a.read("src/x.ts");
+	await a.tool({ action: "claim", paths: ["src/**"] });
+	const target = join(proj, "src", "x.ts");
+	await b.read(target);
+	assert.match((await b.edit(target, "x", "X")).blocked ?? "", /inside alpha's claim "src\/\*\*"/, "the same bytes: the claim binds");
+	const retried = await b.edit(target, "x", "X");
+	assert.equal(retried.blocked, undefined, "standard mode: a retry goes through");
+	await eventually(() => assert.equal(a.sentOf("telecom-change").length, 1), 3_000);
+	assert.match(a.sentOf("telecom-change")[0]?.content ?? "", /bravo changed a file you are working with/);
+});
+
+test("lanes: a change from a worktree peer that joined since the last team refresh is still read as its own copy", async () => {
+	const proj = makeProject("p-lane-fresh");
+	const wt = makeWorktree(proj, "wt", "lane-b");
+	for (const dir of [proj, wt]) writeFileSync(join(dir, "x.ts"), "x\n");
+	const a = await session(proj);
+	await a.read("x.ts");
+	await a.edit("x.ts", "x", "main");
+	// Written in one synchronous block: alpha's next tick drains the event before it refreshes
+	// its team, so the sender is not in its cache yet.
+	const t = openTransport(process.env.PI_TELECOM_DIR as string);
+	const id = "00000000-0000-4000-8000-0000000fresh";
+	t.writePresence({
+		v: WIRE_VERSION, id, callsign: "bravo", pid: process.pid, ticks: processStartTicks(process.pid), cwd: wt,
+		projectRoot: findProjectRoot(wt), repo: findRepo(findProjectRoot(wt)), role: "main", state: "busy",
+		claims: [], recent: [{ path: join(wt, "x.ts"), op: "edit", at: Date.now() }], startedAt: Date.now(), heartbeatAt: Date.now(),
+	});
+	t.deliver({
+		v: WIRE_VERSION, id: "evt-fresh-1", ts: Date.now(), from: id, fromCallsign: "bravo", to: a.id, kind: "event",
+		text: "bravo edited x.ts", topic: "file.changed", data: { path: join(wt, "x.ts"), op: "edit" },
+	});
+	await eventually(() => assert.equal(a.sentOf("telecom-change").length, 1), 3_000);
+	assert.match(a.sentOf("telecom-change")[0]?.content ?? "", /in worktree/);
+	t.removePresence(id);
+});
+
+test("durability: an ask that stopped waiting before a /reload still wakes the agent when its late answer comes", async () => {
+	const proj = makeProject("p-reload-late");
+	const a = await session(proj);
+	const b = await session(proj);
+	const res = await a.tool({ action: "ask", to: "bravo", message: "slow one", timeoutSec: 0.1 });
+	assert.match(res.text, /did not answer within/);
+	await a.stop("reload");
+	const a2 = new Session(proj, { id: a.id });
+	open.push(await a2.start("reload"));
+	await b.tool({ action: "reply", message: "late but here" });
+	await eventually(() => assert.equal(a2.sentOf("telecom-reply").length, 1));
+	const late = a2.sentOf("telecom-reply")[0];
+	assert.match(late?.content ?? "", /Late reply from bravo/);
+	assert.equal(late?.options?.triggerTurn, true, "a late answer wakes the agent, as it would without the reload");
+});
+
+// ---------------------------------------------------------------- scoped broadcasts, asking by path
+
+test("broadcast with paths: agents working there get it now, the rest at their next prompt", async () => {
+	const proj = makeProject("p-broadcast-scope");
+	mkdirSync(join(proj, "src", "db"), { recursive: true });
+	writeFileSync(join(proj, "src", "db", "schema.ts"), "s\n");
+	const a = await session(proj);
+	const reader = await session(proj);
+	const owner = await session(proj);
+	const far = await session(proj);
+	await reader.read("src/db/schema.ts");
+	await owner.tool({ action: "claim", paths: ["src/db/migrations"] });
+	const res = await a.tool({ action: "broadcast", paths: ["src/db/**"], message: "the users table gains a tenant_id column" });
+	assert.match(res.text, /about src\/db\/\*\*: agents working there get it now, the rest at their next prompt/);
+	await eventually(() => {
+		for (const s of [reader, owner, far]) assert.equal(s.sentOf("telecom-broadcast").length, 1);
+	});
+	for (const s of [reader, owner]) assert.equal(s.sentOf("telecom-broadcast")[0]?.options, undefined, "near: delivered now");
+	assert.deepEqual(far.sentOf("telecom-broadcast")[0]?.options, { deliverAs: "nextTurn" }, "far: held for its next run");
+	assert.match(far.sentOf("telecom-broadcast")[0]?.content ?? "", /Broadcast from alpha — about src\/db\/\*\*\*\*\n\nthe users table/);
+	await a.tool({ action: "broadcast", message: "everyone: main is green again" });
+	await eventually(() => assert.equal(far.sentOf("telecom-broadcast").length, 2));
+	assert.equal(far.sentOf("telecom-broadcast")[1]?.options, undefined, "a broadcast without paths concerns everyone");
+});
+
+test("send/ask with paths reach whoever claims them, else whoever changed them last", async () => {
+	const proj = makeProject("p-owner");
+	mkdirSync(join(proj, "src", "api"), { recursive: true });
+	writeFileSync(join(proj, "src", "api", "routes.ts"), "r\n");
+	const a = await session(proj);
+	const b = await session(proj);
+	const c = await session(proj);
+	await c.tool({ action: "claim", paths: ["src/db/**"] });
+	const sent = await a.tool({ action: "send", paths: ["src/db/schema.ts"], message: "heads-up: I renamed users.email" });
+	assert.match(sent.text, /^sent to charlie, which claims "src\/db\/\*\*" \(/);
+	await eventually(() => assert.equal(c.sentOf("telecom-message").length, 1));
+
+	await b.read("src/api/routes.ts");
+	await b.edit("src/api/routes.ts", "r", "R");
+	const pending = a.tool({ action: "ask", paths: ["src/api"], message: "is /users paginated?" });
+	await eventually(() => assert.equal(b.sentOf("telecom-ask").length, 1));
+	await b.tool({ action: "reply", message: "yes, cursor-based" });
+	assert.match((await pending).text, /^bravo \(it changed src\/api\/routes\.ts [^)]*\) answered:\n\nyes, cursor-based/);
+
+	await b.tool({ action: "claim", paths: ["src/api/**"] });
+	const both = await a.tool({ action: "send", paths: ["src/api/x.ts", "src/db/x.ts"], message: "?" });
+	assert.ok(both.isError);
+	assert.match(both.text, /spans the claims of bravo \("src\/api\/\*\*"\), charlie \("src\/db\/\*\*"\)\. Pick one: telecom\(\{ action: "send", to: "bravo"/);
+	const nobody = await a.tool({ action: "ask", paths: ["docs/**"], message: "?" });
+	assert.ok(nobody.isError);
+	assert.match(nobody.text, /no other agent claims or recently changed docs\/\*\*\. .*telecom\(\{ action: "broadcast", paths: \["docs\/\*\*"\]/);
 });

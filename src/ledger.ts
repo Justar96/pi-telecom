@@ -9,6 +9,10 @@
  *   - an outbound ask fails at once when the peer it waits on goes away;
  *   - asks that stopped waiting are remembered, so a late answer reads as "late reply to your
  *     ask" instead of an unexplained message.
+ *
+ * With more than two agents, interrupting on EVERY inbound ask breaks up waits that could never
+ * deadlock (A waits on B; C asks A: B will still answer). So each agent publishes whom it waits
+ * on, and an inbound ask interrupts only when it closes a cycle (`closesCycle`).
  */
 import { setBounded } from "./util.ts";
 
@@ -30,6 +34,7 @@ interface PendingAsk {
 	to: string;
 	toCallsign: string;
 	text: string;
+	since: number;
 	deadline: number;
 	timeoutMs: number;
 	settle(outcome: AskOutcome): void;
@@ -57,6 +62,89 @@ export interface AskLedger {
 	failPeerGone(isGone: (sessionId: string) => boolean): void;
 	expire(now: number): void;
 	outboundCount(): number;
+	/** Asks whose answer would now arrive late (abandoned, or still waiting): kept over a `/reload`. */
+	lateCandidates(): Array<[string, { toCallsign: string; text: string }]>;
+	restoreAbandoned(entries: ReadonlyArray<[string, { toCallsign: string; text: string }]>): void;
+	/** The sessions outbound asks are waiting on, and when the oldest wait began. */
+	waits(): { on: string[]; since?: number };
+}
+
+/** What the wait-for graph needs from a presence record. */
+export interface WaitNode {
+	id: string;
+	pid: number;
+	state: "idle" | "busy";
+	parent?: string;
+	waitingOn?: string[];
+}
+
+/** Wait chains are short; this bounds a walk over hostile records. */
+const MAX_WAIT_DEPTH = 32;
+/**
+ * At most this many waits are published per session. A list this long may have been cut, so the
+ * graph past it is unknown (never "no cycle": a missing edge could be the one closing it).
+ */
+export const WAITS_CAP = 8;
+
+/**
+ * Would `askerId`'s ask to `self` close a wait cycle? The ask makes the asker wait on `self`, so
+ * it closes one exactly when `self` already waits, directly or through others, on the asker. Then
+ * `self` must stop waiting and answer, or every agent on the cycle waits until its timeout. A
+ * session blocked on a busy foreground subagent (one running in its own process) waits on it too,
+ * though no ask says so. `null` when a session on the way publishes no waits (an older telecom):
+ * the graph cannot be known, so the caller interrupts.
+ */
+export function closesCycle(askerId: string, self: WaitNode, peers: readonly WaitNode[]): boolean | null {
+	const byId = new Map(peers.map((p) => [p.id, p]));
+	byId.set(self.id, self);
+	// An asker whose record no longer waits on us has stopped waiting (it was interrupted itself,
+	// or gave up): its ask closes nothing, and our wait can go on.
+	const asker = byId.get(askerId);
+	if (asker?.waitingOn && asker.waitingOn.length < WAITS_CAP && !asker.waitingOn.includes(self.id)) return false;
+	const edges = (node: WaitNode): string[] => [
+		...(node.waitingOn ?? []),
+		...peers.filter((c) => c.parent === node.id && c.pid === node.pid && c.state === "busy").map((c) => c.id),
+	];
+	const seen = new Set<string>([self.id]);
+	let frontier = edges(self);
+	for (let depth = 0; frontier.length > 0 && depth < MAX_WAIT_DEPTH; depth++) {
+		const next: string[] = [];
+		for (const id of frontier) {
+			if (id === askerId) return true;
+			if (seen.has(id)) continue;
+			seen.add(id);
+			const node = byId.get(id);
+			if (!node) continue;
+			if (node.waitingOn === undefined || node.waitingOn.length >= WAITS_CAP) return null;
+			next.push(...edges(node));
+		}
+		frontier = next;
+	}
+	return false;
+}
+
+/** The sessions `start` waits on, directly or through others (bounded like `closesCycle`). */
+export function waitedOn(start: WaitNode, peers: readonly WaitNode[]): Set<string> {
+	const byId = new Map(peers.map((p) => [p.id, p]));
+	const seen = new Set<string>();
+	let frontier = [start];
+	for (let depth = 0; frontier.length > 0 && depth < MAX_WAIT_DEPTH; depth++) {
+		const next: WaitNode[] = [];
+		for (const node of frontier) {
+			const out = [
+				...(node.waitingOn ?? []),
+				...peers.filter((c) => c.parent === node.id && c.pid === node.pid && c.state === "busy").map((c) => c.id),
+			];
+			for (const id of out) {
+				if (seen.has(id) || id === start.id) continue;
+				seen.add(id);
+				const found = byId.get(id);
+				if (found) next.push(found);
+			}
+		}
+		frontier = next;
+	}
+	return seen;
 }
 
 const ABANDONED_CAP = 64;
@@ -112,6 +200,7 @@ export function createAskLedger(): AskLedger {
 					stop(askId, { ok: false, reason: "the ask was abandoned: the tool call was aborted", aborted: true });
 				outbound.set(askId, {
 					...meta,
+					since: Date.now(),
 					deadline: Date.now() + timeoutMs,
 					timeoutMs,
 					settle: finish,
@@ -170,6 +259,23 @@ export function createAskLedger(): AskLedger {
 
 		outboundCount() {
 			return outbound.size;
+		},
+
+		lateCandidates() {
+			return [
+				...abandoned.entries(),
+				...[...outbound.entries()].map(([id, p]): [string, { toCallsign: string; text: string }] => [id, { toCallsign: p.toCallsign, text: p.text }]),
+			].slice(-ABANDONED_CAP);
+		},
+
+		restoreAbandoned(entries) {
+			for (const [id, ask] of entries) setBounded(abandoned, id, ask, ABANDONED_CAP);
+		},
+
+		waits() {
+			const pending = [...outbound.values()];
+			if (pending.length === 0) return { on: [] };
+			return { on: [...new Set(pending.map((p) => p.to))], since: Math.min(...pending.map((p) => p.since)) };
 		},
 	};
 }

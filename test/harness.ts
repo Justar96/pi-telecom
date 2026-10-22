@@ -57,11 +57,17 @@ export class Session {
 	private callCounter = 0;
 	readonly cwd: string;
 
-	constructor(cwd: string, opts: { name?: string; id?: string } = {}) {
+	/** The session header's `parentSession`: pi-subagents sets it to the parent's session file. */
+	parentSession: string | undefined;
+	/** Set to simulate pi disposing the session: every `pi.*` call throws from then on. */
+	disposed = false;
+
+	constructor(cwd: string, opts: { name?: string; id?: string; parentSession?: string } = {}) {
 		this.cwd = cwd;
 		sessionCounter++;
 		this.id = opts.id ?? `00000000-0000-4000-8000-${String(sessionCounter).padStart(12, "0")}`;
 		this.sessionName = opts.name;
+		this.parentSession = opts.parentSession;
 		const self = this;
 		this.ctx = {
 			cwd,
@@ -70,6 +76,7 @@ export class Session {
 			model: { id: "test-model" },
 			sessionManager: {
 				getSessionId: () => self.id,
+				getHeader: () => ({ type: "session", id: self.id, timestamp: "", cwd, ...(self.parentSession ? { parentSession: self.parentSession } : {}) }),
 				getEntries: () => self.entries,
 				getBranch: () => self.entries,
 			},
@@ -105,7 +112,10 @@ export class Session {
 				});
 			},
 			appendEntry: (customType: string, data: unknown) => self.entries.push({ type: "custom", customType, data }),
-			getSessionName: () => self.sessionName,
+			getSessionName: () => {
+				if (self.disposed) throw new Error("This extension ctx is stale after session replacement or reload.");
+				return self.sessionName;
+			},
 			events: { on: () => () => {}, emit: () => {} },
 		};
 		telecom(pi as unknown as ExtensionAPI);
@@ -197,6 +207,14 @@ export class Session {
 			isError: false,
 		});
 		return { note: result?.content?.map((c: { text: string }) => c.text).join("\n") };
+	}
+
+	/** Write this session's file the way pi does (header first), for a child's `parentSession`. */
+	sessionFile(): string {
+		const file = join(SCRATCH, "sessions", `2026-10-22T00-00-00-000Z_${this.id}.jsonl`);
+		mkdirSync(dirname(file), { recursive: true });
+		writeFileSync(file, `${JSON.stringify({ type: "session", version: 3, id: this.id, timestamp: "", cwd: this.cwd })}\n`);
+		return file;
 	}
 
 	sentOf(customType: string): Sent[] {

@@ -9,6 +9,7 @@
  *
  *   node scripts/e2e-rpc.mjs          # exit 0 = pass, 1 = a check failed, 2 = setup problem
  */
+import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -97,6 +98,61 @@ try {
 	await a.command("/telecom");
 	const boardDup = await a.waitFor((r) => isNotify(/You are /)(r) && /1 other agent live/.test(r.message) && /dup-1/.test(r.message), 10_000).catch(() => null);
 	check("peers see that session exactly once", Boolean(boardDup), a.notifies().slice(-1)[0]);
+
+	// 8a. a new session that names the old one as its parent, in the same process (what `/fork`
+	// and `/clone` do): pi tears the old session down first, so the new one is not its subagent
+	const renewed = startPi("renewed", { cwd: project, env, session: ["--session-dir", join(scratch, "sessions-renewed")] });
+	extra.push(renewed);
+	await renewed.waitFor(isStatus(/📡/), 30_000);
+	const stateId = renewed.send({ type: "get_state" });
+	const state = await renewed.waitFor((r) => r.type === "response" && r.id === stateId, 10_000).catch(() => null);
+	const parentSession = state?.data?.sessionFile;
+	check("get_state names the session file", typeof parentSession === "string", JSON.stringify(state));
+	if (typeof parentSession === "string") {
+		const statusesBefore = renewed.records.filter(isStatus(/📡/)).length;
+		const newId = renewed.send({ type: "new_session", parentSession });
+		await renewed.waitFor((r) => r.type === "response" && r.id === newId, 15_000).catch(() => null);
+		await renewed
+			.waitFor((r) => isStatus(/📡/)(r) && renewed.records.filter(isStatus(/📡/)).indexOf(r) >= statusesBefore, 15_000)
+			.catch(() => null);
+		await renewed.command("/telecom");
+		const own = await renewed.waitFor(isNotify(/You are /), 10_000).catch(() => null);
+		const callsign = own?.message.match(/You are ([\w-]+)\./)?.[1] ?? "";
+		check(
+			"a session started in the same process with the old one as parent is not its subagent",
+			Boolean(own) && !/-\d+$/.test(callsign) && !/subagent/.test(own.message),
+			own?.message ?? renewed.notifies().slice(-1)[0],
+		);
+	}
+
+	// 8. a real `git worktree add`: the main checkout and the worktree are one team, in two lanes
+	const repo = join(scratch, "repo");
+	const lane = join(scratch, "repo-lane");
+	let git = true;
+	try {
+		mkdirSync(repo);
+		const g = (...args) => execFileSync("git", ["-c", "user.name=e2e", "-c", "user.email=e2e@example.com", ...args], { cwd: repo, stdio: "pipe" });
+		g("init", "-q", "-b", "main");
+		g("commit", "-q", "--allow-empty", "-m", "init");
+		g("worktree", "add", "-q", "-b", "lane-b", lane);
+	} catch (error) {
+		git = false;
+		console.log(`- skipped the worktree checks: git is not usable here (${error.message.split("\n")[0]})`);
+	}
+	if (git) {
+		const main = startPi("main-agent", { cwd: repo, env });
+		const wt = startPi("lane-agent", { cwd: lane, env });
+		extra.push(main, wt);
+		await main.waitFor(isStatus(/📡 \w+ · 1 peer/), 30_000).catch(() => null);
+		await main.command("/telecom");
+		const laneBoard = await main.waitFor(isNotify(/You are /), 10_000).catch(() => null);
+		check(
+			"an agent in a git worktree is on the main checkout's board, with its lane",
+			Boolean(laneBoard && /• \w+ "lane-agent" \[idle\] on lane-b  in worktree /.test(laneBoard.message)),
+			laneBoard?.message ?? main.notifies().slice(-1)[0],
+		);
+		check("agents in other projects are not counted in the repository's team", Boolean(laneBoard && /1 other agent live/.test(laneBoard.message)), laneBoard?.message);
+	}
 } catch (error) {
 	if (error.message !== "setup") {
 		console.error(error);

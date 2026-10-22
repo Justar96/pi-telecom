@@ -1,11 +1,12 @@
 /**
  * project — what "the same project" means, and one canonical spelling for every path.
  *
- * Two agents share a project when they share a project root: the nearest ancestor of their
- * working directory holding a `.git` entry (a directory, or the file a worktree or submodule
- * uses), or the working directory itself when there is none. Each git worktree is its own
- * project, because its files are its own; agents in sibling worktrees still see each other with
- * `scope: "machine"`.
+ * An agent's project root (its CHECKOUT) is the nearest ancestor of its working directory holding
+ * a `.git` entry (a directory, or the file a worktree or submodule uses), or the working directory
+ * itself when there is none. Checkouts that share a git common directory — the main checkout and
+ * its worktrees — belong to one REPOSITORY, and the agents in them are one team. Each checkout is
+ * a LANE: its files are its own, so the edit guard works within a lane, while claims and
+ * overlapping edits are compared across lanes by their repository-relative path.
  *
  * Paths are compared in one canonical form — `@`-prefix stripped and `~` expanded the way pi's
  * own tools do it, resolved against the session cwd, and symlinks resolved — so `src/a.ts`
@@ -35,15 +36,73 @@ export function findProjectRoot(cwd: string): string {
 	}
 }
 
+/** The git directory of a checkout: `.git` itself, or where a worktree's or submodule's `.git`
+ *  file points. `null` outside git. */
+function gitDirOf(root: string): string | null {
+	const dotGit = join(root, ".git");
+	try {
+		if (!statSync(dotGit).isFile()) return dotGit;
+		const pointer = readFileSync(dotGit, "utf8").match(/^gitdir:\s*(.+)\s*$/m)?.[1]?.trim();
+		return pointer ? resolve(root, pointer) : null;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * The repository a checkout belongs to: its git common directory, which the main checkout and
+ * every worktree share (`<main>/.git`; a worktree's git dir names it in its `commondir` file).
+ * A submodule's git dir has no `commondir`, so a submodule is a repository of its own, and so is
+ * a folder outside git.
+ */
+export function findRepo(root: string): string {
+	const gitDir = gitDirOf(root);
+	if (!gitDir) return root;
+	try {
+		return real(resolve(gitDir, readFileSync(join(gitDir, "commondir"), "utf8").trim()));
+	} catch {
+		return real(gitDir);
+	}
+}
+
+/** Where an agent works, as far as grouping goes. `repo` is optional on the wire: a peer without
+ *  it (an older telecom) is grouped by its checkout alone. */
+export interface Lane {
+	projectRoot: string;
+	repo?: string;
+}
+
+/** Teammates: the same checkout, or checkouts of one repository. */
+export function sameRepo(a: Lane, b: Lane): boolean {
+	return a.projectRoot === b.projectRoot || (a.repo !== undefined && a.repo === b.repo);
+}
+
+/** How a peer's checkout reads to someone in another lane of the repository. */
+export function laneName(peer: Lane): string {
+	// The main checkout holds the common directory itself, as its `.git`.
+	return peer.repo === join(peer.projectRoot, ".git") ? `the main checkout (${peer.projectRoot})` : `worktree ${peer.projectRoot}`;
+}
+
+/**
+ * The file in checkout `to` that `path`, touched by a session in checkout `from`, stands for.
+ * A path that physically belongs to `to` is `to`'s own file, returned as is: the session reached
+ * into `to` (an absolute path, or `to` nested in `from`, like `/repo/.worktrees/wt`). A path that
+ * belongs to `from` stands for the same repository path in `to`, its copy there. `null` when
+ * `path` is in neither. A path inside both belongs to the deeper checkout.
+ */
+export function inCheckout(path: string, from: string, to: string): string | null {
+	const inTo = isWithin(path, to);
+	const inFrom = isWithin(path, from);
+	if (inTo && (!inFrom || isWithin(to, from))) return path;
+	if (!inFrom) return null;
+	return join(to, relative(from, path));
+}
+
 /** The checked-out branch of a project root, read from git's own files (no git process). */
 export function readBranch(root: string): string | undefined {
 	try {
-		let gitDir = join(root, ".git");
-		if (statSync(gitDir).isFile()) {
-			const pointer = readFileSync(gitDir, "utf8").match(/^gitdir:\s*(.+)\s*$/m)?.[1];
-			if (!pointer) return undefined;
-			gitDir = isAbsolute(pointer) ? pointer : resolve(root, pointer);
-		}
+		const gitDir = gitDirOf(root);
+		if (!gitDir) return undefined;
 		const head = readFileSync(join(gitDir, "HEAD"), "utf8").trim();
 		const ref = head.match(/^ref:\s*refs\/heads\/(.+)$/)?.[1];
 		return ref ?? (head.length >= 7 ? `detached@${head.slice(0, 7)}` : undefined);

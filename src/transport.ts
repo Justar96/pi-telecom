@@ -10,7 +10,7 @@
  *   - the root falls back to a private directory under the OS temp dir when `$XDG_RUNTIME_DIR`
  *     is missing (macOS, containers), and can be pinned with `PI_TELECOM_DIR`;
  *   - liveness uses the `/proc/<pid>/stat` start time on Linux (so a reused pid reads as dead)
- *     and `kill(pid, 0)` elsewhere;
+ *     and `kill(pid, 0)` elsewhere, plus the heartbeat for subagents, which share a process;
  *   - the presence record carries what a teammate needs: callsign, project root, branch, busy
  *     state, current task, claims and recently edited files;
  *   - an envelope can carry a structured `data` payload for machine events (file changes,
@@ -35,6 +35,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CALLSIGN_PATTERN } from "./callsign.ts";
 import { ENV } from "./config.ts";
+import { WAITS_CAP } from "./ledger.ts";
 import { messageOf, shortId } from "./util.ts";
 
 export const WIRE_VERSION = 1;
@@ -49,6 +50,14 @@ const ID_PATTERN = /^[A-Za-z0-9._-]{1,128}$/;
 const UNPARSEABLE_GRACE_MS = 5_000;
 /** An inbox without a presence record is kept this long, so a starting session can publish first. */
 const ORPHAN_INBOX_GRACE_MS = 60_000;
+/**
+ * A subagent shares its pid with the process hosting it (the parent's pi for a foreground child,
+ * a pi-subagents runner for a background one), so a live pid does not prove the child is live. A
+ * child record that fell this far behind another session of its own process (all heartbeat every
+ * 15 s) belongs to a disposed session. A suspended process, or a machine asleep, stops every
+ * session in it at once, so their records fall behind together and none is dropped.
+ */
+export const CHILD_SILENT_MS = 5 * 60_000;
 
 export type Result<T> = ({ ok: true } & T) | { ok: false; reason: string };
 
@@ -80,11 +89,22 @@ export interface Presence {
 	/** `/proc/<pid>/stat` start time on Linux; `null` elsewhere. */
 	ticks: number | null;
 	cwd: string;
+	/** The checkout: the nearest folder holding `.git` (see project.ts). */
 	projectRoot: string;
+	/** The git common directory every checkout of the repository shares. Optional: a peer without
+	 *  it is grouped by `projectRoot` alone. */
+	repo?: string;
 	branch?: string;
 	model?: string;
 	/** A pi-subagents child session, or a top-level one. */
 	role: "main" | "child";
+	/** For a child: the session that started it. */
+	parent?: string;
+	/** Sessions this one is blocked on in an `ask`, for finding wait cycles. Always published
+	 *  (empty when not waiting); a record without it comes from an older telecom. */
+	waitingOn?: string[];
+	/** When the oldest of those asks started. */
+	waitingSince?: number;
 	state: "idle" | "busy";
 	task?: string;
 	taskAt?: number;
@@ -115,6 +135,11 @@ export interface Envelope {
 	data?: unknown;
 	/** True when a human typed it (`/telecom msg`), not the model. */
 	human?: boolean;
+	/**
+	 * For `broadcast`: the paths or globs it is about, in the sender's checkout. Agents working
+	 * there get it at once; the rest at their next prompt. Absent: it is about everyone.
+	 */
+	paths?: string[];
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -187,6 +212,26 @@ export function processStartTicks(pid: number): number | null {
 	}
 }
 
+/**
+ * Is the session behind a record still there? Its process must be. A child must also keep up
+ * with `hostBeat`, the latest heartbeat of any session in its process (`hostBeats`).
+ */
+export function isLive(record: Presence, hostBeat = record.heartbeatAt): boolean {
+	if (record.role === "child" && hostBeat - record.heartbeatAt > CHILD_SILENT_MS) return false;
+	return isAlive(record.pid, record.ticks);
+}
+
+/** The latest heartbeat among the records of each process: proof that the process still runs. */
+export function hostBeats(records: readonly Presence[], now = Date.now()): Map<number, number> {
+	const beats = new Map<number, number>();
+	for (const r of records) {
+		// A clock ahead of ours (or a forged record) must not make its process's children look dead.
+		const at = Math.min(r.heartbeatAt, now);
+		if (at > (beats.get(r.pid) ?? Number.NEGATIVE_INFINITY)) beats.set(r.pid, at);
+	}
+	return beats;
+}
+
 export function isAlive(pid: number, ticks: number | null): boolean {
 	if (!Number.isSafeInteger(pid) || pid <= 0) return false;
 	if (ticks !== null && process.platform === "linux") return processStartTicks(pid) === ticks;
@@ -201,7 +246,8 @@ export function isAlive(pid: number, ticks: number | null): boolean {
 // ---------------------------------------------------------------------------------------------
 // validation
 
-function isId(value: unknown): value is string {
+/** A session or envelope id that is safe as a file name. */
+export function isId(value: unknown): value is string {
 	return typeof value === "string" && ID_PATTERN.test(value) && value !== "." && value !== "..";
 }
 
@@ -228,6 +274,8 @@ const LIMITS = {
 	path: 4096,
 	claims: 32,
 	recent: 24,
+	waits: WAITS_CAP,
+	broadcastPaths: 16,
 	summary: 120,
 	excerptLines: 4,
 	excerptLine: 100,
@@ -279,7 +327,9 @@ function parseRecent(value: unknown): RecentFile[] {
 export function parsePresence(value: unknown): Presence | null {
 	if (typeof value !== "object" || value === null) return null;
 	const r = value as Record<string, unknown>;
-	if (r.v !== WIRE_VERSION || !isId(r.id) || !str(r.cwd) || !str(r.projectRoot)) return null;
+	// Checkouts are shown to other models (the board, lane names), so they are paths with no
+	// control characters, like every other path a peer sends.
+	if (r.v !== WIRE_VERSION || !isId(r.id) || !isPath(r.cwd) || !isPath(r.projectRoot)) return null;
 	if (typeof r.callsign !== "string" || !CALLSIGN_PATTERN.test(r.callsign)) return null;
 	if (!num(r.pid) || !(r.ticks === null || num(r.ticks)) || !num(r.startedAt) || !num(r.heartbeatAt)) {
 		return null;
@@ -298,6 +348,10 @@ export function parsePresence(value: unknown): Presence | null {
 		projectRoot: r.projectRoot,
 		role: r.role === "child" ? "child" : "main",
 		state: r.state === "busy" ? "busy" : "idle",
+		...(isPath(r.repo) ? { repo: r.repo } : {}),
+		...(isId(r.parent) ? { parent: r.parent } : {}),
+		...(Array.isArray(r.waitingOn) ? { waitingOn: r.waitingOn.filter(isId).slice(0, LIMITS.waits) } : {}),
+		...(num(r.waitingSince) ? { waitingSince: r.waitingSince } : {}),
 		claims: parseClaims(r.claims),
 		recent: parseRecent(r.recent),
 		startedAt: r.startedAt,
@@ -333,7 +387,17 @@ export function parseEnvelope(value: unknown): Envelope | null {
 		...(typeof r.topic === "string" ? { topic: r.topic } : {}),
 		...(r.data !== undefined ? { data: r.data } : {}),
 		...(r.human === true ? { human: true } : {}),
+		...broadcastPaths(r),
 	};
+}
+
+function broadcastPaths(r: Record<string, unknown>): { paths?: string[] } {
+	if (r.kind !== "broadcast" || !Array.isArray(r.paths)) return {};
+	const paths = r.paths
+		.slice(0, LIMITS.broadcastPaths)
+		.map((p) => line(p, LIMITS.path))
+		.filter((p): p is string => Boolean(p));
+	return paths.length > 0 ? { paths } : {};
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -354,6 +418,8 @@ export interface FileChangedData {
 export interface ClaimContestedData {
 	path: string;
 	pattern: string;
+	/** The peer changed the path in its own checkout (another lane): nothing was held back. */
+	lane?: boolean;
 }
 
 /** `claim.released`: a peer released claims this agent had been held back by. */
@@ -404,7 +470,7 @@ export function parseEvent(envelope: Envelope): TelecomEvent | null {
 		case "claim.contested": {
 			const pattern = line(d.pattern, LIMITS.path);
 			if (!isPath(d.path) || !pattern) return null;
-			return { topic: "claim.contested", data: { path: d.path, pattern } };
+			return { topic: "claim.contested", data: { path: d.path, pattern, ...(d.lane === true ? { lane: true } : {}) } };
 		}
 		case "claim.released": {
 			if (!Array.isArray(d.patterns)) return null;
@@ -508,20 +574,24 @@ export function openTransport(root: string): Transport {
 		},
 
 		readPeers() {
-			const peers: Presence[] = [];
+			const records: Presence[] = [];
 			for (const name of presenceFiles()) {
 				const record = parsePresence(readJson(join(presenceDir, name)));
-				if (record && isAlive(record.pid, record.ticks)) peers.push(record);
+				if (record) records.push(record);
 			}
-			return peers.sort((a, b) => a.startedAt - b.startedAt || a.id.localeCompare(b.id));
+			const beats = hostBeats(records);
+			return records
+				.filter((r) => isLive(r, beats.get(r.pid)))
+				.sort((a, b) => a.startedAt - b.startedAt || a.id.localeCompare(b.id));
 		},
 
 		sweep() {
 			const removed: string[] = [];
-			for (const name of presenceFiles()) {
+			const read = presenceFiles().map((name) => ({ name, record: parsePresence(readJson(join(presenceDir, name))) }));
+			const beats = hostBeats(read.flatMap((r) => (r.record ? [r.record] : [])));
+			for (const { name, record } of read) {
 				const path = join(presenceDir, name);
-				const record = parsePresence(readJson(path));
-				if (record && isAlive(record.pid, record.ticks)) continue;
+				if (record && isLive(record, beats.get(record.pid))) continue;
 				// A record mid-rename can read as null for an instant; only sweep files that are
 				// unparseable for more than a moment, or whose process is provably gone.
 				if (!record) {
@@ -601,7 +671,8 @@ export function openTransport(root: string): Transport {
 				}
 				if (!envelope) {
 					result.refused.push(name);
-					rmSync(path, { force: true });
+					// Recursive: a directory planted in the inbox must not throw on every drain.
+					rmSync(path, { force: true, recursive: true });
 					continue;
 				}
 				try {
