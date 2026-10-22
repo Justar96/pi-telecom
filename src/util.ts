@@ -68,6 +68,11 @@ export function newId(prefix: string): string {
 	return `${prefix}-${process.pid.toString(36)}-${Date.now().toString(36)}-${idCounter.toString(36)}${rand}`;
 }
 
+/** `text` matched literally inside a regular expression. */
+export function escapeRegExp(text: string): string {
+	return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 export function plural(count: number, one: string, many = `${one}s`): string {
 	return `${count} ${count === 1 ? one : many}`;
 }

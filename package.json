@@ -37,7 +37,7 @@
 	},
 	"scripts": {
 		"typecheck": "tsc --noEmit -p tsconfig.json",
-		"test": "node --experimental-strip-types --no-warnings --test test/*.test.ts",
+		"test": "node scripts/test.mjs",
 		"e2e": "node scripts/e2e-rpc.mjs",
 		"e2e:live": "node scripts/e2e-live.mjs",
 		"e2e:cache": "node scripts/e2e-cache.mjs",

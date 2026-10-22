@@ -10,27 +10,31 @@
  *   node scripts/e2e-rpc.mjs          # exit 0 = pass, 1 = a check failed, 2 = setup problem
  */
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { isNotify, isStatus, startPi } from "./rpc-driver.mjs";
 
-const scratch = mkdtempSync(join(tmpdir(), "pi-telecom-e2e-"));
-const project = join(scratch, "proj");
+const scratch = realpathSync.native(mkdtempSync(join(tmpdir(), "pi-telecom-e2e-")));
+const project = join(scratch, "proj with spaces & café");
 mkdirSync(join(project, ".git"), { recursive: true });
 writeFileSync(join(project, ".git", "HEAD"), "ref: refs/heads/main\n");
 const env = { ...process.env, PI_TELECOM_DIR: join(scratch, "switchboard"), PI_TELECOM_TICK_MS: "100" };
 
 let failures = 0;
+let setupFailed = false;
 function check(name, ok, detail = "") {
 	console.log(`${ok ? "✔" : "✖"} ${name}${ok || !detail ? "" : `\n    ${detail}`}`);
 	if (!ok) failures++;
 }
 
 const extra = [];
-const a = startPi("agent-a", { cwd: project, env });
-const b = startPi("agent-b", { cwd: project, env });
+let a;
+let b;
 try {
+	a = startPi("agent-a", { cwd: project, env });
+	b = startPi("agent-b", { cwd: project, env });
 	// 1. both load the extension and publish a callsign in the footer
 	const statusA = await a.waitFor(isStatus(/📡 (alpha|bravo)/), 30_000).catch(() => null);
 	const statusB = await b.waitFor(isStatus(/📡 (alpha|bravo)/), 30_000).catch(() => null);
@@ -79,8 +83,7 @@ try {
 	check("the callsign survives /reload", Boolean(boardB), b.notifies().slice(-1)[0]);
 
 	// 6. B leaves; A's board empties
-	b.child.stdin.end();
-	await new Promise((r) => b.child.once("exit", r));
+	await b.stop();
 	await a.waitFor(isStatus(/solo/), 10_000).catch(() => {});
 	await a.command("/telecom");
 	const board3 = await a.waitFor(isNotify(/No other agent is live/), 10_000).catch(() => null);
@@ -90,9 +93,10 @@ try {
 	const sessionDir = join(scratch, "sessions");
 	const sid = "11111111-2222-4333-8444-555555555555";
 	const s1 = startPi("dup-1", { cwd: project, env, session: ["--session-dir", sessionDir, "--session-id", sid] });
+	extra.push(s1);
 	await s1.waitFor(isStatus(/📡/), 30_000);
 	const s2 = startPi("dup-2", { cwd: project, env, session: ["--session-dir", sessionDir, "--session-id", sid] });
-	extra.push(s1, s2);
+	extra.push(s2);
 	const backedOff = await s2.waitFor(isStatus(/off \(session open elsewhere\)/), 15_000).catch(() => null);
 	check("the second process of one session backs off", Boolean(backedOff), JSON.stringify(s2.records.filter(isStatus(/./)).map((r) => r.statusText)));
 	await a.command("/telecom");
@@ -126,17 +130,18 @@ try {
 	}
 
 	// 8. a real `git worktree add`: the main checkout and the worktree are one team, in two lanes
-	const repo = join(scratch, "repo");
-	const lane = join(scratch, "repo-lane");
+	const repo = join(scratch, "repo [copy]");
+	const lane = join(scratch, "repo lane café");
 	let git = true;
 	try {
 		mkdirSync(repo);
-		const g = (...args) => execFileSync("git", ["-c", "user.name=e2e", "-c", "user.email=e2e@example.com", ...args], { cwd: repo, stdio: "pipe" });
+		const g = (...args) => execFileSync("git", ["-c", "user.name=e2e", "-c", "user.email=e2e@example.com", "-c", "commit.gpgsign=false", ...args], { cwd: repo, stdio: "pipe" });
 		g("init", "-q", "-b", "main");
 		g("commit", "-q", "--allow-empty", "-m", "init");
 		g("worktree", "add", "-q", "-b", "lane-b", lane);
 	} catch (error) {
 		git = false;
+		setupFailed = true;
 		console.log(`- skipped the worktree checks: git is not usable here (${error.message.split("\n")[0]})`);
 	}
 	if (git) {
@@ -153,21 +158,76 @@ try {
 		);
 		check("agents in other projects are not counted in the repository's team", Boolean(laneBoard && /1 other agent live/.test(laneBoard.message)), laneBoard?.message);
 	}
+
+	// 9. Real turns with a local fixture provider: no network or paid model calls.
+	const taskProject = join(scratch, "tasks");
+	mkdirSync(taskProject);
+	const fixture = fileURLToPath(new URL("./rpc-fixture.ts", import.meta.url));
+	const taskArgs = ["-e", fixture, "--model", "telecom-rpc-test/fixture"];
+	const taskEnv = { ...env, PI_TELECOM_MAX_WAKES: "1" };
+	const leader = startPi("task-leader", { cwd: taskProject, env: taskEnv, args: taskArgs });
+	const worker = startPi("task-worker", { cwd: taskProject, env: taskEnv, args: taskArgs });
+	extra.push(leader, worker);
+	await Promise.all([leader.waitFor(isStatus(/1 peer/), 30_000), worker.waitFor(isStatus(/1 peer/), 30_000)]);
+	const settled = (record) => record.type === "agent_settled";
+	const completed = (agent, offset) => agent.records.slice(offset).some((r) =>
+		r.type === "message_end" && r.message?.role === "assistant" && r.message.model === "fixture" && r.message.stopReason === "stop");
+	const taskOffsets = [leader.records.length, worker.records.length];
+	await leader.command("/telecom run review your changes");
+	await Promise.all([leader, worker].map((agent, i) => agent.waitFor(settled, 15_000, taskOffsets[i])));
+	check("/telecom run starts real turns in the caller and its peer", [leader, worker].every((agent, i) => completed(agent, taskOffsets[i])));
+	const workerStatus = worker.records.filter(isStatus(/📡/)).at(-1)?.statusText ?? "";
+	const workerCallsign = workerStatus.match(/📡 ([\w-]+)/)?.[1];
+	if (!workerCallsign) throw new Error("task worker has no callsign");
+
+	// Hold a real stream while several messages are steered in, then use the remaining idle wake.
+	await worker.command("/telecom-test hold");
+	const heldOffset = worker.records.length;
+	worker.send({ type: "prompt", message: "hold this turn" });
+	await worker.waitFor((r) => r.type === "message_start" && r.message?.role === "assistant", 10_000, heldOffset);
+	for (let i = 0; i < 3; i++) await leader.command(`/telecom msg ${workerCallsign} busy message ${i}`);
+	const drainOffset = worker.records.length;
+	// The footer refresh follows the inbox drain; this is a barrier, not a timing guess.
+	await worker.waitFor(isStatus(/📡/), 10_000, drainOffset);
+	await worker.command("/telecom-test release");
+	await worker.waitFor(settled, 10_000, heldOffset);
+	const busyMessages = worker.records.slice(heldOffset).filter((r) => r.type === "message_end" && r.message?.customType === "telecom-message");
+	check("busy messages are steered without a wake-limit warning", busyMessages.length === 3 && busyMessages.every((r) => !/without starting a turn/.test(JSON.stringify(r.message.content))));
+	const wakeOffset = worker.records.length;
+	await leader.command(`/telecom msg ${workerCallsign} wake after busy messages`);
+	const woke = await worker.waitFor(settled, 10_000, wakeOffset).catch(() => null);
+	check("steering into a real busy run preserves the next idle wake", Boolean(woke) && completed(worker, wakeOffset));
+
+	// The explicit run command also works after the automatic wake allowance is exhausted.
+	const repeatOffsets = [leader.records.length, worker.records.length];
+	await leader.command("/telecom run finish your review");
+	await Promise.all([leader, worker].map((agent, i) => agent.waitFor(settled, 10_000, repeatOffsets[i])));
+	check("an explicit team task bypasses the automatic wake limit", [leader, worker].every((agent, i) => completed(agent, repeatOffsets[i])));
+
+	await worker.command("/telecom off");
+	await worker.command("/reload");
+	const offOffset = worker.records.length;
+	await worker.command("/telecom");
+	const off = await worker.waitFor(isNotify(/telecom is off.*\/telecom on/), 10_000, offOffset).catch(() => null);
+	check("/telecom off stays off after a real /reload", Boolean(off));
+	const absentOffset = leader.records.length;
+	await leader.command("/telecom");
+	check("a disabled session leaves its peers' board", Boolean(await leader.waitFor(isNotify(/No other agent is live/), 10_000, absentOffset).catch(() => null)));
+	await worker.command("/telecom on");
+	await worker.command("/reload");
+	const onOffset = worker.records.length;
+	await worker.command("/telecom");
+	check("/telecom on reconnects and stays on after a real /reload", Boolean(await worker.waitFor(isNotify(/You are /), 10_000, onOffset).catch(() => null)));
 } catch (error) {
 	if (error.message !== "setup") {
 		console.error(error);
 		failures++;
 	} else {
-		failures = failures || 2;
+		setupFailed = true;
 	}
 } finally {
-	for (const p of [a, b, ...extra]) {
-		try {
-			p.child.stdin.end();
-			p.child.kill("SIGTERM");
-		} catch {}
-	}
+	await Promise.all([a, b, ...extra].filter(Boolean).map((p) => p.stop()));
 	rmSync(scratch, { recursive: true, force: true });
 }
-console.log(failures === 0 ? "\nall e2e checks passed" : `\n${failures} e2e check(s) failed`);
-process.exit(failures === 0 ? 0 : 1);
+console.log(setupFailed ? "\ne2e checks incomplete: a precondition is missing" : failures === 0 ? "\nall e2e checks passed" : `\n${failures} e2e check(s) failed`);
+process.exit(setupFailed ? 2 : failures === 0 ? 0 : 1);

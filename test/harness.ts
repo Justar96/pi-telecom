@@ -5,17 +5,26 @@
  * extension instance, and they meet on a scratch switchboard (`PI_TELECOM_DIR`). They share
  * the process id, which is fine — liveness is per pid, and the pid is alive.
  */
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
+import { after, before, type TestContext } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-export const SCRATCH = mkdtempSync(join(tmpdir(), "pi-telecom-test-"));
+export const SCRATCH = realpathSync.native(mkdtempSync(join(tmpdir(), "pi-telecom-test-")));
 process.env.PI_TELECOM_DIR = join(SCRATCH, "switchboard");
 process.env.PI_TELECOM_TICK_MS = "20";
 delete process.env.PI_TELECOM_GUARD;
 
 const { default: telecom } = await import("../src/index.ts");
+
+let host: ReturnType<typeof setInterval> | undefined;
+before(() => {
+	// Real pi has a live UI/RPC transport. Our fake host needs its own reference while an ask
+	// waits: telecom correctly unrefs its timers, and Node 22 otherwise exits mid-scenario.
+	host = setInterval(() => {}, 60_000);
+});
+after(() => clearInterval(host));
 
 export interface Sent {
 	customType: string;
@@ -31,6 +40,11 @@ interface ToolLike {
 	execute: (id: string, params: any, signal?: AbortSignal, onUpdate?: unknown, ctx?: unknown) => Promise<any>;
 }
 
+interface CommandLike {
+	handler: (args: string, ctx: any) => Promise<void>;
+	getArgumentCompletions?: (prefix: string) => Array<{ value: string; label: string }> | null;
+}
+
 let sessionCounter = 0;
 
 export function makeProject(name: string, git = true): string {
@@ -43,11 +57,37 @@ export function makeProject(name: string, git = true): string {
 	return dir;
 }
 
+/** A git worktree of `main`, laid out the way `git worktree add` does it. */
+export function makeWorktree(main: string, name: string, branch: string, at?: string): string {
+	const gitDir = join(main, ".git", "worktrees", name);
+	mkdirSync(gitDir, { recursive: true });
+	writeFileSync(join(gitDir, "HEAD"), `ref: refs/heads/${branch}\n`);
+	writeFileSync(join(gitDir, "commondir"), "../..\n");
+	const dir = at ?? join(SCRATCH, `${basename(main)}-${name}`);
+	mkdirSync(dir, { recursive: true });
+	writeFileSync(join(dir, ".git"), `gitdir: ${gitDir}\n`);
+	return dir;
+}
+
+/** Set an environment variable until test `t` ends. */
+export function withEnv(t: TestContext, name: string, value: string | undefined): void {
+	const previous = process.env[name];
+	t.after(() => {
+		if (previous === undefined) delete process.env[name];
+		else process.env[name] = previous;
+	});
+	if (value === undefined) delete process.env[name];
+	else process.env[name] = value;
+}
+
+/** A theme without styling: renders as plain text. */
+export const PLAIN_THEME = { fg: (_color: string, text: string) => text, bg: (_color: string, text: string) => text, bold: (text: string) => text };
+
 export class Session {
 	readonly id: string;
 	readonly handlers = new Map<string, Handler[]>();
 	readonly tools = new Map<string, ToolLike>();
-	readonly commands = new Map<string, { handler: (args: string, ctx: any) => Promise<void> }>();
+	readonly commands = new Map<string, CommandLike>();
 	readonly sent: Sent[] = [];
 	readonly notified: string[] = [];
 	readonly entries: Array<{ type: "custom"; customType: string; data: unknown }> = [];
@@ -81,7 +121,7 @@ export class Session {
 				getBranch: () => self.entries,
 			},
 			ui: {
-				theme: { fg: (_color: string, text: string) => text, bold: (text: string) => text },
+				theme: PLAIN_THEME,
 				setStatus: (_key: string, text: string | undefined) => {
 					self.status = text;
 				},
@@ -100,7 +140,7 @@ export class Session {
 				return () => {};
 			},
 			registerTool: (tool: ToolLike) => self.tools.set(tool.name, tool),
-			registerCommand: (name: string, options: { handler: (args: string, ctx: any) => Promise<void> }) =>
+			registerCommand: (name: string, options: CommandLike) =>
 				self.commands.set(name, options),
 			registerMessageRenderer: () => {},
 			sendMessage: (message: any, options?: Sent["options"]) => {
@@ -244,4 +284,22 @@ export async function eventually(check: () => void | Promise<void>, timeoutMs = 
 		}
 	}
 	throw last;
+}
+
+const open: Session[] = [];
+
+/** Remember a started session, so `stopSessions()` stops it. */
+export function track<S extends Session>(session: S): S {
+	open.push(session);
+	return session;
+}
+
+/** Start a session that `stopSessions()` stops. */
+export async function session(cwd: string, opts: ConstructorParameters<typeof Session>[1] = {}): Promise<Session> {
+	return track(await new Session(cwd, opts).start());
+}
+
+/** Stop every tracked session: a test file's `after` or `afterEach` hook. */
+export async function stopSessions(): Promise<void> {
+	for (const s of open.splice(0)) await s.stop();
 }

@@ -40,7 +40,7 @@ function label(peer: Presence, viewer: Presence, peers: readonly Presence[]): st
 }
 
 /** Peers in start order, each followed by its subagents, so a family reads as one block. */
-function familyOrder(list: readonly Presence[]): Presence[] {
+export function familyOrder(list: readonly Presence[]): Presence[] {
 	const ids = new Set(list.map((p) => p.id));
 	const children = new Map<string, Presence[]>();
 	const tops: Presence[] = [];
@@ -62,7 +62,7 @@ function familyOrder(list: readonly Presence[]): Presence[] {
 	return out;
 }
 
-function liveClaims(peer: Presence, now: number): Presence["claims"] {
+export function liveClaims(peer: Presence, now: number): Presence["claims"] {
 	return peer.claims.filter((c) => c.expiresAt > now);
 }
 
@@ -105,10 +105,13 @@ export function describePeer(
 	return lines;
 }
 
+/** Whom a board lists: this repository's team, or every agent on the machine. */
+export type BoardScope = "project" | "machine";
+
 export interface BoardInput {
 	self: Presence;
 	peers: readonly Presence[];
-	scope: "project" | "machine";
+	scope: BoardScope;
 	inboundAsks: ReadonlyArray<{ id: string; fromCallsign: string; text: string }>;
 }
 

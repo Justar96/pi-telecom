@@ -1,7 +1,7 @@
 /**
  * transport — the wire between pi sessions on one machine. No broker, no socket, no daemon.
  *
- * Layout under the root (0700, owned by this user):
+ * Layout under the root (0700 and owned by this user on Unix; per-user temp storage on Windows):
  *
  *   presence/<session-id>.json        one record per live session, rewritten only by its owner
  *   inbox/<session-id>/<seq>-<id>.json one file per envelope, renamed into place atomically
@@ -22,7 +22,6 @@
  */
 import {
 	lstatSync,
-	statSync,
 	mkdirSync,
 	readdirSync,
 	readFileSync,
@@ -31,7 +30,8 @@ import {
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { createHash } from "node:crypto";
+import { homedir, tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { CALLSIGN_PATTERN } from "./callsign.ts";
 import { ENV } from "./config.ts";
@@ -46,6 +46,7 @@ export const ENVELOPE_CAP = 64 * 1024;
 /** Most envelopes handled per drain; the rest wait for the next tick, so a flood cannot stall. */
 export const DRAIN_BATCH = 64;
 const ID_PATTERN = /^[A-Za-z0-9._-]{1,128}$/;
+const WINDOWS_DEVICE = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i;
 /** An unparseable presence file younger than this may be mid-rename; the sweep leaves it alone. */
 const UNPARSEABLE_GRACE_MS = 5_000;
 /** An inbox without a presence record is kept this long, so a starting session can publish first. */
@@ -135,6 +136,8 @@ export interface Envelope {
 	data?: unknown;
 	/** True when a human typed it (`/telecom msg`), not the model. */
 	human?: boolean;
+	/** An explicit human request to run a task; bypasses the automatic peer wake limit. */
+	triggerTurn?: boolean;
 	/**
 	 * For `broadcast`: the paths or globs it is about, in the sender's checkout. Agents working
 	 * there get it at once; the rest at their next prompt. Absent: it is about everyone.
@@ -146,11 +149,11 @@ export interface Envelope {
 // root
 
 /**
- * The transport root, created 0700 on first use.
+ * The transport root, created 0700 on Unix on first use.
  *
  * `PI_TELECOM_DIR` wins; then `$XDG_RUNTIME_DIR/pi-telecom` when that directory is ours; then
- * `<tmpdir>/pi-telecom-<uid>`. A root that exists but is a symlink, is not a directory, belongs
- * to another user, or is group/world accessible is refused by name rather than used.
+ * `<tmpdir>/pi-telecom-<uid>` (a user hash where there is no uid). Symlinks and non-directories
+ * are refused; Unix additionally checks ownership and group/world permissions.
  */
 export function transportRoot(env: NodeJS.ProcessEnv = process.env): Result<{ path: string }> {
 	const uid = process.getuid?.();
@@ -171,7 +174,7 @@ export function transportRoot(env: NodeJS.ProcessEnv = process.env): Result<{ pa
 		}
 		candidate = runtimeOk && runtime
 			? join(runtime, "pi-telecom")
-			: join(tmpdir(), `pi-telecom-${uid ?? "user"}`);
+			: join(tmpdir(), `pi-telecom-${uid ?? userKey()}`);
 	}
 	try {
 		mkdirSync(candidate, { recursive: true, mode: 0o700 });
@@ -193,6 +196,18 @@ export function transportRoot(env: NodeJS.ProcessEnv = process.env): Result<{ pa
 		return { ok: false, reason: `the transport root ${candidate} cannot be prepared: ${messageOf(error)}` };
 	}
 	return { ok: true, path: candidate };
+}
+
+/** Windows has no uid. Keep users apart even when TEMP points at a shared directory. */
+function userKey(): string {
+	let identity = homedir();
+	try {
+		const info = userInfo();
+		identity = `${info.homedir}\u0000${info.username}`;
+	} catch {
+		/* a service account may have no user database entry; its home is still stable */
+	}
+	return createHash("sha256").update(identity).digest("hex").slice(0, 16);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -246,9 +261,14 @@ export function isAlive(pid: number, ticks: number | null): boolean {
 // ---------------------------------------------------------------------------------------------
 // validation
 
+/** Why `text` cannot be sent (`what`: "the message", "the prompt"); null when it fits `TEXT_CAP`. */
+export function textTooLong(text: string, what: string): string | null {
+	return Buffer.byteLength(text, "utf8") > TEXT_CAP ? `${what} exceeds ${TEXT_CAP} bytes — shorten it or point at a file` : null;
+}
+
 /** A session or envelope id that is safe as a file name. */
 export function isId(value: unknown): value is string {
-	return typeof value === "string" && ID_PATTERN.test(value) && value !== "." && value !== "..";
+	return typeof value === "string" && ID_PATTERN.test(value) && !value.endsWith(".") && !WINDOWS_DEVICE.test(value);
 }
 
 function str(value: unknown): value is string {
@@ -387,6 +407,7 @@ export function parseEnvelope(value: unknown): Envelope | null {
 		...(typeof r.topic === "string" ? { topic: r.topic } : {}),
 		...(r.data !== undefined ? { data: r.data } : {}),
 		...(r.human === true ? { human: true } : {}),
+		...(r.kind === "message" && r.human === true && r.triggerTurn === true ? { triggerTurn: true } : {}),
 		...broadcastPaths(r),
 	};
 }
@@ -500,14 +521,20 @@ function writeAtomic(dir: string, name: string, body: string): Result<object> {
 		renameSync(tmp, join(dir, name));
 		return { ok: true };
 	} catch (error) {
-		rmSync(tmp, { force: true });
+		try {
+			rmSync(tmp, { force: true });
+		} catch {
+			/* A Windows sharing violation can lock the temp file too; preserve the write error. */
+		}
 		return { ok: false, reason: `writing ${name} failed: ${messageOf(error)}` };
 	}
 }
 
 function readJson(path: string): unknown {
+	// An unreadable file is not malformed JSON. Let callers retain it and try on a later tick.
+	const text = readFileSync(path, "utf8");
 	try {
-		return JSON.parse(readFileSync(path, "utf8")) as unknown;
+		return JSON.parse(text) as unknown;
 	} catch {
 		return null;
 	}
@@ -545,6 +572,8 @@ export interface Transport {
 export function openTransport(root: string): Transport {
 	const presenceDir = join(root, "presence");
 	const inboxRoot = join(root, "inbox");
+	/** Each presence file's last valid record, kept while the file is briefly locked. */
+	let lastPresence = new Map<string, Presence>();
 
 	function presenceFiles(): string[] {
 		try {
@@ -574,11 +603,20 @@ export function openTransport(root: string): Transport {
 		},
 
 		readPeers() {
-			const records: Presence[] = [];
+			const read = new Map<string, Presence>();
 			for (const name of presenceFiles()) {
-				const record = parsePresence(readJson(join(presenceDir, name)));
-				if (record) records.push(record);
+				let record: Presence | null;
+				try {
+					record = parsePresence(readJson(join(presenceDir, name)));
+				} catch (error) {
+					// Indexers and virus scanners can briefly lock an otherwise healthy record.
+					// ENOENT really is a departure; every retained record still has to be live.
+					record = isErrno(error, "ENOENT") ? null : lastPresence.get(name) ?? null;
+				}
+				if (record) read.set(name, record);
 			}
+			lastPresence = read;
+			const records = [...read.values()];
 			const beats = hostBeats(records);
 			return records
 				.filter((r) => isLive(r, beats.get(r.pid)))
@@ -587,7 +625,13 @@ export function openTransport(root: string): Transport {
 
 		sweep() {
 			const removed: string[] = [];
-			const read = presenceFiles().map((name) => ({ name, record: parsePresence(readJson(join(presenceDir, name))) }));
+			const read = presenceFiles().flatMap((name) => {
+				try {
+					return [{ name, record: parsePresence(readJson(join(presenceDir, name))) }];
+				} catch {
+					return []; // locked or gone; neither is evidence of a corrupt presence
+				}
+			});
 			const beats = hostBeats(read.flatMap((r) => (r.record ? [r.record] : [])));
 			for (const { name, record } of read) {
 				const path = join(presenceDir, name);
@@ -608,7 +652,13 @@ export function openTransport(root: string): Transport {
 				}
 				const id = name.slice(0, -".json".length);
 				removed.push(id);
-				if (isId(id)) rmSync(join(inboxRoot, id), { recursive: true, force: true });
+				if (isId(id)) {
+					try {
+						rmSync(join(inboxRoot, id), { recursive: true, force: true });
+					} catch {
+						/* a locked inbox can be reclaimed by the orphan sweep on a later tick */
+					}
+				}
 			}
 			// An inbox with no presence record belongs to a session that has gone (a message can
 			// land just after its owner left). Give a starting session a minute to publish first.
@@ -633,9 +683,8 @@ export function openTransport(root: string): Transport {
 
 		deliver(envelope) {
 			if (!isId(envelope.to)) return { ok: false, reason: "the target id is not file-name safe" };
-			if (Buffer.byteLength(envelope.text, "utf8") > TEXT_CAP) {
-				return { ok: false, reason: `the message exceeds ${TEXT_CAP} bytes — shorten it or point at a file` };
-			}
+			const tooLong = textTooLong(envelope.text, "the message");
+			if (tooLong) return { ok: false, reason: tooLong };
 			if (!parseEnvelope(envelope)) return { ok: false, reason: "the envelope is malformed" };
 			const body = `${JSON.stringify(envelope)}\n`;
 			if (Buffer.byteLength(body, "utf8") > ENVELOPE_CAP) {
@@ -663,27 +712,37 @@ export function openTransport(root: string): Transport {
 			}
 			for (const name of names.filter((n) => !n.startsWith(".")).sort().slice(0, DRAIN_BATCH)) {
 				const path = join(dir, name);
+				const failed = (error: unknown) => result.failed.push(`${name}: ${messageOf(error)}`);
+				// Recursive: a directory planted in the inbox must not throw on every drain.
+				const remove = () => {
+					try {
+						rmSync(path, { force: true, recursive: true });
+					} catch (error) {
+						failed(error);
+					}
+				};
 				let envelope: Envelope | null = null;
 				try {
-					if (statSync(path).size <= ENVELOPE_CAP) envelope = parseEnvelope(readJson(path));
-				} catch {
-					continue; // vanished: another drainer of the same id took it
+					const stat = lstatSync(path);
+					if (stat.isFile() && stat.size <= ENVELOPE_CAP) envelope = parseEnvelope(readJson(path));
+				} catch (error) {
+					if (!isErrno(error, "ENOENT")) failed(error);
+					continue; // temporarily locked, or another drainer took it; do not discard it
 				}
-				if (!envelope) {
+				if (!envelope || envelope.to !== id) {
 					result.refused.push(name);
-					// Recursive: a directory planted in the inbox must not throw on every drain.
-					rmSync(path, { force: true, recursive: true });
+					remove();
 					continue;
 				}
 				try {
 					handle(envelope);
 					result.handled++;
 				} catch (error) {
-					result.failed.push(`${name}: ${messageOf(error)}`);
+					failed(error);
 				} finally {
 					// Removed even when the handler threw: a message that always throws must not
 					// wedge the inbox (poison message), and the failure is reported instead.
-					rmSync(path, { force: true });
+					remove();
 				}
 			}
 			return result;
@@ -708,9 +767,13 @@ export function openTransport(root: string): Transport {
 		takeHandoff(id) {
 			if (!isId(id)) return null;
 			const path = join(root, "handoff", `${id}.json`);
-			const state = readJson(path);
-			rmSync(path, { force: true });
-			return state;
+			try {
+				const state = readJson(path);
+				rmSync(path, { force: true });
+				return state;
+			} catch {
+				return null; // missing or locked: reconnect without making reload fail
+			}
 		},
 	};
 }

@@ -26,11 +26,12 @@ pi install npm:@justar_96/pi-telecom
 ```
 
 Open two or more pi sessions in the same repository. They find each other through a shared
-directory on this machine; there is no server, port or configuration. `/telecom` shows the team.
-The footer shows this session's callsign and its peers:
+directory on this machine; there is no server, port or configuration. `/telecom` shows the team,
+and `/telecom help` lists the other commands. The footer shows this session's callsign, its
+peers, and any ask waiting on it:
 
 ```
-📡 bravo · 1 peer (1 busy) · 1 claim
+📡 bravo · 1 peer (1 busy) · 1 claim · 1 ask waiting
 ```
 
 Other ways to install:
@@ -42,7 +43,8 @@ pi install npm:@justar_96/pi-telecom@0.2.0     # a pinned version
 pi install git:github.com/Justar96/pi-telecom  # from GitHub
 ```
 
-Requires pi 1.3 or later and Node 22.6 or later, on Linux or macOS.
+Requires pi 1.3 or later and Node 22.6 or later, on Linux, macOS or Windows. Use a newer Node
+version when required by your pi installation.
 
 ## What the model receives
 
@@ -263,7 +265,8 @@ one. A broadcast without `paths` goes to everyone right away.
 Delivery rules:
 
 - **Wake limit.** Direct messages and late answers start at most 6 turns per minute per agent
-  (`PI_TELECOM_MAX_WAKES`). Beyond that, they arrive without starting a turn.
+  (`PI_TELECOM_MAX_WAKES`). Beyond that, they arrive without starting a turn. Messages steered
+  into a busy session do not use this allowance. Explicit tasks from `/telecom run` bypass it.
 - **Asks always start a turn**, since the asker is waiting. An agent about to stop with an
   unanswered ask is reminded once.
 - **Wait cycles.** Each agent publishes which sessions its asks are waiting on. An ask to an agent
@@ -285,26 +288,59 @@ Delivery rules:
 ```
 /telecom                     the board for this repository
 /telecom all                 every agent on this machine
+/telecom run <prompt>        start work in every connected session in this repository, including this one
 /telecom msg <agent> <text>  message an agent as its human (starts a turn if it's idle)
 /telecom broadcast <text>    message every agent in this repository
+/telecom off                 disconnect this session and release its claims
+/telecom on                  reconnect this session
 /telecom name <callsign>     rename this session
-/telecom widget              show a live board above the editor
+/telecom widget              show or hide a live team list above the editor
 /telecom release             release every claim this session holds
+/telecom help                list the commands, including while telecom is off
 ```
+
+In the terminal UI, `/telecom` and `/telecom all` open a live board in place of the editor: Tab
+switches between this repository and the whole machine, `w` toggles the widget, the arrow keys
+scroll, and Esc closes it. `/telecom help` opens a command list; Enter runs the selected command,
+or puts it in the editor when it takes arguments. Completions after `/telecom ` describe each
+command, and `/telecom msg ` lists each agent with its state and task. In RPC mode and other
+clients without the terminal UI, the same commands answer with plain text.
+
+The widget lists this agent first, then each teammate with its state, task and claims, subagents
+under their parent, and any ask waiting on this agent. Each agent keeps one colour in the widget,
+the board, and the transcript, where telecom's own tool calls and peers' messages show as panels
+edged in the sender's colour. When telecom is off, the footer reads `📡 off`.
+
+To give the whole team a task from one terminal:
+
+```
+/telecom run Review your changes, run the relevant tests, and report any blockers.
+```
+
+The prompt reaches this session and every connected teammate in the repository, including
+subagents and sibling worktrees. Idle sessions start a turn; busy sessions receive it before
+their next model step. Multiline prompts keep their formatting. The command reports which
+sessions received the task and any delivery failures. A session running an older telecom receives
+it as a human message under that version's wake limit.
+
+`/telecom off` stops messaging and edit guards in this session, releases its claims, and ends its
+pending asks. `/telecom on` reconnects it. The setting survives reloads and resumes on the current
+session branch, and an explicit command overrides `PI_TELECOM_DISABLE`. Other sessions keep their
+own settings. Disconnected sessions do not receive team tasks.
 
 ## Configuration
 
-Environment variables, read when a session starts:
+Environment variables, read when a session starts or reconnects:
 
 | variable | default | |
 |---|---|---|
 | `PI_TELECOM_GUARD` | `standard` | `strict`, `standard` or `off` (see [the edit guard](#the-edit-guard)) |
 | `PI_TELECOM_CALLSIGN` | first free word | a fixed callsign for this session |
 | `PI_TELECOM_ASK_TIMEOUT_MS` | `300000` | default wait for `ask` (at most 1 h) |
-| `PI_TELECOM_MAX_WAKES` | `6` | messages per minute that may start a turn; `0` means none (asks still do) |
+| `PI_TELECOM_MAX_WAKES` | `6` | automatic peer wake-ups per minute; `0` disables them (asks and `/telecom run` still wake) |
 | `PI_TELECOM_CLAIM_TTL_MIN` | `120` | minutes without an edit inside a claim before it expires |
 | `PI_TELECOM_DIR` | see [How it works](#how-it-works) | the shared directory |
-| `PI_TELECOM_DISABLE` | unset | `1` turns telecom off for this session |
+| `PI_TELECOM_DISABLE` | unset | `1` starts telecom off; `/telecom on` or `/telecom off` overrides it for this session |
 
 ## Behavior under failure
 
@@ -343,17 +379,22 @@ about 950 prompt tokens to every session.
   `.git`, or the working directory when there is none. Checkouts that share a git common directory
   form one repository, and the sessions in one repository form a team. `scope: "machine"` and
   `/telecom all` show agents in other repositories.
-- **Shared directory.** `$XDG_RUNTIME_DIR/pi-telecom`, or `<tmpdir>/pi-telecom-<uid>` where that
-  variable isn't set (macOS). It holds one presence record and one inbox per session. Files are
-  written under a temporary name and then renamed, so a reader never sees a partial file. Telecom
-  doesn't use the directory unless it is private to the user (mode `0700`).
+- **Shared directory.** `$XDG_RUNTIME_DIR/pi-telecom`, or a directory under the OS temporary
+  folder: `pi-telecom-<uid>` on Unix, `pi-telecom-<user hash>` on Windows. It holds one presence
+  record and one inbox per session. Files are written under a temporary name and then renamed,
+  so a reader never sees a partial file. Unix roots must belong to the user and have mode `0700`;
+  Windows uses the user's temporary folder and inherited Windows permissions. Temporarily locked
+  messages stay queued, and one file's cleanup failure does not stop the rest of the inbox.
 - **Liveness.** A record is live while its process is. On Linux the process start time must also
   match, so a reused process id isn't mistaken for a live session. Records of exited sessions are
   removed. Subagents share their host's process, so they are also checked by heartbeat (see
   [Subagents](#subagents)). A suspended process stops all of its sessions at once, so their
   records are kept.
-- **Paths** are compared in canonical form: `@` and `~` are handled as pi's tools handle them,
-  relative paths are resolved against the session's directory, and symlinks are followed.
+- **Paths** are compared in canonical form: `@`, `~` and file URLs are expanded, relative paths
+  are resolved against the session's directory, and symlinks and Windows junctions are followed.
+  On macOS and Windows, the OS supplies the spelling of existing paths, keeping aliases together
+  while preserving distinct files on case-sensitive volumes. Windows claims accept `/` or `\`,
+  including drive and UNC paths; `*` stays within a directory and `**` crosses directories.
 
 ### Limits
 
@@ -370,7 +411,11 @@ about 950 prompt tokens to every session.
 ## Contributing
 
 See [AGENTS.md](AGENTS.md) for the development setup, the architecture, the rules the code must
-keep, and the release process. In short: `npm install && npm run check`.
+keep, and the release process. Run `npm install` and `npm run check`.
+
+The CI workflow runs typechecking, tests and real pi RPC checks on Linux, macOS and Windows with
+Node 22 and 24. RPC checks use the locally installed pi package and a local fixture provider;
+they need no global `pi` command, model credentials or network calls.
 
 ## Credits
 

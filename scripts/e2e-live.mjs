@@ -14,7 +14,7 @@
  *
  * Exit 0 = pass, 1 = a check failed, 2 = no model configured.
  */
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { isStatus, startPi } from "./rpc-driver.mjs";
@@ -25,7 +25,7 @@ if (!model) {
 	process.exit(2);
 }
 
-const scratch = mkdtempSync(join(tmpdir(), "pi-telecom-live-"));
+const scratch = realpathSync.native(mkdtempSync(join(tmpdir(), "pi-telecom-live-")));
 const project = join(scratch, "proj");
 mkdirSync(join(project, ".git"), { recursive: true });
 writeFileSync(join(project, ".git", "HEAD"), "ref: refs/heads/main\n");
@@ -242,12 +242,7 @@ try {
 	console.error(error);
 	failures++;
 } finally {
-	for (const p of [a, b]) {
-		try {
-			p.child.stdin.end();
-			p.child.kill("SIGTERM");
-		} catch {}
-	}
+	await Promise.all([a, b].map((p) => p.stop()));
 	rmSync(scratch, { recursive: true, force: true });
 	clearInterval(keepAlive);
 }

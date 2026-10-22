@@ -15,7 +15,7 @@
  *
  * Costs model calls. Exit 0 = pass, 1 = a check failed, 2 = no model configured.
  */
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -30,7 +30,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const probe = resolve(here, "cache-probe.ts");
 const extra = (process.env.TELECOM_LIVE_EXTENSIONS ?? "").split(",").map((p) => p.trim()).filter(Boolean);
 
-const scratch = mkdtempSync(join(tmpdir(), "pi-telecom-cache-"));
+const scratch = realpathSync.native(mkdtempSync(join(tmpdir(), "pi-telecom-cache-")));
 const keepAlive = setInterval(() => {}, 1_000);
 let failures = 0;
 function check(name, ok, detail = "") {
@@ -133,13 +133,7 @@ async function scenario({ withTelecom }) {
 		const kinds = b.records.filter((r) => r.type === "message_end" && r.message?.customType?.startsWith("telecom-")).map((r) => r.message.customType);
 		return { rows: rows(log), usage: usageOf(b), kinds };
 	} finally {
-		for (const p of [a, b]) {
-			if (!p) continue;
-			try {
-				p.child.stdin.end();
-				p.child.kill("SIGTERM");
-			} catch {}
-		}
+		await Promise.all([a, b].filter(Boolean).map((p) => p.stop()));
 	}
 }
 

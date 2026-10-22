@@ -17,11 +17,11 @@ export interface TelecomConfig {
 	askTimeoutMs: number;
 	/** Peer messages that may wake (start a turn in) this agent per rolling minute. Messages over
 	 *  the limit still arrive, passively, so a chatty peer cannot burn this agent's tokens. 0 = never
-	 *  wake (asks excepted: a peer is blocked on them). */
+	 *  wake automatically (asks and explicit human team tasks still wake). */
 	maxWakesPerMinute: number;
 	/** Fixed callsign for this session, instead of the next free NATO word. */
 	callsign: string | undefined;
-	/** Do not load at all. */
+	/** Start disconnected unless this session has an explicit command override. */
 	disabled: boolean;
 	/** Claim time-to-live without activity, in milliseconds. */
 	claimTtlMs: number;

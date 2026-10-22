@@ -10,7 +10,7 @@ README is the user-facing description. This file is for working on the code.
 ```bash
 npm install            # dev tooling only — the package has no runtime dependencies
 npm run typecheck      # tsc --noEmit: strict, erasable syntax only, covers src/ test/ scripts/
-npm test               # node:test over test/*.test.ts (~10 s)
+npm test               # node:test over test/*.test.ts and test/*.test.mjs
 npm run e2e            # real `pi --mode rpc` processes, no model calls (~1 min)
 npm run check          # all three; run before every commit
 
@@ -23,6 +23,16 @@ TELECOM_LIVE_MODEL=<provider/model> npm run e2e:live       # one model; TELECOM_
 TELECOM_LIVE_MODEL=<provider/model> npm run e2e:cache      # the prompt-cache proof
 TELECOM_LIVE_PROVIDER=<provider> npm run screenshots       # docs/images/team.png from real pi sessions (needs tmux, Chrome)
 ```
+
+`npm test` uses `scripts/test.mjs` to expand test files without a shell. CI runs `npm run check`
+on Linux, macOS and Windows with Node 22 and 24. The RPC driver invokes the local pi package's JS
+entry with Node (no global `pi` or `.cmd` shell shim), decodes UTF-8 across pipe reads, and exposes
+`stop()`; await it before deleting a process's scratch directory.
+
+Use native canonical paths on macOS/Windows; never globally lowercase or Unicode-normalize
+filenames, since a volume may distinguish them. Glob syntax uses `/` internally, with native
+Windows separators converted at the boundary. Filesystem read errors must stay distinct from
+malformed JSON: locked messages and presence files are retried on later ticks, not discarded.
 
 **Models.** Live tests, results and docs use exactly the models in `scripts/lab-models.mjs`:
 Claude Opus 5.5 and GPT-6.1 Sol. Don't name other models in docs or examples. When a lab ships a
@@ -53,7 +63,7 @@ what ran before it.
 | file | owns |
 |---|---|
 | `src/index.ts` | The entry point. One closure per session runtime wires presence, the inbox loop, inbound handling, the guard hooks, the `telecom` tool's actions (one function each) and the `/telecom` command. Sections are marked `// ---- name`. |
-| `src/tool.ts` | The static half of the `telecom` tool: schema, description, guidelines, renderers, `ok`/`fail`. Fixed at registration (rule 1). |
+| `src/tool.ts` | The static half of the `telecom` tool: schema, description, guidelines, renderers (its own panels: `renderShell: "self"`), `ok`/`fail`. Fixed at registration (rule 1). |
 | `src/notices.ts` | Change-notice text: the summary sent about an own edit, and the notice shown about a peer's. Pure. |
 | `src/transport.ts` | The wire: root directory, liveness, presence records, envelopes, typed event payloads (`parseEvent`), `deliver`/`drain`, reload handoff, and **all validation of peer data**. |
 | `src/awareness.ts` | What this agent has seen (views), what peers changed, and the guard's verdicts (stale files, claims, lane overlaps). Pure decisions; the caller acts on them. |
@@ -64,7 +74,8 @@ what ran before it.
 | `src/project.ts` | Checkout (project root), repository (`findRepo`: the git common dir), lanes (`sameRepo`, `laneName`, `inCheckout`), git branch, canonical paths. |
 | `src/callsign.ts` | Callsign choice and collision handling. |
 | `src/config.ts` | Every `PI_TELECOM_*` variable, read at session start (never at import). |
-| `src/render.ts` | TUI renderers for telecom messages. |
+| `src/render.ts` | The transcript look: renderers for telecom messages, and the pieces every telecom surface shares (one colour per agent, `Panel`, board styling, dimmed model instructions). Display only; nothing here reaches the model. |
+| `src/view.ts` | Human-only views: the footer text, the live widget, the `/telecom` board panel and command list (TUI components), and the command table that help and completions share. RPC clients get plain text. |
 | `src/util.ts` | Small helpers (`clip`, `ago`, `fileFingerprint`, `newId`). |
 | `test/harness.ts` | A fake `pi` that drives the real extension; many sessions in one process. |
 | `scripts/` | e2e drivers (`rpc-driver.mjs`), the probe extension for the cache test, `lab-models.mjs` (the models live tests use), and `e2e-matrix.mjs`. |
@@ -73,8 +84,8 @@ what ran before it.
 | `reference/` | Gitignored. A clone of tinoy1336/pi-extensions at `6a71be3`, the code the transport was derived from. Recreate it with `git clone https://github.com/tinoy1336/pi-extensions.git reference/pi-extensions`. |
 
 Runtime imports are acyclic: `index → board, notices → awareness → glob → project`, `index →
-tool → util`, `index, board → family → transport`, `transport → ledger → util`, and `transport → config →
-callsign → project`. `callsign.ts` imports only *types* from `transport.ts` (erased at load), which is what
+view → board, render`, `index → tool → render → callsign`, `tool, render, glob → util`, `index, board → family →
+transport`, `transport → ledger → util`, and `transport → config → callsign → project`. `callsign.ts` imports only *types* from `transport.ts` (erased at load), which is what
 keeps that pair from forming a cycle. Keep it acyclic: an ESM import cycle can hand a module an
 uninitialized binding.
 
@@ -106,22 +117,30 @@ uninitialized binding.
 - **Envelope kinds:** `message`, `broadcast`, `ask`, `answer`, and `event`. Event topics are
   `file.changed`, `claim.contested` (with `lane: true` when the edit was in another checkout and
   nothing was held back), `claim.released` and `ask.withdrawn`.
+  A human `message` may carry optional `triggerTurn: true` for an explicit `/telecom run` task.
+  Older peers ignore this field and apply their usual wake limit. Draining checks the recipient;
+  answers and withdrawals are matched to the session involved in the ask.
 - **Delivery to the model** (`inject` modes):
 
   | mode | used for | when busy | when idle |
   |---|---|---|---|
   | `wake` | direct messages, late answers | steered in | starts a turn (wake-limited) |
-  | `wake-always` | asks (a peer is blocked) | steered in | starts a turn |
+  | `wake-always` | asks and explicit human team tasks | steered in | starts a turn |
   | `passive` | notices, broadcasts, claim news | steered in | appended, no turn |
   | `later` | broadcasts about paths away from this agent's work | held for the next run (`deliverAs: "nextTurn"`) | held for the next run |
 
+- **Human commands.** `/telecom run <prompt>` targets this session and its repository team.
+  `/telecom off` stops the transport loop, releases claims and ends outbound waits; `/telecom on`
+  reconnects. `telecom-enabled` custom entries persist the override on the active session branch.
+  Tools and hooks stay registered with their static definitions, including while disconnected.
 - **Asks and the wait-for graph.** A session publishes `waitingOn` (the sessions its open asks
   wait on, at most `WAITS_CAP`) before it delivers an ask and again when the wait ends. An
   inbound ask interrupts this agent's own wait only when `closesCycle` says this agent already
   waits, directly or through others, on the asker. A busy foreground subagent counts as an edge
   from its parent. New sessions always publish `waitingOn`, possibly empty. A record without it
   is an older telecom, and a list at the cap may have been cut: either way the graph is unknown
-  (`null`) and the ask interrupts, as it always did. An asker whose record no longer waits on us
+  (`null`) and the ask interrupts, as it always did. Reaching the search depth limit also leaves
+  the graph unknown; a known cycle wins over an unknown branch. An asker whose record no longer waits on us
   has stopped waiting, and closes no cycle. A peer inside a foreground subagent run cannot be
   interrupted at all, so `askAction` refuses an ask that would close a cycle there, and names the
   inbound ask to answer instead.
@@ -167,7 +186,8 @@ Each rule has a test or an e2e check. Read the reason before bending a rule.
    it, flatten it to one line, and cap it. A new event topic gets a case in `parseEvent` and a
    member in `TelecomEvent`; handlers never read `envelope.data` directly. Never put raw peer text into a model message without `clip`.
 8. **Information never wakes an idle agent.** Only direct messages, late answers and asks start
-   turns, and `wake` respects `PI_TELECOM_MAX_WAKES`. A new passive kind must use `passive`.
+   turns, and `wake` respects `PI_TELECOM_MAX_WAKES`, counting only idle wake-ups. Explicit human
+   tasks use `wake-always`. A new passive kind must use `passive`.
 9. **Every refusal says what happened and what to do next,** including the exact
    `telecom({ ... })` call when one helps. Models follow these literally; the live tests show it.
 10. **Tool schema conventions:** string enums use `StringEnum` from `@earendil-works/pi-ai`
@@ -249,9 +269,14 @@ The exact types are in `dist/core/extensions/types.d.ts`.
   - Every harness session shares the test's pid, so `new Session(dir, { parentSession:
     a.sessionFile() })` is a foreground subagent of `a`. `session.disposed = true` simulates pi
     disposing it.
+- **View tests** (`test/view.test.ts`): what the human sees. A tagged theme (`<color>text</color>`)
+  shows which colour each run got, and `asTui()` gives a harness session a fake TUI (`custom`,
+  `setWidget`, `setEditorText`) so the board panel and command list can be driven by keys.
 - **Coverage:** a new behavior needs a scenario test, and a fix needs a test that fails without
   it. Anything that depends on pi's real lifecycle (reload, RPC, session ids) also needs a check
   in `scripts/e2e-rpc.mjs`.
+  Its `rpc-fixture.ts` provider completes turns locally and can hold a stream until released by
+  a command, so team tasks, busy delivery and toggle persistence need no external model calls.
 - **Live scripts:** `run()` waits for idle, then for its *own* run's start and end. A peer's ask
   can wake an agent at any moment, so never wait for the next `agent_settled` alone.
 

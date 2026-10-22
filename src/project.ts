@@ -15,10 +15,17 @@
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
+
+/** Use the OS spelling (including case/Unicode aliases on macOS and Windows), without folding
+ *  names ourselves: case-sensitive volumes may contain both spellings as distinct files. */
+function realExisting(path: string): string {
+	return process.platform === "win32" || process.platform === "darwin" ? realpathSync.native(path) : realpathSync(path);
+}
 
 function real(path: string): string {
 	try {
-		return realpathSync(path);
+		return realExisting(path);
 	} catch {
 		return normalize(path);
 	}
@@ -118,11 +125,17 @@ export function readBranch(root: string): string | undefined {
  */
 export function canonicalPath(input: string, cwd: string): string {
 	let path = input.trim().replace(/^@/, "");
+	if (process.platform === "win32") {
+		// pi also accepts Git Bash/MSYS, WSL and Cygwin drive paths on native Windows.
+		const drive = /^\/(?:mnt\/|cygdrive\/)?([a-z])(?:\/(.*))?$/i.exec(path);
+		if (drive && !path.includes("\\")) path = `${drive[1]!.toUpperCase()}:/${drive[2] ?? ""}`;
+	}
 	if (path === "~") path = homedir();
-	else if (path.startsWith("~/")) path = join(homedir(), path.slice(2));
+	else if (path.startsWith("~/") || (process.platform === "win32" && path.startsWith("~\\"))) path = join(homedir(), path.slice(2));
+	if (path.startsWith("file://")) path = fileURLToPath(path);
 	const absolute = resolve(cwd, path);
 	try {
-		return realpathSync(absolute);
+		return realExisting(absolute);
 	} catch {
 		const tail: string[] = [];
 		let dir = absolute;
@@ -132,7 +145,7 @@ export function canonicalPath(input: string, cwd: string): string {
 			if (parent === dir) return normalize(absolute);
 			dir = parent;
 			try {
-				return join(realpathSync(dir), ...tail);
+				return join(realExisting(dir), ...tail);
 			} catch {
 				/* keep walking up */
 			}
@@ -143,7 +156,7 @@ export function canonicalPath(input: string, cwd: string): string {
 /** True when `path` is `root` or sits underneath it (segment-wise, so /a/bc is not in /a/b). */
 export function isWithin(path: string, root: string): boolean {
 	const rel = relative(root, path);
-	return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+	return rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
 }
 
 /** A path as a human reads it on the board: project-relative when inside the project. */

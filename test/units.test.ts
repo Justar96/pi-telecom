@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -134,7 +134,7 @@ test("ledger: answer, timeout, interruption, peer gone, late replies", async () 
 	const ledger = createAskLedger();
 	const meta = { to: "peer", toCallsign: "bravo", text: "q?" };
 	const answered = ledger.awaitAnswer("a1", meta, 10_000);
-	assert.ok(ledger.settle("a1", "yes", "bravo"));
+	assert.ok(ledger.settle("a1", "yes", "bravo", "peer"));
 	assert.deepEqual(await answered, { ok: true, text: "yes", fromCallsign: "bravo" });
 
 	const timed = ledger.awaitAnswer("a2", meta, 1);
@@ -142,7 +142,7 @@ test("ledger: answer, timeout, interruption, peer gone, late replies", async () 
 	ledger.expire(Date.now());
 	const t = await timed;
 	assert.ok(!t.ok && /did not answer/.test(t.reason));
-	assert.deepEqual(ledger.wasAbandoned("a2"), { toCallsign: "bravo", text: "q?" });
+	assert.deepEqual(ledger.wasAbandoned("a2", "peer"), { to: "peer", toCallsign: "bravo", text: "q?" });
 
 	const interrupted = ledger.awaitAnswer("a3", meta, 10_000);
 	ledger.interruptAll({ id: "in1", from: "peer", fromCallsign: "bravo", text: "and you?", at: 1, reminded: false });
@@ -258,7 +258,7 @@ test("ids: the short form tells apart UUIDv7 session ids started in the same min
 // ---------------------------------------------------------------- lanes and families
 
 test("project: worktrees share their repository; submodules and plain folders are their own", () => {
-	const base = mkdtempSync(join(tmpdir(), "telecom-repo-"));
+	const base = realpathSync.native(mkdtempSync(join(tmpdir(), "telecom-repo-")));
 	const main = join(base, "main");
 	mkdirSync(join(main, ".git", "worktrees", "wt"), { recursive: true });
 	writeFileSync(join(main, ".git", "HEAD"), "ref: refs/heads/main\n");
@@ -426,4 +426,31 @@ test("ledger: a wait list at the cap may have been cut, so it never proves there
 	// A node on the way at the cap: the edge to the asker may be the one that was cut.
 	assert.equal(closesCycle("c", node("a", ["x"]), [node("x", others), node("c", ["a"])]), null);
 	assert.equal(closesCycle("c", node("a", ["x"]), [node("x", others.slice(1)), node("c", ["a"])]), false);
+});
+
+test("ledger: a known cycle wins over an unknown branch, regardless of peer order", () => {
+	const start: WaitNode = { id: "a", pid: 1, state: "busy", waitingOn: ["old", "b"] };
+	const peers: WaitNode[] = [
+		{ id: "old", pid: 2, state: "busy" },
+		{ id: "b", pid: 3, state: "busy", waitingOn: ["c"] },
+		{ id: "c", pid: 4, state: "busy", waitingOn: ["a"] },
+	];
+	assert.equal(closesCycle("c", start, peers), true);
+	assert.equal(closesCycle("c", { ...start, waitingOn: ["b", "old"] }, peers), true);
+});
+
+test("ledger: an unfinished depth-limited search cannot prove there is no cycle", () => {
+	const chain: WaitNode[] = Array.from({ length: 40 }, (_, i) => ({
+		id: `n${i}`, pid: i + 1, state: "busy", waitingOn: [i === 39 ? "asker" : `n${i + 1}`],
+	}));
+	chain.push({ id: "asker", pid: 100, state: "busy", waitingOn: ["n0"] });
+	assert.equal(closesCycle("asker", chain[0] as WaitNode, chain), null);
+});
+
+test("transport: explicit task wakes are accepted only on human direct messages", () => {
+	const env = { v: 1, id: "task", ts: 1, from: "a", fromCallsign: "alpha", to: "b", kind: "message", text: "work", triggerTurn: true };
+	assert.equal(parseEnvelope(env)?.triggerTurn, undefined);
+	assert.equal(parseEnvelope({ ...env, human: true })?.triggerTurn, true);
+	assert.equal(parseEnvelope({ ...env, human: true, triggerTurn: "true" })?.triggerTurn, undefined);
+	assert.equal(parseEnvelope({ ...env, human: true, kind: "broadcast" })?.triggerTurn, undefined);
 });

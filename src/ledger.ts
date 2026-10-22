@@ -40,10 +40,17 @@ interface PendingAsk {
 	settle(outcome: AskOutcome): void;
 }
 
+/** `to` is absent only in a handoff written by an older runtime. */
+export interface LateAsk {
+	to?: string;
+	toCallsign: string;
+	text: string;
+}
+
 export interface AskLedger {
 	noteInbound(ask: Omit<InboundAsk, "reminded">): void;
 	/** Drop the inbound ask a reply answers; `null` when the handle is unknown. */
-	resolveInbound(askId: string): InboundAsk | null;
+	resolveInbound(askId: string, from?: string): InboundAsk | null;
 	inbound(): InboundAsk[];
 	/** Forget inbound asks from sessions that are gone: nobody is waiting on them any more. */
 	dropInboundFrom(sessionIds: ReadonlySet<string>): InboundAsk[];
@@ -54,17 +61,19 @@ export interface AskLedger {
 		signal?: AbortSignal,
 	): Promise<AskOutcome>;
 	/** Complete the waiting ask an answer names. False when no ask is waiting on it. */
-	settle(answerTo: string, text: string, fromCallsign: string): boolean;
+	settle(answerTo: string, text: string, fromCallsign: string, from: string): boolean;
 	/** True when `askId` was ours but stopped waiting (timed out, interrupted, aborted). */
-	wasAbandoned(askId: string): { toCallsign: string; text: string } | null;
+	wasAbandoned(askId: string, from: string): LateAsk | null;
 	abandon(askId: string, reason: string): void;
+	/** End every local wait when this runtime disconnects. */
+	abandonAll(reason: string): Array<{ id: string; to: string }>;
 	interruptAll(by: InboundAsk): void;
 	failPeerGone(isGone: (sessionId: string) => boolean): void;
 	expire(now: number): void;
 	outboundCount(): number;
 	/** Asks whose answer would now arrive late (abandoned, or still waiting): kept over a `/reload`. */
-	lateCandidates(): Array<[string, { toCallsign: string; text: string }]>;
-	restoreAbandoned(entries: ReadonlyArray<[string, { toCallsign: string; text: string }]>): void;
+	lateCandidates(): Array<[string, LateAsk]>;
+	restoreAbandoned(entries: ReadonlyArray<[string, LateAsk]>): void;
 	/** The sessions outbound asks are waiting on, and when the oldest wait began. */
 	waits(): { on: string[]; since?: number };
 }
@@ -86,6 +95,21 @@ const MAX_WAIT_DEPTH = 32;
  */
 export const WAITS_CAP = 8;
 
+/** Does `node` publish its whole wait list? Absent (an older telecom) or at the cap (maybe cut) is unknown. */
+function waitsKnown(node: WaitNode): node is WaitNode & { waitingOn: string[] } {
+	return node.waitingOn !== undefined && node.waitingOn.length < WAITS_CAP;
+}
+
+/** Index foreground children once per walk instead of scanning all peers for every edge. */
+function waitGraph(start: WaitNode, peers: readonly WaitNode[]): Map<string, { node: WaitNode; edges: string[] }> {
+	const graph = new Map([...peers, start].map((node) => [node.id, { node, edges: [...(node.waitingOn ?? [])] }]));
+	for (const { node } of graph.values()) {
+		const parent = node.parent ? graph.get(node.parent) : undefined;
+		if (parent && node.pid === parent.node.pid && node.state === "busy") parent.edges.push(node.id);
+	}
+	return graph;
+}
+
 /**
  * Would `askerId`'s ask to `self` close a wait cycle? The ask makes the asker wait on `self`, so
  * it closes one exactly when `self` already waits, directly or through others, on the asker. Then
@@ -95,51 +119,43 @@ export const WAITS_CAP = 8;
  * the graph cannot be known, so the caller interrupts.
  */
 export function closesCycle(askerId: string, self: WaitNode, peers: readonly WaitNode[]): boolean | null {
-	const byId = new Map(peers.map((p) => [p.id, p]));
-	byId.set(self.id, self);
+	const graph = waitGraph(self, peers);
 	// An asker whose record no longer waits on us has stopped waiting (it was interrupted itself,
 	// or gave up): its ask closes nothing, and our wait can go on.
-	const asker = byId.get(askerId);
-	if (asker?.waitingOn && asker.waitingOn.length < WAITS_CAP && !asker.waitingOn.includes(self.id)) return false;
-	const edges = (node: WaitNode): string[] => [
-		...(node.waitingOn ?? []),
-		...peers.filter((c) => c.parent === node.id && c.pid === node.pid && c.state === "busy").map((c) => c.id),
-	];
+	const asker = graph.get(askerId)?.node;
+	if (asker && waitsKnown(asker) && !asker.waitingOn.includes(self.id)) return false;
 	const seen = new Set<string>([self.id]);
-	let frontier = edges(self);
+	let unknown = !waitsKnown(self);
+	let frontier = graph.get(self.id)?.edges ?? [];
 	for (let depth = 0; frontier.length > 0 && depth < MAX_WAIT_DEPTH; depth++) {
 		const next: string[] = [];
 		for (const id of frontier) {
 			if (id === askerId) return true;
 			if (seen.has(id)) continue;
 			seen.add(id);
-			const node = byId.get(id);
-			if (!node) continue;
-			if (node.waitingOn === undefined || node.waitingOn.length >= WAITS_CAP) return null;
-			next.push(...edges(node));
+			const entry = graph.get(id);
+			if (!entry) continue;
+			if (!waitsKnown(entry.node)) unknown = true;
+			// A known cycle on another branch still wins over incomplete information here.
+			next.push(...entry.edges.filter((edge) => !seen.has(edge)));
 		}
 		frontier = next;
 	}
-	return false;
+	return unknown || frontier.some((id) => !seen.has(id)) ? null : false;
 }
 
 /** The sessions `start` waits on, directly or through others (bounded like `closesCycle`). */
 export function waitedOn(start: WaitNode, peers: readonly WaitNode[]): Set<string> {
-	const byId = new Map(peers.map((p) => [p.id, p]));
+	const graph = waitGraph(start, peers);
 	const seen = new Set<string>();
-	let frontier = [start];
+	let frontier = [start.id];
 	for (let depth = 0; frontier.length > 0 && depth < MAX_WAIT_DEPTH; depth++) {
-		const next: WaitNode[] = [];
-		for (const node of frontier) {
-			const out = [
-				...(node.waitingOn ?? []),
-				...peers.filter((c) => c.parent === node.id && c.pid === node.pid && c.state === "busy").map((c) => c.id),
-			];
-			for (const id of out) {
+		const next: string[] = [];
+		for (const nodeId of frontier) {
+			for (const id of graph.get(nodeId)?.edges ?? []) {
 				if (seen.has(id) || id === start.id) continue;
 				seen.add(id);
-				const found = byId.get(id);
-				if (found) next.push(found);
+				if (graph.has(id)) next.push(id);
 			}
 		}
 		frontier = next;
@@ -149,15 +165,20 @@ export function waitedOn(start: WaitNode, peers: readonly WaitNode[]): Set<strin
 
 const ABANDONED_CAP = 64;
 
+/** What a late answer needs to name the ask it answers. */
+function lateOf(ask: PendingAsk): LateAsk {
+	return { to: ask.to, toCallsign: ask.toCallsign, text: ask.text };
+}
+
 export function createAskLedger(): AskLedger {
 	const inbound = new Map<string, InboundAsk>();
 	const outbound = new Map<string, PendingAsk>();
-	const abandoned = new Map<string, { toCallsign: string; text: string }>();
+	const abandoned = new Map<string, LateAsk>();
 
 	function stop(id: string, outcome: AskOutcome & { ok: false }): void {
 		const pending = outbound.get(id);
 		if (!pending) return;
-		setBounded(abandoned, id, { toCallsign: pending.toCallsign, text: pending.text }, ABANDONED_CAP);
+		setBounded(abandoned, id, lateOf(pending), ABANDONED_CAP);
 		pending.settle(outcome);
 	}
 
@@ -166,8 +187,9 @@ export function createAskLedger(): AskLedger {
 			inbound.set(ask.id, { ...ask, reminded: false });
 		},
 
-		resolveInbound(askId) {
+		resolveInbound(askId, from) {
 			const found = inbound.get(askId) ?? null;
+			if (from !== undefined && found?.from !== from) return null;
 			if (found) inbound.delete(askId);
 			return found;
 		},
@@ -210,21 +232,31 @@ export function createAskLedger(): AskLedger {
 			});
 		},
 
-		settle(answerTo, text, fromCallsign) {
+		settle(answerTo, text, fromCallsign, from) {
 			const pending = outbound.get(answerTo);
-			if (!pending) return false;
+			if (!pending || pending.to !== from) return false;
 			pending.settle({ ok: true, text, fromCallsign });
 			return true;
 		},
 
-		wasAbandoned(askId) {
+		wasAbandoned(askId, from) {
 			const found = abandoned.get(askId) ?? null;
+			if (found?.to !== undefined && found.to !== from) return null;
 			if (found) abandoned.delete(askId);
 			return found;
 		},
 
 		abandon(askId, reason) {
 			stop(askId, { ok: false, reason });
+		},
+
+		abandonAll(reason) {
+			const stopped: Array<{ id: string; to: string }> = [];
+			for (const [id, pending] of outbound) {
+				stopped.push({ id, to: pending.to });
+				stop(id, { ok: false, reason });
+			}
+			return stopped;
 		},
 
 		interruptAll(by) {
@@ -264,7 +296,7 @@ export function createAskLedger(): AskLedger {
 		lateCandidates() {
 			return [
 				...abandoned.entries(),
-				...[...outbound.entries()].map(([id, p]): [string, { toCallsign: string; text: string }] => [id, { toCallsign: p.toCallsign, text: p.text }]),
+				...[...outbound.entries()].map(([id, p]): [string, LateAsk] => [id, lateOf(p)]),
 			].slice(-ABANDONED_CAP);
 		},
 

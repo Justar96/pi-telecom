@@ -6,6 +6,48 @@ All notable changes to `@justar_96/pi-telecom`. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Windows path handling for claims, drive and UNC paths, home expansion and pi's Windows shell
+  path spellings. CI checks Linux, macOS and Windows on Node 22 and 24.
+- `/telecom run <prompt>` starts work in every connected session in the repository, including
+  the caller, subagents and sibling worktrees. Multiline prompts retain their formatting, and
+  explicit human tasks bypass the automatic wake limit.
+- `/telecom off` disconnects this session, releases its claims and ends its pending asks;
+  `/telecom on` reconnects it. The setting survives reloads and resumes on the active session
+  branch and overrides `PI_TELECOM_DISABLE`. Help remains available while disconnected.
+- A cleaner terminal UI. `/telecom` opens a live board panel (Tab switches to the whole machine,
+  `w` toggles the widget, Esc closes), and `/telecom help` opens a command list that runs the
+  selected command. Completions describe every command and, for `/telecom msg`, every agent.
+- Each agent keeps one colour across the transcript, board and widget. The `telecom` tool's calls
+  and results, and peers' messages, draw as panels edged in the sender's colour, with the
+  instructions meant for the model dimmed.
+- The live widget lists this agent first, subagents under their parent, each agent's state, task
+  and claims, and the asks waiting on this agent, and fits narrow terminals. The footer shows
+  `📡 off` while telecom is disconnected.
+
+### Fixed
+
+- macOS and Windows use native canonical paths for existing files and checkout aliases, without
+  merging distinct case or Unicode names on volumes that distinguish them. Glob characters in a
+  checkout's directory name stay literal, and `..name` is correctly inside its checkout.
+- Temporary file locks no longer discard messages or sweep unreadable presence records. Inbox
+  cleanup failures are isolated, and atomic-write errors remain reportable even if cleanup fails.
+- Windows transport roots use a per-user key, and record ids reject Windows device names and
+  trailing dots.
+- Test runners avoid shell globs and Windows command shims, preserve split UTF-8 pipe data,
+  report early process failures, and await process shutdown before removing scratch files.
+- Messages steered into a busy session no longer consume its idle wake allowance.
+- A failed reply delivery keeps the ask handle available for retry. Already cancelled asks
+  send no question, and disconnecting or reloading completes outstanding local waits.
+- Answers and withdrawals must match the session involved in the ask. Late-answer correlation
+  survives reload, and asks from departed sessions in other projects no longer leave reminders.
+- An envelope in the wrong inbox is discarded before it can wake or modify that session.
+- Coalesced change notices count all edits in the window and show the latest excerpt, including
+  changes in sibling worktrees.
+- Wait-cycle searches retain uncertainty at their depth limit and find known cycles even when
+  another branch is unknown. Foreground child edges are indexed once per search.
+
 ## [0.2.0] - 2026-10-23
 
 ### Added

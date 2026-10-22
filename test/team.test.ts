@@ -4,21 +4,13 @@
  */
 import assert from "node:assert/strict";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { basename, join } from "node:path";
+import { join } from "node:path";
 import { after, test } from "node:test";
 import { findProjectRoot, findRepo } from "../src/project.ts";
 import { openTransport, processStartTicks, WIRE_VERSION } from "../src/transport.ts";
-import { eventually, makeProject, SCRATCH, Session, sleep } from "./harness.ts";
+import { eventually, makeProject, makeWorktree, PLAIN_THEME, Session, session, sleep, stopSessions, track } from "./harness.ts";
 
-const open: Session[] = [];
-async function session(cwd: string, opts: { name?: string; parentSession?: string } = {}): Promise<Session> {
-	const s = await new Session(cwd, opts).start();
-	open.push(s);
-	return s;
-}
-after(async () => {
-	for (const s of open) await s.stop();
-});
+after(stopSessions);
 
 test("agents in one project get callsigns and see each other; other projects stay off the board", async () => {
 	const proj = makeProject("p-board");
@@ -199,6 +191,8 @@ test("a peer's edit to a file you read produces one coalesced change notice", as
 	assert.equal(notices.length, 1, "coalesced, and nothing about files bravo never touched");
 	assert.match(notices[0]?.content ?? "", /alpha changed a file you are working with/);
 	assert.match(notices[0]?.content ?? "", /shared\.ts — edited/);
+	assert.match(notices[0]?.content ?? "", /edited \(2×\)/, "every edit in the coalescing window is counted");
+	assert.match(notices[0]?.content ?? "", /\+export const b = 20;/, "the excerpt describes the latest edit");
 	assert.match(notices[0]?.content ?? "", /you read this file earlier/);
 	assert.equal(notices[0]?.options, undefined, "passive: never wakes an idle agent");
 	// The board shows what alpha changed recently.
@@ -459,8 +453,7 @@ test("callsign is kept across a resume when still free", async () => {
 	await first.stop();
 	const resumed = new Session(proj, { id: first.id });
 	resumed.entries.push(...entries);
-	await resumed.start();
-	open.push(resumed);
+	track(await resumed.start());
 	assert.equal((await resumed.tool({ action: "board" })).details.callsign, "kilo");
 });
 
@@ -493,8 +486,7 @@ test("durability: /reload keeps the line — no gap for peers, nothing lost, cla
 	assert.ok(!during.isError, during.text);
 
 	const a2 = new Session(proj, { id: a.id });
-	await a2.start("reload");
-	open.push(a2);
+	track(await a2.start("reload"));
 	await eventually(() => assert.equal(a2.sentOf("telecom-message").length, 1));
 	assert.match(a2.sentOf("telecom-message")[0]?.content ?? "", /sent mid-reload/);
 	const board = await a2.tool({ action: "board" });
@@ -657,7 +649,7 @@ test("tool results render folded by default and in full when expanded", async ()
 	const proj = makeProject("p-render");
 	const a = await session(proj);
 	const tool = a.tools.get("telecom") as any;
-	const theme = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
+	const theme = PLAIN_THEME;
 	const long = { content: [{ type: "text", text: Array.from({ length: 20 }, (_, i) => `line ${i}`).join("\n") }], details: { ok: true } };
 	const folded = tool.renderResult(long, { expanded: false, isPartial: false }, theme).render(80).join("\n");
 	assert.match(folded, /line 7/);
@@ -710,18 +702,6 @@ test("ids: agents started together get distinct ids on the board, and those ids 
 
 // ---------------------------------------------------------------- lanes: worktrees of one repository
 
-/** A git worktree of `main`, laid out the way `git worktree add` does it. */
-function makeWorktree(main: string, name: string, branch: string, at?: string): string {
-	const gitDir = join(main, ".git", "worktrees", name);
-	mkdirSync(gitDir, { recursive: true });
-	writeFileSync(join(gitDir, "HEAD"), `ref: refs/heads/${branch}\n`);
-	writeFileSync(join(gitDir, "commondir"), "../..\n");
-	const dir = at ?? join(SCRATCH, `${basename(main)}-${name}`);
-	mkdirSync(dir, { recursive: true });
-	writeFileSync(join(dir, ".git"), `gitdir: ${gitDir}\n`);
-	return dir;
-}
-
 test("lanes: agents in worktrees of one repository are one team; the guard stays within a checkout", async () => {
 	const proj = makeProject("p-lanes");
 	const wt = makeWorktree(proj, "wt", "lane-b");
@@ -742,7 +722,7 @@ test("lanes: agents in worktrees of one repository are one team; the guard stays
 	// alpha changed its own copy too, so it hears about bravo's — as merge news, not a stale view.
 	await eventually(() => assert.equal(a.sentOf("telecom-change").length, 1), 3_000);
 	const notice = a.sentOf("telecom-change")[0]?.content ?? "";
-	assert.match(notice, /x\.ts — rewrote in worktree .* you changed your copy too/);
+	assert.match(notice, /x\.ts — rewrote \(2×\) in worktree .* you changed your copy too/);
 	assert.match(notice, /nothing in yours is stale/);
 	assert.doesNotMatch(notice, /Re-read/);
 	assert.equal((await a.write("x.ts", "main again\n")).blocked, undefined, "alpha's own copy never went stale");
@@ -976,7 +956,7 @@ test("subagents: a child forked from its parent's context is still named after t
 	const child = new Session(proj, { parentSession: a.sessionFile() });
 	// pi-subagents' context: "fork" copies the parent's entries, its remembered callsign included.
 	child.entries.push({ type: "custom", customType: "telecom-callsign", data: { callsign: "alpha" } });
-	open.push(await child.start());
+	track(await child.start());
 	assert.equal((await child.tool({ action: "board" })).details.callsign, "alpha-1");
 });
 
@@ -1099,7 +1079,7 @@ test("durability: an ask that stopped waiting before a /reload still wakes the a
 	assert.match(res.text, /did not answer within/);
 	await a.stop("reload");
 	const a2 = new Session(proj, { id: a.id });
-	open.push(await a2.start("reload"));
+	track(await a2.start("reload"));
 	await b.tool({ action: "reply", message: "late but here" });
 	await eventually(() => assert.equal(a2.sentOf("telecom-reply").length, 1));
 	const late = a2.sentOf("telecom-reply")[0];
