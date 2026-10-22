@@ -270,6 +270,13 @@ export class Session {
 
 export const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
+/**
+ * How long to wait for a change notice. Notices are held for the coalescing window (1.2 s)
+ * before they are sent, and a loaded CI runner (Windows especially) runs ticks two to three
+ * times slower than a workstation, so the default `eventually` limit is too tight for them.
+ */
+export const NOTICE_WAIT_MS = 6_000;
+
 /** Wait until `check` passes, or fail with its last error. */
 export async function eventually(check: () => void | Promise<void>, timeoutMs = 2_000): Promise<void> {
 	const deadline = Date.now() + timeoutMs;

@@ -25,7 +25,7 @@ TELECOM_LIVE_PROVIDER=<provider> npm run screenshots       # docs/images/team.pn
 ```
 
 `npm test` uses `scripts/test.mjs` to expand test files without a shell. CI runs `npm run check`
-on Linux, macOS and Windows with Node 22 and 24. The RPC driver invokes the local pi package's JS
+on Linux, macOS and Windows with Node 24 and 26. The RPC driver invokes the local pi package's JS
 entry with Node (no global `pi` or `.cmd` shell shim), decodes UTF-8 across pipe reads, and exposes
 `stop()`; await it before deleting a process's scratch directory.
 

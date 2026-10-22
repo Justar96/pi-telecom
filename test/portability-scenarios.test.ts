@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
-import { eventually, makeProject, session, stopSessions } from "./harness.ts";
+import { eventually, makeProject, NOTICE_WAIT_MS, session, stopSessions } from "./harness.ts";
 
 afterEach(stopSessions);
 
@@ -18,7 +18,7 @@ test("portable sessions: symlink aliases share a team, notices and the stale-wri
 	assert.match(board.text, /1 other agent live/);
 	await a.read("résumé.txt");
 	assert.equal((await b.edit("résumé.txt", "before", "after")).blocked, undefined);
-	await eventually(() => assert.equal(a.sentOf("telecom-change").length, 1));
+	await eventually(() => assert.equal(a.sentOf("telecom-change").length, 1), NOTICE_WAIT_MS);
 	assert.ok((await a.write("résumé.txt", "stale")).blocked, "different directory spellings must not hide peer changes");
 });
 

@@ -6,6 +6,16 @@ All notable changes to `@justar_96/pi-telecom`. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- CI checks Linux, macOS and Windows on Node 24 and 26.
+
+### Fixed
+
+- Tests no longer race a slow runner: the late-answer reload test waits until the peer holds the
+  ask, change-notice waits leave room for slow CI machines, and a worktree path is escaped before
+  it is used in a regular expression, so Windows backslashes match literally.
+
 ## [0.3.0] - 2026-10-23
 
 ### Added

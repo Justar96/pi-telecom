@@ -414,7 +414,7 @@ See [AGENTS.md](AGENTS.md) for the development setup, the architecture, the rule
 keep, and the release process. Run `npm install` and `npm run check`.
 
 The CI workflow runs typechecking, tests and real pi RPC checks on Linux, macOS and Windows with
-Node 22 and 24. RPC checks use the locally installed pi package and a local fixture provider;
+Node 24 and 26. RPC checks use the locally installed pi package and a local fixture provider;
 they need no global `pi` command, model credentials or network calls.
 
 ## Credits
