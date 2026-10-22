@@ -6,6 +6,8 @@ All notable changes to `@justar_96/pi-telecom`. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-23
+
 ### Added
 
 - **Worktrees are lanes of one team.** Agents in the main checkout and in git worktrees of the
@@ -143,6 +145,7 @@ First release.
   presence repairs itself.
 - Prompt cache unaffected: 84.4 % hit rate with and without telecom on Claude Sonnet 5.5.
 
-[Unreleased]: https://github.com/Justar96/pi-telecom/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/Justar96/pi-telecom/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/Justar96/pi-telecom/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/Justar96/pi-telecom/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Justar96/pi-telecom/releases/tag/v0.1.0

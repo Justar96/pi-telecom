@@ -38,7 +38,7 @@ Other ways to install:
 ```bash
 pi -e npm:@justar_96/pi-telecom                # for one session, without installing
 pi install -l npm:@justar_96/pi-telecom        # for one project (loads once the project is trusted)
-pi install npm:@justar_96/pi-telecom@0.1.1     # a pinned version
+pi install npm:@justar_96/pi-telecom@0.2.0     # a pinned version
 pi install git:github.com/Justar96/pi-telecom  # from GitHub
 ```
 
