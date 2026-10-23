@@ -717,6 +717,21 @@ test("ids: agents started together get distinct ids on the board, and those ids 
 	assert.equal(c.sentOf("telecom-message").length, 0);
 });
 
+test("status: a task set on purpose outlives short replies to the agent; a new direction replaces it", async () => {
+	const proj = makeProject("p-sticky-task");
+	const a = await session(proj);
+	const taskOf = async () => (await a.tool({ action: "status" })).text;
+	await a.prompt("continue");
+	assert.match(await taskOf(), /\(none\)/, "one word answers the agent; it is no task");
+	await a.prompt("fix the flaky upload test");
+	assert.match(await taskOf(), /fix the flaky upload test/);
+	await a.tool({ action: "status", message: "upload test fixed; reviewing bravo's api" });
+	for (const reply of ["yes B is good", "both enabled", "follow best practice and how enterprise using"]) await a.prompt(reply);
+	assert.match(await taskOf(), /reviewing bravo's api/, "short follow-ups keep a task the agent set");
+	await a.prompt("drop the review and port the importer to streaming reads so large files never sit in memory");
+	assert.match(await taskOf(), /port the importer to streaming reads/, "a new direction replaces it");
+});
+
 // ---------------------------------------------------------------- lanes: worktrees of one repository
 
 test("lanes: agents in worktrees of one repository are one team; the guard stays within a checkout", async () => {
@@ -743,6 +758,19 @@ test("lanes: agents in worktrees of one repository are one team; the guard stays
 	assert.match(notice, /nothing in yours is stale/);
 	assert.doesNotMatch(notice, /Re-read/);
 	assert.equal((await a.write("x.ts", "main again\n")).blocked, undefined, "alpha's own copy never went stale");
+});
+
+test("lanes: a session started before `git init` joins the repository's worktrees once it is a checkout", async () => {
+	const proj = makeProject("p-late-git", false);
+	const a = await session(proj);
+	mkdirSync(join(proj, ".git"), { recursive: true });
+	writeFileSync(join(proj, ".git", "HEAD"), "ref: refs/heads/main\n");
+	const wt = makeWorktree(proj, "wt", "lane-b");
+	const b = await session(wt);
+	assert.deepEqual((await b.tool({ action: "board" })).details.peers, [], "a folder outside git is not the worktree's repository");
+	await a.prompt("wire the importer into the api");
+	await eventually(async () => assert.equal((await b.tool({ action: "board" })).details.peers.length, 1));
+	assert.equal((await a.tool({ action: "board" })).details.peers.length, 1);
 });
 
 test("lanes: a claim made in another worktree is advisory — noted, the owner told once, overlapping claims allowed", async () => {

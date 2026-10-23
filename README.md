@@ -94,7 +94,9 @@ Each session gets a callsign: the first free word of `alpha`, `bravo`, `charlie`
 repository. It is kept across a resume, and `/telecom name ops` changes it. Each session
 publishes:
 
-- busy or idle, and its task: the first line of its latest prompt, or one set with `status`;
+- busy or idle, and its task: one set with `status` or `/telecom run`, else the first line of its
+  latest prompt. A one-word prompt ("continue") never becomes the task, and a task set with
+  `status` is replaced only by a prompt of 10 words or more, not by a short reply;
 - its checkout and git branch;
 - its claims;
 - the last 12 files it changed through pi's `edit` and `write` tools;

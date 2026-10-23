@@ -100,6 +100,12 @@ const MIN_ID_PREFIX = 4;
 const WAKE_WINDOW_MS = 60_000;
 /** Own task and claim notes as peers see them. */
 const TASK_CAP = 160;
+/**
+ * A task the agent or its human set on purpose (`status`, a team task) is not replaced by a
+ * prompt shorter than this: "continue", "yes B is good" or "both enabled" answer the agent, they
+ * don't reassign it, and each replacement reaches every teammate's brief as news.
+ */
+const NEW_DIRECTION_WORDS = 10;
 const CLAIM_NOTE_CAP = 120;
 /** A claim refused again for the same conflicts within this window is a blind retry. */
 const CLAIM_RETRY_WINDOW_MS = 10 * 60_000;
@@ -121,6 +127,8 @@ interface Handoff {
 	claims: Claim[];
 	task?: string;
 	taskAt?: number;
+	/** The task was set with `status` or by a team task, not taken from a prompt. */
+	taskExplicit?: boolean;
 	inboundAsks: Array<{ id: string; from: string; fromCallsign: string; text: string; at: number }>;
 	contesters: Array<[string, Array<[string, string]>]>;
 	/** Asks whose answer now arrives late: it must still wake the replacement runtime. */
@@ -174,6 +182,8 @@ export default function telecom(pi: ExtensionAPI): void {
 	/** The team as of the last refresh, with each member's role (subagents come and go quietly). */
 	let teamIds = new Map<string, Presence["role"]>();
 	let briefState: BriefState | null = null;
+	/** The current task was set on purpose, so only a new direction from a prompt replaces it. */
+	let taskExplicit = false;
 	let widgetOn = false;
 	/** The live widget and the open `/telecom` panel (TUI only), redrawn on every team refresh. */
 	let widget: { tui: TUI; component: TeamWidget } | null = null;
@@ -444,9 +454,18 @@ export default function telecom(pi: ExtensionAPI): void {
 	}
 
 	/** The task peers see for this agent. */
-	function setTask(me: Presence, text: string): void {
+	function setTask(me: Presence, text: string, explicit: boolean): void {
 		me.task = clip(text, TASK_CAP);
 		me.taskAt = Date.now();
+		taskExplicit = explicit;
+	}
+
+	/** A prompt becomes the task unless it only answers the agent: one word ("continue", "yes"),
+	 *  or a short follow-up while a task set on purpose stands. */
+	function taskFromPrompt(me: Presence, prompt: string): void {
+		const words = prompt.trim().split(/\s+/).length;
+		if (words < 2 || (taskExplicit && words < NEW_DIRECTION_WORDS)) return;
+		setTask(me, prompt.split("\n").find((l) => l.trim()) ?? prompt, false);
 	}
 
 	function claimTtlMinutes(): number {
@@ -585,7 +604,7 @@ export default function telecom(pi: ExtensionAPI): void {
 	/** An explicit team task from a human wakes idle sessions even when automatic wakes are off. */
 	function runTask(env: Envelope): boolean {
 		if (!self) return false;
-		setTask(self, env.text.split("\n").find((line) => line.trim()) ?? env.text);
+		setTask(self, env.text.split("\n").find((line) => line.trim()) ?? env.text, true);
 		publish();
 		return inject(
 			MESSAGE_TYPES.message,
@@ -905,6 +924,18 @@ export default function telecom(pi: ExtensionAPI): void {
 		publish();
 	}
 
+	/**
+	 * A session that started outside git is grouped by its folder alone. When `git init` (or a
+	 * clone) later makes that folder a checkout, its worktrees' agents must find it in their
+	 * repository. Only the repository is re-read: the checkout stays, since claims and views are
+	 * spelled relative to it, and a session in a subfolder keeps its folder.
+	 */
+	function adoptRepo(me: Presence): void {
+		if (me.repo !== me.projectRoot) return;
+		const repo = findRepo(me.projectRoot);
+		if (repo !== me.projectRoot) me.repo = repo;
+	}
+
 	function heartbeat(): void {
 		if (!self || !transport) return;
 		const now = Date.now();
@@ -919,6 +950,7 @@ export default function telecom(pi: ExtensionAPI): void {
 				"passive",
 			);
 		}
+		adoptRepo(self);
 		const branch = readBranch(self.projectRoot);
 		if (branch) self.branch = branch;
 		else delete self.branch;
@@ -950,6 +982,7 @@ export default function telecom(pi: ExtensionAPI): void {
 			claims: self.claims,
 			...(self.task ? { task: self.task } : {}),
 			...(self.taskAt ? { taskAt: self.taskAt } : {}),
+			...(taskExplicit ? { taskExplicit } : {}),
 			inboundAsks: ledger.inbound().map(({ id, from, fromCallsign, text, at }) => ({ id, from, fromCallsign, text, at })),
 			contesters: [...contesters].map(([pattern, who]) => [pattern, [...who]]),
 			abandonedAsks: ledger.lateCandidates(),
@@ -1112,6 +1145,7 @@ export default function telecom(pi: ExtensionAPI): void {
 				...(handoff?.task ? { task: handoff.task } : {}),
 				...(handoff?.taskAt ? { taskAt: handoff.taskAt } : {}),
 			};
+			taskExplicit = handoff?.taskExplicit === true;
 			for (const ask of handoff?.inboundAsks ?? []) ledger.noteInbound(ask);
 			if (Array.isArray(handoff?.abandonedAsks)) ledger.restoreAbandoned(handoff.abandonedAsks);
 			for (const [pattern, who] of handoff?.contesters ?? []) contesters.set(pattern, new Map(who));
@@ -1171,9 +1205,8 @@ export default function telecom(pi: ExtensionAPI): void {
 		ctxRef = ctx;
 		if (!self) return;
 		self.state = "busy";
-		if (event.messageType === "user" && event.prompt.trim()) {
-			setTask(self, event.prompt.split("\n").find((l) => l.trim()) ?? event.prompt);
-		}
+		if (event.messageType === "user" && event.prompt.trim()) taskFromPrompt(self, event.prompt);
+		adoptRepo(self);
 		publish();
 		const brief = renderBrief(self, readPeers(), briefState, {
 			paths: awareness.focusPaths(),
@@ -1389,7 +1422,7 @@ export default function telecom(pi: ExtensionAPI): void {
 
 	function statusAction({ me, message }: ActionCall): ToolResult {
 		if (!message) return ok(`your task as peers see it: ${me.task ?? "(none)"}`);
-		setTask(me, message);
+		setTask(me, message, true);
 		publish();
 		return ok(`status set — peers now see ${me.callsign}: ${me.task}`);
 	}
