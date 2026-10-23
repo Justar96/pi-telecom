@@ -34,8 +34,9 @@ All notable changes to `@justar_96/pi-telecom`. The format follows
   or more still does.
 - The footer is set only when its text changes. Before, every team refresh set it, and each set
   redraws the TUI.
-- A claim's result in the transcript shows the paths it left out (a path outside the repository)
-  under what it claimed. Before, the panel showed only the claimed paths.
+- A claim's result in the transcript shows the paths it left out, under what it claimed: paths a
+  peer holds, and paths outside the repository. Before, the panel showed only the claimed paths,
+  so since 0.4.0 the human never saw that part of a claim was refused.
 - The team widget names the worktree a peer works in, not the checkout it started in.
 - Unanswered asks from peers are kept up to 64 at a time, and the times this agent was warned
   about a peer's claim up to 512, the oldest giving way. Before, a flood of either grew without
