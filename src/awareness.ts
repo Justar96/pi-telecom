@@ -20,10 +20,10 @@
  * The verdicts are pure decisions; the caller performs the blocking, the warning and the
  * notifications.
  */
+import { join } from "node:path";
 import type { GuardMode } from "./config.ts";
 import { matchesClaim } from "./glob.ts";
-import { join } from "node:path";
-import { displayPath, laneName, type Place, type PlaceCache, placeOf, sameRepo } from "./project.ts";
+import { displayPath, laneIn, laneName, type Place, type PlaceCache, placeOf, sameRepo, workingCheckout } from "./project.ts";
 import type { Claim, Presence } from "./transport.ts";
 import { ago, fileFingerprint, setBounded } from "./util.ts";
 
@@ -105,16 +105,6 @@ export class Awareness {
 			if (place) out.add(place.checkout);
 		}
 		return out;
-	}
-
-	/** Where an agent works now: the checkout of its newest edit, else where it started. */
-	latestCheckout(lane: Presence): string {
-		let newest: { at: number; checkout: string } | null = null;
-		for (const r of lane.recent) {
-			const place = this.placeOf(r.path, lane);
-			if (place && (!newest || r.at > newest.at)) newest = { at: r.at, checkout: place.checkout };
-		}
-		return newest?.checkout ?? lane.projectRoot;
 	}
 
 	noteRead(path: string): void {
@@ -244,7 +234,7 @@ export class Awareness {
 			if (!hit || this.laneNoted.has(key)) continue;
 			keys.push(key);
 			first ??= peer.callsign;
-			lines.push(`${peer.callsign} ${hit.op === "write" ? "rewrote" : "edited"} its copy ${ago(hit.at)}, in ${laneName({ projectRoot: hit.checkout, ...(peer.repo ? { repo: peer.repo } : {}) })}`);
+			lines.push(`${peer.callsign} ${hit.op === "write" ? "rewrote" : "edited"} its copy ${ago(hit.at)}, in ${laneName(laneIn(hit.checkout, peer))}`);
 		}
 		if (!first) return { action: "allow" };
 		return {
@@ -418,7 +408,7 @@ export class Awareness {
 		const tell = warnedAt === undefined || now - warnedAt >= CONTEST_WINDOW_MS;
 		return {
 			action: "warn",
-			note: `⚠ telecom: ${what}, in ${laneName({ projectRoot: this.latestCheckout(peer), ...(peer.repo ? { repo: peer.repo } : {}) })}. Your checkout is separate, so this went through, but the two changes meet when the branches merge${
+			note: `⚠ telecom: ${what}, in ${laneName(laneIn(workingCheckout(peer, this.places), peer))}. Your checkout is separate, so this went through, but the two changes meet when the branches merge${
 				tell ? ` — ${peer.callsign} has been told` : ""
 			}. If they may conflict, agree on one owner: telecom({ action: "send", to: "${peer.callsign}", message: "…" }).`,
 			...(tell ? { contested: { owner: peer, claim, lane: true } } : {}),

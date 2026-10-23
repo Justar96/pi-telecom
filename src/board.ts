@@ -15,7 +15,7 @@
 import { UNRESPONSIVE_MS } from "./awareness.ts";
 import { lineOf } from "./family.ts";
 import { claimMatcher, claimsOverlap, laneRelativePattern } from "./glob.ts";
-import { displayPath, inCheckout, type Lane, laneName, placeOf, readBranch, sameRepo } from "./project.ts";
+import { displayPath, inCheckout, type Lane, laneIn, laneName, type PlaceCache, placeOf, readBranch, sameRepo, workingCheckout } from "./project.ts";
 import type { Presence } from "./transport.ts";
 import { ago, clip, plural, shortId } from "./util.ts";
 
@@ -67,23 +67,13 @@ export function liveClaims(peer: Presence, now: number): Presence["claims"] {
 }
 
 /**
- * Where a peer works: the checkout its newest edit inside the repository landed in, which may be a
- * worktree other than the one it started in (and then so is the branch it works on). An edit
- * outside the repository (shared notes, a scratch script) says nothing about where it works.
+ * Where a peer works (`workingCheckout`): a worktree other than the one it started in, if its
+ * edits say so, and then so is the branch it works on.
  */
-function workplace(peer: Presence): { checkout: string; lane: Lane; branch: string | undefined } {
-	let newest: { at: number; checkout: string } | null = null;
-	for (const r of peer.recent) {
-		const place = placeOf(r.path, peer);
-		if (place && (!newest || r.at > newest.at)) newest = { at: r.at, checkout: place.checkout };
-	}
-	const checkout = newest?.checkout ?? peer.projectRoot;
+function workplace(peer: Presence, cache?: PlaceCache): { checkout: string; lane: Lane; branch: string | undefined } {
+	const checkout = workingCheckout(peer, cache);
 	const read = checkout === peer.projectRoot ? undefined : readBranch(checkout);
-	return {
-		checkout,
-		lane: { projectRoot: checkout, ...(peer.repo ? { repo: peer.repo } : {}) },
-		branch: read ? clip(read, 100) : peer.branch,
-	};
+	return { checkout, lane: laneIn(checkout, peer), branch: read ? clip(read, 100) : peer.branch };
 }
 
 /** One peer, as a block of lines, as `viewer` sees it. `peers` name a subagent's parent. */
@@ -95,8 +85,10 @@ export function describePeer(
 	const now = opts.now ?? Date.now();
 	const lines: string[] = [];
 	const recent = [...peer.recent].sort((a, b) => b.at - a.at).slice(0, RECENT_SHOWN);
-	const places = recent.map((r) => ({ r, place: placeOf(r.path, peer) }));
-	const { checkout: working, lane, branch: branchName } = workplace(peer);
+	// Both walk up from the same files: one call's worth of caching, so no state outlives it.
+	const cache: PlaceCache = new Map();
+	const places = recent.map((r) => ({ r, place: placeOf(r.path, peer, cache) }));
+	const { checkout: working, lane, branch: branchName } = workplace(peer, cache);
 	const where =
 		working === viewer.projectRoot ? "" : sameRepo(lane, viewer) ? `  in ${laneName(lane)}` : `  in ${working}`;
 	const branch = branchName ? ` on ${branchName}` : "";

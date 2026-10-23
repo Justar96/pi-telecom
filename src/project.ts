@@ -90,6 +90,11 @@ export function laneName(peer: Lane): string {
 	return peer.repo === join(peer.projectRoot, ".git") ? `the main checkout (${peer.projectRoot})` : `worktree ${peer.projectRoot}`;
 }
 
+/** Another checkout of `of`'s repository, as a lane: where a peer works when it left its own. */
+export function laneIn(checkout: string, of: Lane): Lane {
+	return { projectRoot: checkout, ...(of.repo ? { repo: of.repo } : {}) };
+}
+
 /**
  * The file in checkout `to` that `path`, touched by a session in checkout `from`, stands for.
  * A path that physically belongs to `to` is `to`'s own file, returned as is: the session reached
@@ -144,6 +149,19 @@ export function placeOf(path: string, lane: Lane, cache?: PlaceCache): Place | n
 		return { checkout: found.checkout, rel: relative(found.checkout, path) };
 	}
 	return isWithin(path, lane.projectRoot) ? { checkout: lane.projectRoot, rel: relative(lane.projectRoot, path) } : null;
+}
+
+/**
+ * Where an agent works now: the checkout of its newest edit in the repository, else where it
+ * started. An edit outside the repository (shared notes, a scratch script) says nothing of it.
+ */
+export function workingCheckout(agent: Lane & { recent: readonly { path: string; at: number }[] }, cache?: PlaceCache): string {
+	let newest: { at: number; checkout: string } | null = null;
+	for (const r of agent.recent) {
+		const place = placeOf(r.path, agent, cache);
+		if (place && (!newest || r.at > newest.at)) newest = { at: r.at, checkout: place.checkout };
+	}
+	return newest?.checkout ?? agent.projectRoot;
 }
 
 /** The checked-out branch of a project root, read from git's own files (no git process). */
