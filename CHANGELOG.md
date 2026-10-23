@@ -6,6 +6,8 @@ All notable changes to `@justar_96/pi-telecom`. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-23
+
 ### Changed
 
 - CI checks Linux, macOS and Windows on Node 24 and 26.
@@ -216,7 +218,8 @@ First release.
   presence repairs itself.
 - Prompt cache unaffected: 84.4 % hit rate with and without telecom on Claude Sonnet 5.5.
 
-[Unreleased]: https://github.com/Justar96/pi-telecom/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/Justar96/pi-telecom/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/Justar96/pi-telecom/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Justar96/pi-telecom/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Justar96/pi-telecom/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/Justar96/pi-telecom/compare/v0.1.0...v0.1.1
