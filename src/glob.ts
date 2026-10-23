@@ -42,7 +42,7 @@ function atLeastVolume(path: string, of: string): string {
 }
 
 /** Translate a glob into an anchored regular expression over absolute posix paths. */
-export function globToRegExp(glob: string): RegExp {
+function globToRegExp(glob: string): RegExp {
 	let out = "";
 	let inGroup = 0;
 	for (let i = 0; i < glob.length; i++) {

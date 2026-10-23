@@ -22,7 +22,7 @@ import { basename } from "node:path";
 import { isId, type Presence } from "./transport.ts";
 
 /** Set by pi-subagents on the runner process that hosts background children. */
-export const SUBAGENT_ENV = {
+const SUBAGENT_ENV = {
 	child: "PI_SUBAGENT_CHILD",
 	parent: "PI_SUBAGENT_PARENT_SESSION",
 	runnerPid: "PI_SUBAGENT_RUNNER_PID",

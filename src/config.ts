@@ -40,7 +40,7 @@ export const ENV = {
 	tickMs: "PI_TELECOM_TICK_MS",
 } as const;
 
-export const DEFAULT_ASK_TIMEOUT_MS = 5 * 60_000;
+const DEFAULT_ASK_TIMEOUT_MS = 5 * 60_000;
 export const MAX_ASK_TIMEOUT_MS = 60 * 60_000;
 const DEFAULT_MAX_WAKES = 6;
 const DEFAULT_CLAIM_TTL_MIN = 120;

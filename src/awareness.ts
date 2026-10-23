@@ -149,10 +149,6 @@ export class Awareness {
 		return this.changes.has(path) || this.views.get(path)?.tainted !== undefined;
 	}
 
-	viewedPaths(): string[] {
-		return [...this.views.keys()];
-	}
-
 	/** The files this agent works with: the ones a peer's change to would earn a notice. */
 	focusPaths(now = Date.now()): Set<string> {
 		const paths = new Set<string>();

@@ -42,9 +42,9 @@ export const WIRE_VERSION = 1;
 /** Largest envelope text, in UTF-8 bytes. */
 export const TEXT_CAP = 32 * 1024;
 /** Largest envelope file, everything included (text, structured data, headers). */
-export const ENVELOPE_CAP = 64 * 1024;
+const ENVELOPE_CAP = 64 * 1024;
 /** Most envelopes handled per drain; the rest wait for the next tick, so a flood cannot stall. */
-export const DRAIN_BATCH = 64;
+const DRAIN_BATCH = 64;
 const ID_PATTERN = /^[A-Za-z0-9._-]{1,128}$/;
 const WINDOWS_DEVICE = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i;
 /** An unparseable presence file younger than this may be mid-rename; the sweep leaves it alone. */
@@ -249,7 +249,7 @@ export function hostBeats(records: readonly Presence[], now = Date.now()): Map<n
 	return beats;
 }
 
-export function isAlive(pid: number, ticks: number | null): boolean {
+function isAlive(pid: number, ticks: number | null): boolean {
 	if (!Number.isSafeInteger(pid) || pid <= 0) return false;
 	if (ticks !== null && process.platform === "linux") return processStartTicks(pid) === ticks;
 	try {
@@ -587,7 +587,7 @@ export interface Transport {
 	 * call. A message file is removed only AFTER `handle` returns (or throws), so a process that
 	 * dies mid-delivery finds it again on restart — at-least-once; the caller dedupes by id.
 	 */
-	drain(id: string, handle: (envelope: Envelope) => void): { handled: number; refused: string[]; failed: string[] };
+	drain(id: string, handle: (envelope: Envelope) => void): { handled: number; failed: string[] };
 	removeInbox(id: string): void;
 	/** Park state for the runtime that replaces this one (a `/reload`). */
 	writeHandoff(id: string, state: unknown): void;
@@ -727,7 +727,7 @@ export function openTransport(root: string): Transport {
 		},
 
 		drain(id, handle) {
-			const result = { handled: 0, refused: [] as string[], failed: [] as string[] };
+			const result = { handled: 0, failed: [] as string[] };
 			if (!isId(id)) return result;
 			const dir = join(inboxRoot, id);
 			let names: string[];
@@ -756,7 +756,7 @@ export function openTransport(root: string): Transport {
 					continue; // temporarily locked, or another drainer took it; do not discard it
 				}
 				if (!envelope || envelope.to !== id) {
-					result.refused.push(name);
+					// Malformed, or not addressed to us: peer data, dropped without a word.
 					remove();
 					continue;
 				}

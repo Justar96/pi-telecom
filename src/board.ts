@@ -77,7 +77,7 @@ function workplace(peer: Presence, cache?: PlaceCache): { checkout: string; lane
 }
 
 /** One peer, as a block of lines, as `viewer` sees it. `peers` name a subagent's parent. */
-export function describePeer(
+function describePeer(
 	peer: Presence,
 	viewer: Presence,
 	opts: { self?: boolean; now?: number; peers?: readonly Presence[]; waits?: boolean } = {},

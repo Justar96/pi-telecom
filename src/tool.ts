@@ -25,7 +25,7 @@ import {
 } from "./render.ts";
 import { clip } from "./util.ts";
 
-export const TOOL_NAME = "telecom";
+const TOOL_NAME = "telecom";
 
 /** Tool results are folded to this many lines until expanded. */
 const RESULT_FOLD_LINES = 8;
@@ -34,10 +34,10 @@ const CALL_PREVIEW_CHARS = 240;
 /** Where a delivery report lists the agents it did not reach; the result renderer looks for it. */
 const FAILED_MARK = " (failed: ";
 
-export const TOOL_ACTIONS = ["board", "send", "ask", "reply", "broadcast", "status", "claim", "release"] as const;
+const TOOL_ACTIONS = ["board", "send", "ask", "reply", "broadcast", "status", "claim", "release"] as const;
 export type ToolAction = (typeof TOOL_ACTIONS)[number];
 
-export const TOOL_PARAMETERS = Type.Object({
+const TOOL_PARAMETERS = Type.Object({
 	// StringEnum, not a Union of Literals: Google models reject the anyOf form.
 	action: StringEnum(TOOL_ACTIONS, { description: "What to do." }),
 	to: Type.Optional(Type.String({ description: "send/ask: callsign, session name or id (as the board shows it)." })),
