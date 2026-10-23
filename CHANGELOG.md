@@ -6,6 +6,17 @@ All notable changes to `@justar_96/pi-telecom`. The format follows
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-10-23
+
+### Fixed
+
+- A short reply to the agent ("continue", "yes B is good") no longer replaces the task peers
+  see. One-word prompts never become the task, and a task set with `status` or `/telecom run`
+  gives way only to a prompt of 10 words or more. Each replacement went to every teammate's
+  brief as news.
+- A session started in a folder before `git init` joins the repository's team once the folder
+  is a checkout, so agents in worktrees created later see it as a teammate.
+
 ## [0.4.0] - 2026-10-23
 
 ### Changed
@@ -218,7 +229,8 @@ First release.
   presence repairs itself.
 - Prompt cache unaffected: 84.4 % hit rate with and without telecom on Claude Sonnet 5.5.
 
-[Unreleased]: https://github.com/Justar96/pi-telecom/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/Justar96/pi-telecom/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/Justar96/pi-telecom/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/Justar96/pi-telecom/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Justar96/pi-telecom/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Justar96/pi-telecom/compare/v0.1.1...v0.2.0
