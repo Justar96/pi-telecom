@@ -5,13 +5,15 @@
 import assert from "node:assert/strict";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { after, test } from "node:test";
+import { afterEach, test } from "node:test";
 import { findProjectRoot, findRepo } from "../src/project.ts";
 import { openTransport, processStartTicks, WIRE_VERSION } from "../src/transport.ts";
 import { escapeRegExp } from "../src/util.ts";
 import { eventually, makeProject, makeWorktree, NOTICE_WAIT_MS, PLAIN_THEME, Session, session, sleep, stopSessions, track } from "./harness.ts";
 
-after(stopSessions);
+// Per test: every live session ticks and reads every presence record, so sessions left over
+// from earlier tests slow later ones until they time out (Windows file I/O especially).
+afterEach(stopSessions);
 
 test("agents in one project get callsigns and see each other; other projects stay off the board", async () => {
 	const proj = makeProject("p-board");
@@ -263,6 +265,16 @@ test("claims: overlap refused, path held back once with owner told, release tell
 	const overlap = await b.tool({ action: "claim", paths: ["src"] });
 	assert.ok(overlap.isError);
 	assert.match(overlap.text, /overlaps alpha's claim "src\/auth\/\*\*"/);
+	assert.match(overlap.text, /telecom\(\{ action: "ask", to: "alpha", message: "…" \}\)/, "the refusal names whom to ask");
+	assert.doesNotMatch(overlap.text, /Nothing has changed/);
+	assert.match((await b.tool({ action: "claim", paths: ["src"] })).text, /Nothing has changed since this was last refused/);
+	// A held path does not cost the free ones.
+	const partial = await b.tool({ action: "claim", paths: ["src/auth/login.ts", "docs/auth.md"] });
+	assert.ok(!partial.isError, partial.text);
+	assert.match(partial.text, /^claimed docs\/auth\.md\b/);
+	assert.match(partial.text, /Not claimed: "src\/auth\/login\.ts" overlaps alpha's claim/);
+	assert.deepEqual(partial.details.refused, ["src/auth/login.ts"]);
+	await b.tool({ action: "release", paths: ["docs/auth.md"] });
 
 	await b.read("auth.ts");
 	const first = await b.edit("auth.ts", "export {}", "export const x = 1;");
@@ -368,13 +380,13 @@ test("briefs with many agents: peers near your work are described, the rest are 
 	await c.prompt("now the api tests");
 	await c.tool({ action: "claim", paths: ["test/api"] });
 	await b.prompt("now b.ts");
-	const delta = (await a.prompt("next"))?.message?.content ?? "";
-	assert.match(delta, /bravo is now on: now b\.ts/);
-	assert.doesNotMatch(delta, /charlie/);
+	// A near peer's new task alone, right after the last brief, waits for other news.
+	assert.equal(await a.prompt("next"), undefined, "a task change alone is held for a while");
 	// ...until a claim covers this agent's files: then it is near, and described as it is now.
 	await c.tool({ action: "claim", paths: ["a.ts"] });
 	const claimed = (await a.prompt("next"))?.message?.content ?? "";
 	assert.match(claimed, /• now working near you: charlie \[busy\][^\n]*\n\s+task: now the api tests[^\n]*\n\s+claims: [^\n]*a\.ts/);
+	assert.match(claimed, /bravo is now on: now b\.ts/, "the held task change rides along with the news");
 	await c.tool({ action: "release", paths: ["a.ts"] });
 	assert.match((await a.prompt("next"))?.message?.content ?? "", /charlie released a\.ts/);
 
@@ -383,7 +395,11 @@ test("briefs with many agents: peers near your work are described, the rest are 
 	const near = (await a.prompt("again"))?.message?.content ?? "";
 	assert.match(near, /• now working near you: echo \[busy\][^\n]*\n\s+task: the build/);
 	await e.prompt("still the build, and a.ts");
-	assert.match((await a.prompt("again"))?.message?.content ?? "", /echo is now on: still the build, and a\.ts/);
+	assert.equal(await a.prompt("again"), undefined, "a task change alone is held for a while");
+	await b.tool({ action: "claim", paths: ["b.ts"] });
+	const both = (await a.prompt("again"))?.message?.content ?? "";
+	assert.match(both, /echo is now on: still the build, and a\.ts/);
+	assert.match(both, /bravo claimed b\.ts/);
 	assert.equal(await a.prompt("again"), undefined, "nothing changed");
 });
 
@@ -750,6 +766,41 @@ test("lanes: a claim made in another worktree is advisory — noted, the owner t
 	const claim = await b.tool({ action: "claim", paths: ["src/y.ts"] });
 	assert.ok(!claim.isError, claim.text);
 	assert.match(claim.text, /Note: "src\/y\.ts" overlaps alpha's claim "src\/\*\*" .* both claims stand/);
+});
+
+test("lanes: agents started in the main checkout but working in worktrees of their own are told apart by where they edit", async () => {
+	const proj = makeProject("p-lane-started-main");
+	const wtA = makeWorktree(proj, "wa", "lane-a");
+	const wtB = makeWorktree(proj, "wb", "lane-b");
+	for (const wt of [wtA, wtB]) {
+		mkdirSync(join(wt, "src"), { recursive: true });
+		writeFileSync(join(wt, "src", "x.ts"), "x\n");
+	}
+	const a = await session(proj);
+	const b = await session(proj);
+	const c = await session(proj);
+	await a.tool({ action: "claim", paths: ["src/x.ts", "src/y.ts"], message: "parser" });
+	await a.read(join(wtA, "src", "x.ts"));
+	assert.equal((await a.edit(join(wtA, "src", "x.ts"), "x", "A")).blocked, undefined);
+	// The board shows where alpha works (its worktree and branch), paths relative to it, and a
+	// note shared by claims made together once.
+	await eventually(async () => {
+		const board = (await b.tool({ action: "board" })).text;
+		assert.match(board, /• alpha \[\w+\] on lane-a {2}in worktree .*wa {2}id/);
+		assert.match(board, /claims: src\/x\.ts, src\/y\.ts — parser\n/);
+		assert.match(board, /recently changed: src\/x\.ts \(/);
+	});
+	// bravo changes its own copy: separate files, so only a note, naming where alpha works.
+	await b.read(join(wtB, "src", "x.ts"));
+	const lane = await b.edit(join(wtB, "src", "x.ts"), "x", "B");
+	assert.equal(lane.blocked, undefined, "another worktree is never held back");
+	assert.match(lane.note ?? "", /inside alpha's claim "src\/x\.ts" \(parser\).* in worktree .*wa\b/);
+	assert.match(lane.note ?? "", /alpha edited its copy .* in worktree .*wa\b/);
+	await eventually(() => assert.equal(a.sentOf("telecom-claim").length, 1));
+	// charlie reaches into the worktree alpha works in: one copy, so the claim binds.
+	await c.read(join(wtA, "src", "x.ts"));
+	const held = await c.edit(join(wtA, "src", "x.ts"), "A", "C");
+	assert.match(held.blocked ?? "", /inside alpha's claim "src\/x\.ts"/);
 });
 
 test("lanes: a claim in another worktree never hides a binding claim in this checkout", async () => {

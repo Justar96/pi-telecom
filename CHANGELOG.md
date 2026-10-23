@@ -9,8 +9,25 @@ All notable changes to `@justar_96/pi-telecom`. The format follows
 ### Changed
 
 - CI checks Linux, macOS and Windows on Node 24 and 26.
+- A claim with some paths held by a peer grants the free ones, names the owner in the suggested
+  `ask`, and says so when an identical refused claim is retried.
+- The board and briefs show a peer's worktree and branch where its recent edits landed, paths
+  relative to that checkout, and a note shared by several claims once.
+- A team update that would only report task changes waits up to 5 minutes for other news;
+  the changes are told then, never dropped.
+- A tool guideline keeps broadcasts for what every agent must act on, and the reply hint under
+  peer messages is shorter.
 
 ### Fixed
+
+- Claims, lane notes and change notices work when agents start in one checkout but edit sibling
+  worktrees: checkouts are told apart by where the edited file lies. Before, such edits were
+  in neither checkout and skipped.
+- Windows: a presence or message write retries the rename briefly when a peer, an indexer or a
+  virus scanner holds the target open (`EPERM`, `EACCES`, `EBUSY`). A single failed heartbeat no
+  longer warns, and the warning no longer repeats for every temp file name.
+- The scenario tests stop their sessions after each test, so sessions left over from earlier
+  tests no longer slow the rest until they time out.
 
 - Tests no longer race a slow runner: the late-answer reload test waits until the peer holds the
   ask, change-notice waits leave room for slow CI machines, and a worktree path is escaped before

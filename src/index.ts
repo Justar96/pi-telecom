@@ -26,6 +26,7 @@
  * Messaging is derived from @tinoy/pi-ipc (MIT, github.com/tinoy1336/pi-extensions); the team
  * layer — projects, callsigns, briefs, change notices, claims and the guard — is new.
  */
+import { join } from "node:path";
 import type {
 	AgentToolUpdateCallback,
 	ExtensionAPI,
@@ -87,6 +88,8 @@ const RECENT_CAP = 12;
 /** Peer changes arriving within this window are folded into one notice. */
 const NOTICE_COALESCE_MS = 1_200;
 const HEARTBEAT_MS = 15_000;
+/** Consecutive failed presence writes before the human is warned; one is a passing file lock. */
+const PRESENCE_FAILURES_REPORTED = 3;
 /** The team is re-read every this many ticks; the inbox is drained on every tick. */
 const TEAM_REFRESH_TICKS = 2;
 /** Joins and leaves seen in the first ticks are the team as it was at startup, not news. */
@@ -98,6 +101,8 @@ const WAKE_WINDOW_MS = 60_000;
 /** Own task and claim notes as peers see them. */
 const TASK_CAP = 160;
 const CLAIM_NOTE_CAP = 120;
+/** A claim refused again for the same conflicts within this window is a blind retry. */
+const CLAIM_RETRY_WINDOW_MS = 10 * 60_000;
 /** Per-call bookkeeping kept between tool_call and tool_result; bounded in case a result never comes. */
 const CALL_MAP_CAP = 256;
 /** Envelope ids already handled, so an at-least-once redelivery is not handled twice. */
@@ -162,6 +167,9 @@ export default function telecom(pi: ExtensionAPI): void {
 	let timer: ReturnType<typeof setInterval> | null = null;
 	let tickCount = 0;
 	let lastHeartbeat = 0;
+	let presenceFailures = 0;
+	/** The last claim refused for a conflict: an identical retry is told nothing has changed. */
+	let lastClaimRefusal: { key: string; at: number } | null = null;
 	let peersCache: Presence[] = [];
 	/** The team as of the last refresh, with each member's role (subagents come and go quietly). */
 	let teamIds = new Map<string, Presence["role"]>();
@@ -243,7 +251,10 @@ export default function telecom(pi: ExtensionAPI): void {
 		if (name) self.name = name;
 		else delete self.name;
 		const written = transport.writePresence(self);
-		if (!written.ok) report("presence", written.reason);
+		// One failed write leaves the previous record in place and the next publish retries it, so
+		// only a write that keeps failing is worth a warning.
+		presenceFailures = written.ok ? 0 : presenceFailures + 1;
+		if (!written.ok && presenceFailures >= PRESENCE_FAILURES_REPORTED) report("presence", written.reason);
 		lastHeartbeat = Date.now();
 	}
 
@@ -597,7 +608,7 @@ export default function telecom(pi: ExtensionAPI): void {
 				}
 				inject(
 					MESSAGE_TYPES.message,
-					`**📡 Message from ${from}${human}**\n\n${env.text}\n\n(Reply only if it needs one: telecom({ action: "send", to: "${from}", message: "…" }).)`,
+					`**📡 Message from ${from}${human}**\n\n${env.text}\n\n(Reply only if needed: action "send", to "${from}".)`,
 					{ ...base, tone: "accent" },
 					"wake",
 				);
@@ -727,13 +738,21 @@ export default function telecom(pi: ExtensionAPI): void {
 		// A sender that joined since the last team refresh is not cached yet: look again before
 		// telling its own copy of a file from this agent's. Gone already: go by where the path lies.
 		const sender = peersCache.find((p) => p.id === env.from) ?? readPeers().find((p) => p.id === env.from);
-		const mine = !sender
-			? isWithin(data.path, self.projectRoot)
-				? data.path
-				: null
-			: sender.projectRoot !== self.projectRoot && sameRepo(sender, self)
-				? inCheckout(data.path, sender.projectRoot, self.projectRoot)
-				: data.path;
+		let mine: string | null = data.path;
+		if (!sender) {
+			if (!isWithin(data.path, self.projectRoot)) mine = null;
+		} else if (sameRepo(sender, self)) {
+			// Lanes are told apart by where the files lie: agents started in one checkout may each
+			// work in a worktree of their own. A file in a checkout this agent works in (or one it
+			// has looked at) is this agent's very file; else its copy here is the one it has looked
+			// at, or the one in its own checkout.
+			const theirs = awareness.placeOf(data.path, sender);
+			const checkouts = awareness.checkoutsOf(self);
+			if (theirs && !checkouts.has(theirs.checkout) && !awareness.hasView(data.path)) {
+				const copies = [...checkouts].map((c) => join(c, theirs.rel));
+				mine = copies.find((c) => awareness.hasView(c)) ?? join(self.projectRoot, theirs.rel);
+			}
+		}
 		// `mine === data.path` from another lane: the peer reached into this checkout (nested in
 		// its own) and changed this agent's very file, so it is an ordinary peer change below.
 		if (mine !== data.path) {
@@ -1538,8 +1557,12 @@ export default function telecom(pi: ExtensionAPI): void {
 	 * are only worth a note (the files are separate until the merge). This agent's lineal family
 	 * never conflicts: a subagent may claim part of its parent's claim, and the other way round.
 	 */
-	function claimConflicts(me: Presence, patterns: readonly string[], now: number): { conflicts: string[]; lanes: string[] } {
-		const conflicts: string[] = [];
+	function claimConflicts(
+		me: Presence,
+		patterns: readonly string[],
+		now: number,
+	): { conflicts: { mine: string; owner: string; what: string }[]; lanes: string[] } {
+		const conflicts: { mine: string; owner: string; what: string }[] = [];
 		const lanes: string[] = [];
 		const peers = readPeers();
 		const family = lineOf(me, peers);
@@ -1554,7 +1577,7 @@ export default function telecom(pi: ExtensionAPI): void {
 					if (!claimsOverlap(mine, pattern, me.projectRoot)) continue;
 					const what = `"${mine}" overlaps ${peer.callsign}'s claim "${theirs.pattern}"${theirs.note ? ` (${theirs.note})` : ""}`;
 					if (otherLane) lanes.push(`${what} in ${laneName(peer)}`);
-					else conflicts.push(what);
+					else conflicts.push({ mine, owner: peer.callsign, what });
 				}
 			}
 		}
@@ -1564,16 +1587,28 @@ export default function telecom(pi: ExtensionAPI): void {
 	function claimAction({ me, params, message }: ActionCall): ToolResult {
 		const patterns = (params.paths ?? []).map((p) => p.trim()).filter(Boolean);
 		if (patterns.length === 0) return fail('"claim" needs `paths` — project-relative paths or globs');
-		const now = Date.now();
-		const { conflicts, lanes } = claimConflicts(me, patterns, now);
-		if (conflicts.length > 0) {
-			return fail(`${conflicts.join("; ")}. Agree on a split first: telecom({ action: "ask", to: "…", message: "…" }).`);
-		}
 		const outside = patterns.filter((p) => !isWithin(absolutePattern(p, me.projectRoot), me.projectRoot));
 		if (outside.length > 0) return fail(`claims must be inside the project (${me.projectRoot}): ${outside.join(", ")}`);
+		const now = Date.now();
+		const { conflicts, lanes } = claimConflicts(me, patterns, now);
+		// A held path does not cost the free ones: models that got an all-or-nothing refusal
+		// tended to drop the whole claim and edit unclaimed.
+		const held = new Set(conflicts.map((c) => c.mine));
+		const granted = patterns.filter((p) => !held.has(p));
+		let refusal = "";
+		if (conflicts.length > 0) {
+			const owners = [...new Set(conflicts.map((c) => c.owner))];
+			const key = `${[...held].sort().join("\u0000")}\u0001${owners.sort().join("\u0000")}`;
+			const repeated = lastClaimRefusal?.key === key && now - lastClaimRefusal.at < CLAIM_RETRY_WINDOW_MS;
+			lastClaimRefusal = { key, at: now };
+			refusal = `${conflicts.map((c) => c.what).join("; ")}. ${
+				repeated ? `Nothing has changed since this was last refused: retrying will not help. ` : ""
+			}Ask ${owners.join(" or ")} to release or split it — telecom({ action: "ask", to: "${owners[0]}", message: "…" }) — or pick other work.`;
+			if (granted.length === 0) return fail(refusal, { refused: [...held] });
+		}
 		// Stored without closing punctuation (a clip "…" stays): it is quoted mid-sentence elsewhere.
 		const note = message ? clip(message, CLAIM_NOTE_CAP).replace(/[\s.!?]+$/, "") : "";
-		for (const pattern of patterns) {
+		for (const pattern of granted) {
 			me.claims = me.claims.filter((c) => c.pattern !== pattern);
 			me.claims.push({ pattern, since: now, expiresAt: now + cfg.claimTtlMs, ...(note ? { note } : {}) });
 		}
@@ -1584,8 +1619,14 @@ export default function telecom(pi: ExtensionAPI): void {
 				? ` Note: ${lanes.join("; ")}. Your checkouts are separate, so both claims stand, but the work meets when the branches merge; agree on one owner if it may conflict.`
 				: "";
 		return ok(
-			`claimed ${patterns.join(", ")}${note ? ` — ${note}` : ""}. Peers editing there are held back and you are told. Release with telecom({ action: "release" }) when done; idle claims expire after ${claimTtlMinutes()} min.${overlap}`,
-			{ claims: me.claims.map((c) => c.pattern), ...(lanes.length > 0 ? { laneOverlaps: lanes.length } : {}) },
+			`claimed ${granted.join(", ")}${note ? ` — ${note}` : ""}. Peers editing there are held back and you are told. Release with telecom({ action: "release" }) when done; idle claims expire after ${claimTtlMinutes()} min.${overlap}${
+				refusal ? `\nNot claimed: ${refusal}` : ""
+			}`,
+			{
+				claims: me.claims.map((c) => c.pattern),
+				...(held.size > 0 ? { refused: [...held] } : {}),
+				...(lanes.length > 0 ? { laneOverlaps: lanes.length } : {}),
+			},
 		);
 	}
 

@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, readdirSync, realpathSync, writeFileSync } from
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { renderBrief, TASK_ONLY_HOLD_MS } from "../src/board.ts";
 import { childCallsign, mustYield, pickCallsign } from "../src/callsign.ts";
 import { readConfig } from "../src/config.ts";
 import { detectLineage, lineOf, sessionIdOfFile } from "../src/family.ts";
@@ -453,4 +454,18 @@ test("transport: explicit task wakes are accepted only on human direct messages"
 	assert.equal(parseEnvelope({ ...env, human: true })?.triggerTurn, true);
 	assert.equal(parseEnvelope({ ...env, human: true, triggerTurn: "true" })?.triggerTurn, undefined);
 	assert.equal(parseEnvelope({ ...env, human: true, kind: "broadcast" })?.triggerTurn, undefined);
+});
+
+test("briefs: a task change alone is held, then told once the hold has passed", () => {
+	const peer = (id: string, task: string): Presence => ({
+		v: 1, id, callsign: id, pid: process.pid, ticks: null, cwd: "/p", projectRoot: "/p", role: "main",
+		state: "busy", task, claims: [], recent: [], startedAt: 1, heartbeatAt: Date.now(),
+	});
+	const me = peer("alpha", "");
+	const first = renderBrief(me, [me, peer("bravo", "one")], null);
+	assert.match(first.text ?? "", /task: one/);
+	const held = renderBrief(me, [me, peer("bravo", "two")], first.state);
+	assert.equal(held.text, null, "right after a brief, a task change alone waits");
+	const later = renderBrief(me, [me, peer("bravo", "two")], { ...held.state, toldAt: Date.now() - TASK_ONLY_HOLD_MS - 1 });
+	assert.match(later.text ?? "", /bravo is now on: two/, "held, never dropped");
 });

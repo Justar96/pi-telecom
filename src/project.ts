@@ -105,6 +105,47 @@ export function inCheckout(path: string, from: string, to: string): string | nul
 	return join(to, relative(from, path));
 }
 
+/** Where a file lies in a repository: the checkout that physically holds it, and its path there. */
+export interface Place {
+	checkout: string;
+	rel: string;
+}
+
+/** A directory's nearest checkout and that checkout's repository, as `placeOf` caches them. */
+export type PlaceCache = Map<string, { checkout: string; repo: string } | null>;
+const PLACE_CACHE_CAP = 1_024;
+
+/**
+ * Where `path` lies in `lane`'s repository. An agent's checkout is where it STARTED, but it may
+ * edit any worktree of the repository (a common setup: start in the main checkout, work in
+ * `../repo-<agent>`), so the checkout is found from the file itself: the nearest folder holding
+ * `.git` (a worktree nested in another wins), when it belongs to the repository. Otherwise a path
+ * inside the lane's own checkout (a submodule, a folder outside git) is placed there, and
+ * anything else is in no checkout of the repository: `null`. `cache` saves the walk per folder.
+ */
+export function placeOf(path: string, lane: Lane, cache?: PlaceCache): Place | null {
+	const dir = dirname(path);
+	let found = cache?.get(dir);
+	if (found === undefined) {
+		found = null;
+		for (let at = dir; ; at = dirname(at)) {
+			if (existsSync(join(at, ".git"))) {
+				found = { checkout: at, repo: findRepo(at) };
+				break;
+			}
+			if (dirname(at) === at) break;
+		}
+		if (cache) {
+			if (cache.size >= PLACE_CACHE_CAP) cache.clear();
+			cache.set(dir, found);
+		}
+	}
+	if (found && (found.checkout === lane.projectRoot || (lane.repo !== undefined && found.repo === lane.repo))) {
+		return { checkout: found.checkout, rel: relative(found.checkout, path) };
+	}
+	return isWithin(path, lane.projectRoot) ? { checkout: lane.projectRoot, rel: relative(lane.projectRoot, path) } : null;
+}
+
 /** The checked-out branch of a project root, read from git's own files (no git process). */
 export function readBranch(root: string): string | undefined {
 	try {

@@ -51,6 +51,8 @@ const WINDOWS_DEVICE = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i;
 const UNPARSEABLE_GRACE_MS = 5_000;
 /** An inbox without a presence record is kept this long, so a starting session can publish first. */
 const ORPHAN_INBOX_GRACE_MS = 60_000;
+/** Waits between attempts to rename over a file Windows reports as locked (77 ms at most). */
+const RENAME_RETRY_MS = [2, 5, 10, 20, 40];
 /**
  * A subagent shares its pid with the process hosting it (the parent's pi for a foreground child,
  * a pi-subagents runner for a background one), so a live pid does not prove the child is live. A
@@ -512,13 +514,34 @@ export function parseEvent(envelope: Envelope): TelecomEvent | null {
 // files
 
 let tmpCounter = 0;
+const sleeper = new Int32Array(new SharedArrayBuffer(4));
+
+/**
+ * Windows refuses to replace a file that another process holds open (a peer reading presence
+ * every second, an indexer, a virus scanner) with EPERM, EACCES or EBUSY. The lock lasts
+ * milliseconds, so retry a few times before giving up (graceful-fs and write-file-atomic do the
+ * same). The waits block the loop, so their sum stays small.
+ */
+function renameRetrying(from: string, to: string): void {
+	for (let attempt = 0; ; attempt++) {
+		try {
+			renameSync(from, to);
+			return;
+		} catch (error) {
+			const delay = RENAME_RETRY_MS[attempt];
+			const locked = ["EPERM", "EACCES", "EBUSY"].some((code) => isErrno(error, code));
+			if (process.platform !== "win32" || !locked || delay === undefined) throw error;
+			Atomics.wait(sleeper, 0, 0, delay);
+		}
+	}
+}
 
 function writeAtomic(dir: string, name: string, body: string): Result<object> {
 	tmpCounter += 1;
 	const tmp = join(dir, `.tmp-${process.pid}-${tmpCounter}`);
 	try {
 		writeFileSync(tmp, body, { mode: 0o600 });
-		renameSync(tmp, join(dir, name));
+		renameRetrying(tmp, join(dir, name));
 		return { ok: true };
 	} catch (error) {
 		try {
@@ -526,7 +549,10 @@ function writeAtomic(dir: string, name: string, body: string): Result<object> {
 		} catch {
 			/* A Windows sharing violation can lock the temp file too; preserve the write error. */
 		}
-		return { ok: false, reason: `writing ${name} failed: ${messageOf(error)}` };
+		// Drop the quoted paths: the temp name changes on every write, and callers report each
+		// distinct reason once, so a path in it would repeat the same warning on every heartbeat.
+		const reason = messageOf(error).replace(/ '[^']*'(?: -> '[^']*')?/g, "");
+		return { ok: false, reason: `writing ${name} failed: ${reason}` };
 	}
 }
 

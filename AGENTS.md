@@ -95,6 +95,10 @@ uninitialized binding.
   git common directory (`findRepo`). Each checkout is a lane. Views, stale checks and change
   notices are per checkout (a peer in another worktree edits its own copy); claims and
   overlapping edits are compared across lanes by repository-relative path, and are advisory there.
+  A file's lane is the checkout it physically lies in (`placeOf`), not the session's starting
+  checkout: agents often start in the main checkout and edit worktrees of their own. A claim
+  binds in every checkout its owner works in (`Awareness.checkoutsOf`: where it started, plus
+  where its recent edits landed).
   `repo` is optional on the wire, so a peer without it is grouped by `projectRoot` alone
   (`sameRepo`). A pi-subagents child publishes `role: "child"` and `parent`; its lineal family
   (`lineOf`) is exempt from each other's claims, and briefs fold it into its parent.
@@ -261,7 +265,9 @@ The exact types are in `dist/core/extensions/types.d.ts`.
   directory.
 - **Scenario tests** (`test/team.test.ts`): real extension instances via `test/harness.ts`.
   - Each test calls `makeProject("p-<unique>")`, so tests can't see each other.
-  - `session(dir)` starts a session and registers it for cleanup.
+  - `session(dir)` starts a session and registers it for cleanup. Scenario files call
+    `afterEach(stopSessions)`: every live session ticks and reads every presence record, so
+    sessions kept for a whole file slow later tests until they time out.
   - `eventually()` polls asynchronous delivery; never use a fixed `sleep` as the assertion.
   - The harness sets `PI_TELECOM_TICK_MS=20` and a scratch `PI_TELECOM_DIR` *before* importing
     the extension.

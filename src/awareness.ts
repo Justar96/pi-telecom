@@ -22,7 +22,8 @@
  */
 import type { GuardMode } from "./config.ts";
 import { matchesClaim } from "./glob.ts";
-import { displayPath, inCheckout, laneName, sameRepo } from "./project.ts";
+import { join } from "node:path";
+import { displayPath, laneName, type Place, type PlaceCache, placeOf, sameRepo } from "./project.ts";
 import type { Claim, Presence } from "./transport.ts";
 import { ago, fileFingerprint, setBounded } from "./util.ts";
 
@@ -88,6 +89,33 @@ export class Awareness {
 	private readonly staleBlocks = new Map<string, { changeAt: number; count: number }>();
 	/** Peer and path pairs already told about a change in another lane: once is enough. */
 	private readonly laneNoted = new Map<string, true>();
+	/** Each folder's checkout, so placing a path does not walk the tree on every tool call. */
+	private readonly places: PlaceCache = new Map();
+
+	/** Where `path` lies in `lane`'s repository (see `placeOf`). */
+	placeOf(path: string, lane: Presence): Place | null {
+		return placeOf(path, lane, this.places);
+	}
+
+	/** The checkouts an agent works in: where it started, and wherever its recent edits landed. */
+	checkoutsOf(lane: Presence): Set<string> {
+		const out = new Set([lane.projectRoot]);
+		for (const r of lane.recent) {
+			const place = this.placeOf(r.path, lane);
+			if (place) out.add(place.checkout);
+		}
+		return out;
+	}
+
+	/** Where an agent works now: the checkout of its newest edit, else where it started. */
+	latestCheckout(lane: Presence): string {
+		let newest: { at: number; checkout: string } | null = null;
+		for (const r of lane.recent) {
+			const place = this.placeOf(r.path, lane);
+			if (place && (!newest || r.at > newest.at)) newest = { at: r.at, checkout: place.checkout };
+		}
+		return newest?.checkout ?? lane.projectRoot;
+	}
 
 	noteRead(path: string): void {
 		this.views.set(path, {
@@ -194,25 +222,34 @@ export class Awareness {
 	 * will meet when the branches merge.
 	 */
 	checkLanes(path: string, peers: readonly Presence[], self: Presence): Verdict {
+		// Lanes are told apart by where the files lie, not where the agents started: two agents
+		// started in one checkout may each work in a worktree of their own.
+		const mine = this.placeOf(path, self);
+		if (!mine) return { action: "allow" };
 		const lines: string[] = [];
 		const keys: string[] = [];
 		let first: string | null = null;
 		for (const peer of peers) {
-			if (peer.id === self.id || peer.projectRoot === self.projectRoot || !sameRepo(peer, self)) continue;
-			const theirs = inCheckout(path, self.projectRoot, peer.projectRoot);
-			// The very same file (a checkout nested in the other): the stale check covers it.
-			if (theirs === path) continue;
-			const hit = theirs ? peer.recent.find((r) => r.path === theirs) : undefined;
+			if (peer.id === self.id || !sameRepo(peer, self)) continue;
+			let hit: { op: "edit" | "write"; at: number; checkout: string } | undefined;
+			for (const r of peer.recent) {
+				const theirs = this.placeOf(r.path, peer);
+				// The very same file (one checkout): the stale check covers it.
+				if (theirs && theirs.checkout !== mine.checkout && theirs.rel === mine.rel) {
+					hit = { op: r.op, at: r.at, checkout: theirs.checkout };
+					break;
+				}
+			}
 			const key = `${peer.id}\u0000${path}`;
 			if (!hit || this.laneNoted.has(key)) continue;
 			keys.push(key);
 			first ??= peer.callsign;
-			lines.push(`${peer.callsign} ${hit.op === "write" ? "rewrote" : "edited"} its copy ${ago(hit.at)}, in ${laneName(peer)}`);
+			lines.push(`${peer.callsign} ${hit.op === "write" ? "rewrote" : "edited"} its copy ${ago(hit.at)}, in ${laneName({ projectRoot: hit.checkout, ...(peer.repo ? { repo: peer.repo } : {}) })}`);
 		}
 		if (!first) return { action: "allow" };
 		return {
 			action: "warn",
-			note: `⚠ telecom: ${displayPath(path, self.projectRoot)} — ${lines.join("; ")}. Your checkouts are separate, so this went through, but the two changes meet when the branches merge. If they may conflict, agree on one owner: telecom({ action: "send", to: "${first}", message: "…" }).`,
+			note: `⚠ telecom: ${displayPath(path, mine.checkout)} — ${lines.join("; ")}. Your checkouts are separate, so this went through, but the two changes meet when the branches merge. If they may conflict, agree on one owner: telecom({ action: "send", to: "${first}", message: "…" }).`,
 			laneNotes: keys,
 		};
 	}
@@ -315,22 +352,26 @@ export class Awareness {
 	): Verdict {
 		if (mode === "off") return { action: "allow" };
 		const now = Date.now();
-		const root = self.projectRoot;
+		const mine = this.placeOf(path, self);
+		if (!mine) return { action: "allow" };
 		// Advisory matches are kept aside while the scan goes on: a binding claim further down the
 		// list (a responsive owner in this checkout) must still hold the edit back.
 		let lane: { peer: Presence; claim: Claim; what: string } | null = null;
 		let unenforced: string | null = null;
 		for (const peer of peers) {
 			if (peer.id === self.id || exempt.has(peer.id) || !sameRepo(peer, self)) continue;
-			// A claim is written against its owner's checkout. `theirs` is the file there that this
-			// edit stands for: the target itself when it physically lies in the owner's checkout
-			// (then the claim binds, from any lane), else this lane's copy (then it is advisory).
-			const theirs = inCheckout(path, root, peer.projectRoot);
-			if (theirs === null) continue;
-			const otherLane = theirs !== path;
+			// A claim is written against its owner's checkout (where it started). `theirs` is the
+			// file there that this edit stands for. The claim binds when it names this very file, or
+			// when its owner works in the checkout this file lies in (its recent edits landed there):
+			// then both agents change one copy. Otherwise the copies are separate: advisory.
+			const theirs = join(peer.projectRoot, mine.rel);
+			const sharedCheckout = this.checkoutsOf(peer).has(mine.checkout);
 			for (const claim of peer.claims) {
-				if (claim.expiresAt <= now || !matchesClaim(theirs, claim.pattern, peer.projectRoot)) continue;
-				const shown = displayPath(path, root);
+				if (claim.expiresAt <= now) continue;
+				const exact = matchesClaim(path, claim.pattern, peer.projectRoot);
+				if (!exact && !matchesClaim(theirs, claim.pattern, peer.projectRoot)) continue;
+				const otherLane = !exact && !sharedCheckout;
+				const shown = displayPath(path, mine.checkout);
 				const what = `${shown} is inside ${peer.callsign}'s claim "${claim.pattern}"${
 					claim.note ? ` (${claim.note})` : ""
 				}, held since ${ago(claim.since)}`;
@@ -377,7 +418,7 @@ export class Awareness {
 		const tell = warnedAt === undefined || now - warnedAt >= CONTEST_WINDOW_MS;
 		return {
 			action: "warn",
-			note: `⚠ telecom: ${what}, in ${laneName(peer)}. Your checkout is separate, so this went through, but the two changes meet when the branches merge${
+			note: `⚠ telecom: ${what}, in ${laneName({ projectRoot: this.latestCheckout(peer), ...(peer.repo ? { repo: peer.repo } : {}) })}. Your checkout is separate, so this went through, but the two changes meet when the branches merge${
 				tell ? ` — ${peer.callsign} has been told` : ""
 			}. If they may conflict, agree on one owner: telecom({ action: "send", to: "${peer.callsign}", message: "…" }).`,
 			...(tell ? { contested: { owner: peer, claim, lane: true } } : {}),

@@ -165,8 +165,9 @@ telecom({ action: "claim", paths: ["src/auth/**"], message: "refactor" })
 ```
 
 Patterns are project-relative paths or globs (`src/auth`, `src/**/*.test.ts`, `src/{api,db}/**`).
-A claim that overlaps a peer's claim in the same checkout is refused. Overlaps with a claim in
-another worktree are allowed, with a note, and a subagent may claim part of its parent's claim.
+A path that overlaps a peer's claim in the same checkout is not claimed: the rest of the call is
+granted, and the result names the owner to ask. Overlaps with a claim in another worktree are
+allowed, with a note, and a subagent may claim part of its parent's claim.
 A claim ends when it is released, when its session ends, or after 2 hours without an edit inside
 it (`PI_TELECOM_CLAIM_TTL_MIN`). When a claim ends, peers that were held back by it are told.
 
@@ -193,6 +194,11 @@ when the branches merge:
 An edit that reaches into another checkout's own files, through an absolute path or a worktree
 nested inside the main checkout, is treated like an edit in that checkout: claims bind and the
 guard checks it. A submodule is its own repository, and a folder outside git is its own project.
+
+Checkouts are told apart by where the edited files are, not by where each session started. If
+every agent starts in the main checkout and works in a worktree of its own, each agent's edits
+are compared as edits in that worktree. A claim binds an edit in the worktree its owner works in
+(where its recent edits landed), and the board shows that worktree and its branch.
 
 ### Subagents
 

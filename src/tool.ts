@@ -100,6 +100,7 @@ export const TOOL_SPEC = {
 	promptGuidelines: [
 		"When 📡 telecom shows other agents in this project: claim an area before a large change and release it after; re-read a file a peer changed before editing it; reply to a peer's ask promptly (they are blocked).",
 		"Message peers only for real coordination (requests, handoffs, shared-interface changes) — no acknowledgements; each message costs the recipient a turn.",
+		"Broadcast only what every agent must act on, with `paths` when it is about files; report progress with `status`, or `send` it to whoever coordinates.",
 	],
 	parameters: TOOL_PARAMETERS,
 	// Hints for permission extensions: telecom only talks to local pi sessions and edits nothing.

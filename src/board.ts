@@ -15,7 +15,7 @@
 import { UNRESPONSIVE_MS } from "./awareness.ts";
 import { lineOf } from "./family.ts";
 import { claimMatcher, claimsOverlap, laneRelativePattern } from "./glob.ts";
-import { displayPath, inCheckout, laneName, sameRepo } from "./project.ts";
+import { displayPath, inCheckout, type Lane, laneName, placeOf, readBranch, sameRepo } from "./project.ts";
 import type { Presence } from "./transport.ts";
 import { ago, clip, plural, shortId } from "./util.ts";
 
@@ -74,9 +74,17 @@ export function describePeer(
 ): string[] {
 	const now = opts.now ?? Date.now();
 	const lines: string[] = [];
+	const recent = [...peer.recent].sort((a, b) => b.at - a.at).slice(0, RECENT_SHOWN);
+	const places = recent.map((r) => ({ r, place: placeOf(r.path, peer) }));
+	// Where the peer works: the checkout its newest edit landed in, which may be a worktree other
+	// than the one it started in (and then so is the branch it works on).
+	const working = places[0]?.place?.checkout ?? peer.projectRoot;
+	const lane: Lane = { projectRoot: working, ...(peer.repo ? { repo: peer.repo } : {}) };
 	const where =
-		peer.projectRoot === viewer.projectRoot ? "" : sameRepo(peer, viewer) ? `  in ${laneName(peer)}` : `  in ${peer.projectRoot}`;
-	const branch = peer.branch ? ` on ${peer.branch}` : "";
+		working === viewer.projectRoot ? "" : sameRepo(lane, viewer) ? `  in ${laneName(lane)}` : `  in ${working}`;
+	const read = working === peer.projectRoot ? undefined : readBranch(working);
+	const branchName = read ? clip(read, 100) : peer.branch;
+	const branch = branchName ? ` on ${branchName}` : "";
 	const you = opts.self ? " — you" : "";
 	let state =
 		!opts.self && now - peer.heartbeatAt > UNRESPONSIVE_MS
@@ -92,15 +100,24 @@ export function describePeer(
 	if (peer.task) lines.push(`    task: ${clip(peer.task, 140)}${peer.taskAt ? ` (${ago(peer.taskAt, now)})` : ""}`);
 	const claims = liveClaims(peer, now);
 	if (claims.length > 0) {
+		// Claims made together share their note: say it once per group, not once per path.
+		const byNote = new Map<string, string[]>();
+		for (const c of claims) {
+			const note = c.note ? clip(c.note, 60) : "";
+			byNote.set(note, [...(byNote.get(note) ?? []), c.pattern]);
+		}
 		lines.push(
-			`    claims: ${claims.map((c) => `${c.pattern}${c.note ? ` — ${clip(c.note, 60)}` : ""}`).join("; ")}`,
+			`    claims: ${[...byNote].map(([note, patterns]) => `${patterns.join(", ")}${note ? ` — ${note}` : ""}`).join("; ")}`,
 		);
 	}
-	const recent = [...peer.recent].sort((a, b) => b.at - a.at).slice(0, RECENT_SHOWN);
 	if (recent.length > 0) {
-		lines.push(
-			`    recently changed: ${recent.map((r) => `${displayPath(r.path, peer.projectRoot)} (${ago(r.at, now)})`).join(", ")}`,
-		);
+		// Paths relative to the checkout they lie in, named once where it is not the one shown above.
+		const shown = places.map(({ r, place }) => {
+			const path = place ? displayPath(r.path, place.checkout) : r.path;
+			const elsewhere = place && place.checkout !== working ? ` in ${place.checkout}` : "";
+			return `${path}${elsewhere} (${ago(r.at, now)})`;
+		});
+		lines.push(`    recently changed: ${shown.join(", ")}`);
 	}
 	return lines;
 }
@@ -162,6 +179,8 @@ export interface BriefState {
 		{ callsign: string; task: string; claims: string[]; holders: Map<string, string>; members: string[]; described: boolean }
 	>;
 	fullAt: number;
+	/** When the last brief or update was sent. */
+	toldAt: number;
 }
 
 /** What makes a peer relevant to this agent. */
@@ -176,6 +195,12 @@ const NO_FOCUS: Focus = { paths: new Set(), contacts: new Set() };
 
 /** A full brief is repeated at most this often; in between, only what changed is sent. */
 const FULL_BRIEF_EVERY_MS = 30 * 60_000;
+/**
+ * An update that would only say peers moved on to new tasks waits until this long after the last
+ * one, or until there is other news to carry it. Agents re-state their task often, and an update
+ * for each re-statement costs every teammate a message about nothing they must act on.
+ */
+export const TASK_ONLY_HOLD_MS = 5 * 60_000;
 
 /** One entry of a brief: a peer, and the subagents folded into it. */
 interface Unit {
@@ -306,7 +331,7 @@ export function renderBrief(
 	const summary = units
 		.map((u) => `${u.peer.callsign} (${u.peer.state}${u.peer.task ? `: ${clip(u.peer.task, 40)}` : ""})`)
 		.join(" · ");
-	if (!previous && units.length === 0) return { text: null, summary, state: { peers: new Map(), fullAt: 0 } };
+	if (!previous && units.length === 0) return { text: null, summary, state: { peers: new Map(), fullAt: 0, toldAt: 0 } };
 	const parent = self.parent ? peers.find((p) => p.id === self.parent) : undefined;
 	const you = `you are "${self.callsign}"${parent ? `, a subagent of ${parent.callsign}` : ""}`;
 
@@ -330,7 +355,7 @@ export function renderBrief(
 		lines.push(
 			"Stay out of their claimed paths, re-read files they changed before editing, and use the telecom tool to coordinate when your work overlaps theirs.",
 		);
-		return { text: lines.join("\n"), summary, state: { peers: stateOf(units, now, ids), fullAt: now } };
+		return { text: lines.join("\n"), summary, state: { peers: stateOf(units, now, ids), fullAt: now, toldAt: now } };
 	}
 
 	const current = stateOf(units, now, new Set());
@@ -344,6 +369,8 @@ export function renderBrief(
 	const changes: string[] = [];
 	/** Far units whose news was held back: what this agent still knows of their task and claims. */
 	const held = new Map<string, { task: string; claims: string[] }>();
+	/** Near units whose task changed: the task this agent was told before. */
+	const taskMoves = new Map<string, string>();
 	// A subagent folded into a unit last time, now a unit of its own: its parent left, it stayed.
 	const foldedInto = new Map<string, string>();
 	for (const before of previous.peers.values()) for (const id of before.members) foldedInto.set(id, before.callsign);
@@ -376,7 +403,10 @@ export function renderBrief(
 			held.set(peer.id, { task: before.task, claims: before.claims.filter((c) => after.claims.includes(c)) });
 			continue;
 		}
-		if (before.task !== after.task && after.task) changes.push(`• ${name} is now on: ${clip(after.task, 140)}`);
+		if (before.task !== after.task && after.task) {
+			changes.push(`• ${name} is now on: ${clip(after.task, 140)}`);
+			taskMoves.set(peer.id, before.task);
+		}
 		const added = after.claims.filter((c) => !before.claims.includes(c));
 		const dropped = before.claims.filter((c) => !after.claims.includes(c));
 		if (added.length) changes.push(`• ${name} claimed ${added.join(", ")}`);
@@ -389,12 +419,21 @@ export function renderBrief(
 		const free = [...before.holders.keys()].filter((c) => !present.has(before.holders.get(c) ?? id)).sort();
 		changes.push(`• ${before.callsign} left${free.length ? ` (its claims ${free.join(", ")} are free)` : ""}`);
 	}
-	const state = { peers: stateOf(units, now, described), fullAt: previous.fullAt };
+	const state = { peers: stateOf(units, now, described), fullAt: previous.fullAt, toldAt: previous.toldAt };
 	for (const [id, told] of held) {
 		const entry = state.peers.get(id);
 		if (entry) Object.assign(entry, told);
 	}
+	// Only task changes, soon after the last update: hold them (as not yet told) for the next one.
+	if (changes.length > 0 && changes.length === taskMoves.size && now - previous.toldAt < TASK_ONLY_HOLD_MS) {
+		for (const [id, task] of taskMoves) {
+			const entry = state.peers.get(id);
+			if (entry) entry.task = task;
+		}
+		return { text: null, summary, state };
+	}
 	if (changes.length === 0) return { text: null, summary, state };
+	state.toldAt = now;
 	const head =
 		units.length === 0
 			? `📡 Telecom — team update: you ("${self.callsign}") are now the only agent in this project.`

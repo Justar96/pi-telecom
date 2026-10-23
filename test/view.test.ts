@@ -4,13 +4,15 @@
  * per agent, model instructions dimmed, rows that fit) and the commands' TUI and RPC paths.
  */
 import assert from "node:assert/strict";
-import { after, test } from "node:test";
+import { afterEach, test } from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { agentColor, MESSAGE_TYPES, paintCallsigns, PLAIN, registerRenderers, styleBoard } from "../src/render.ts";
 import { COMMANDS, helpText, statusText, widgetLines } from "../src/view.ts";
 import { eventually, makeProject, PLAIN_THEME, Session, session, stopSessions } from "./harness.ts";
 
-after(stopSessions);
+// Per test: every live session ticks and reads every presence record, so sessions left over
+// from earlier tests slow later ones until they time out (Windows file I/O especially).
+afterEach(stopSessions);
 
 /** A theme that shows its styling as tags: `<color>text</color>` and `*bold*`. */
 const tagged = {

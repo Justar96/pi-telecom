@@ -220,6 +220,51 @@ test("portability: an atomic write failure remains a result even when its temp f
 	}
 });
 
+test("portability: Windows retries a rename over a presence file a reader holds open", (t) => {
+	const wire = switchboard(t);
+	const record: Presence = { v: 1, id: "live", callsign: "alpha", pid: process.pid, ticks: null, cwd: wire.root, projectRoot: wire.root, role: "main", state: "idle", claims: [], recent: [], startedAt: 1, heartbeatAt: Date.now() };
+	const original = fs.renameSync;
+	let refusals = 2;
+	const rename = t.mock.method(fs, "renameSync", (...args: Parameters<typeof fs.renameSync>) => {
+		if (refusals-- > 0) throw fault("EPERM");
+		return original(...args);
+	});
+	const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+	try {
+		Object.defineProperty(process, "platform", { value: "win32" });
+		syncBuiltinESMExports();
+		assert.ok(wire.writePresence(record).ok, "a passing sharing violation is retried");
+		assert.equal(rename.mock.callCount(), 3);
+		Object.defineProperty(process, "platform", { value: "linux" });
+		refusals = 1;
+		assert.equal(wire.writePresence(record).ok, false, "elsewhere EPERM is a real refusal, not a lock");
+	} finally {
+		Object.defineProperty(process, "platform", platform);
+		rename.mock.restore();
+		syncBuiltinESMExports();
+	}
+	assert.equal(wire.readPeers().length, 1);
+});
+
+test("portability: a failed write's reason leaves out the temp name, so it is reported once", (t) => {
+	const wire = switchboard(t);
+	const rename = t.mock.method(fs, "renameSync", (from: string, to: string) => {
+		throw Object.assign(new Error(`EPERM: operation not permitted, rename '${from}' -> '${to}'`), { code: "EPERM" });
+	});
+	try {
+		syncBuiltinESMExports();
+		const first = wire.deliver(envelope("one"));
+		const second = wire.deliver(envelope("two"));
+		assert.ok(!first.ok && !second.ok);
+		if (first.ok || second.ok) return;
+		assert.doesNotMatch(first.reason, /\.tmp-/);
+		assert.match(first.reason, /EPERM: operation not permitted, rename$/);
+	} finally {
+		rename.mock.restore();
+		syncBuiltinESMExports();
+	}
+});
+
 test("portability: a locked presence is not swept as corrupt", (t) => {
 	const wire = switchboard(t);
 	const record: Presence = { v: 1, id: "live", callsign: "alpha", pid: process.pid, ticks: null, cwd: wire.root, projectRoot: wire.root, role: "main", state: "idle", claims: [], recent: [], startedAt: 1, heartbeatAt: Date.now() };
