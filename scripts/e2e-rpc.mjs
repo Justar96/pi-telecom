@@ -10,7 +10,7 @@
  *   node scripts/e2e-rpc.mjs          # exit 0 = pass, 1 = a check failed, 2 = setup problem
  */
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -27,6 +27,31 @@ let setupFailed = false;
 function check(name, ok, detail = "") {
 	console.log(`${ok ? "✔" : "✖"} ${name}${ok || !detail ? "" : `\n    ${detail}`}`);
 	if (!ok) failures++;
+}
+
+/**
+ * Resolves once the session started as `name` has drained its inbox: telecom hands each envelope
+ * to pi before removing it. The footer is no barrier for this: it is set only when its text
+ * changes, and a delivery need not change it. Matched by name, since callsigns are unique only
+ * within a project and every project here shares one switchboard.
+ */
+async function inboxDrained(name, timeoutMs) {
+	const switchboard = env.PI_TELECOM_DIR;
+	const deadline = Date.now() + timeoutMs;
+	for (;;) {
+		let waiting = true;
+		try {
+			const records = readdirSync(join(switchboard, "presence")).filter((n) => n.endsWith(".json") && !n.startsWith("."));
+			const id = records.map((n) => JSON.parse(readFileSync(join(switchboard, "presence", n), "utf8"))).find((r) => r.name === name)?.id;
+			if (id) waiting = readdirSync(join(switchboard, "inbox", id)).some((n) => !n.startsWith("."));
+		} catch (error) {
+			// No inbox left is a drained one; anything else (a record a reader holds) is retried.
+			if (error.code === "ENOENT" && error.path?.includes("inbox")) waiting = false;
+		}
+		if (!waiting) return;
+		if (Date.now() > deadline) throw new Error(`${name}: inbox not drained within ${timeoutMs} ms`);
+		await new Promise((resolve) => setTimeout(resolve, 50));
+	}
 }
 
 const extra = [];
@@ -186,13 +211,16 @@ try {
 	worker.send({ type: "prompt", message: "hold this turn" });
 	await worker.waitFor((r) => r.type === "message_start" && r.message?.role === "assistant", 10_000, heldOffset);
 	for (let i = 0; i < 3; i++) await leader.command(`/telecom msg ${workerCallsign} busy message ${i}`);
-	const drainOffset = worker.records.length;
-	// The footer refresh follows the inbox drain; this is a barrier, not a timing guess.
-	await worker.waitFor(isStatus(/📡/), 10_000, drainOffset);
+	// A barrier, not a timing guess: steering leaves no record until the stream ends.
+	await inboxDrained("task-worker", 10_000);
 	await worker.command("/telecom-test release");
 	await worker.waitFor(settled, 10_000, heldOffset);
 	const busyMessages = worker.records.slice(heldOffset).filter((r) => r.type === "message_end" && r.message?.customType === "telecom-message");
-	check("busy messages are steered without a wake-limit warning", busyMessages.length === 3 && busyMessages.every((r) => !/without starting a turn/.test(JSON.stringify(r.message.content))));
+	check(
+		"busy messages are steered without a wake-limit warning",
+		busyMessages.length === 3 && busyMessages.every((r) => !/without starting a turn/.test(JSON.stringify(r.message.content))),
+		JSON.stringify(busyMessages.map((r) => r.message.content)),
+	);
 	const wakeOffset = worker.records.length;
 	await leader.command(`/telecom msg ${workerCallsign} wake after busy messages`);
 	const woke = await worker.waitFor(settled, 10_000, wakeOffset).catch(() => null);

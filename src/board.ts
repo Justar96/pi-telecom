@@ -66,6 +66,26 @@ export function liveClaims(peer: Presence, now: number): Presence["claims"] {
 	return peer.claims.filter((c) => c.expiresAt > now);
 }
 
+/**
+ * Where a peer works: the checkout its newest edit inside the repository landed in, which may be a
+ * worktree other than the one it started in (and then so is the branch it works on). An edit
+ * outside the repository (shared notes, a scratch script) says nothing about where it works.
+ */
+function workplace(peer: Presence): { checkout: string; lane: Lane; branch: string | undefined } {
+	let newest: { at: number; checkout: string } | null = null;
+	for (const r of peer.recent) {
+		const place = placeOf(r.path, peer);
+		if (place && (!newest || r.at > newest.at)) newest = { at: r.at, checkout: place.checkout };
+	}
+	const checkout = newest?.checkout ?? peer.projectRoot;
+	const read = checkout === peer.projectRoot ? undefined : readBranch(checkout);
+	return {
+		checkout,
+		lane: { projectRoot: checkout, ...(peer.repo ? { repo: peer.repo } : {}) },
+		branch: read ? clip(read, 100) : peer.branch,
+	};
+}
+
 /** One peer, as a block of lines, as `viewer` sees it. `peers` name a subagent's parent. */
 export function describePeer(
 	peer: Presence,
@@ -76,14 +96,9 @@ export function describePeer(
 	const lines: string[] = [];
 	const recent = [...peer.recent].sort((a, b) => b.at - a.at).slice(0, RECENT_SHOWN);
 	const places = recent.map((r) => ({ r, place: placeOf(r.path, peer) }));
-	// Where the peer works: the checkout its newest edit landed in, which may be a worktree other
-	// than the one it started in (and then so is the branch it works on).
-	const working = places[0]?.place?.checkout ?? peer.projectRoot;
-	const lane: Lane = { projectRoot: working, ...(peer.repo ? { repo: peer.repo } : {}) };
+	const { checkout: working, lane, branch: branchName } = workplace(peer);
 	const where =
 		working === viewer.projectRoot ? "" : sameRepo(lane, viewer) ? `  in ${laneName(lane)}` : `  in ${working}`;
-	const read = working === peer.projectRoot ? undefined : readBranch(working);
-	const branchName = read ? clip(read, 100) : peer.branch;
 	const branch = branchName ? ` on ${branchName}` : "";
 	const you = opts.self ? " — you" : "";
 	let state =
@@ -165,19 +180,28 @@ export function renderBoard(input: BoardInput): string {
 	return lines.join("\n");
 }
 
-/** What a brief is about: membership, callsigns, tasks and claims — not every file touched
- *  (relevant file changes reach the agent as change notices instead). */
+/** What a brief is about: membership, callsigns, tasks, claims and where each peer works — not
+ *  every file touched (relevant file changes reach the agent as change notices instead). */
 export interface BriefState {
 	/**
-	 * Per unit: `task` and `claims` as this agent was last TOLD them (a far peer's changes are held
-	 * back, and must still read as news once it comes near), `holders` the session holding each
-	 * current claim, `members` its folded subagents, and `described`: whether it was described in
-	 * full (not only named on the roster).
+	 * Per unit: `task`, `claims` and `lane` (the checkout and branch it works in) as this agent was
+	 * last TOLD them (a far peer's changes are held back, and must still read as news once it comes
+	 * near), `holders` the session holding each current claim, `members` its folded subagents, and
+	 * `described`: whether it was described in full (not only named on the roster).
 	 */
 	peers: Map<
 		string,
-		{ callsign: string; task: string; claims: string[]; holders: Map<string, string>; members: string[]; described: boolean }
+		{
+			callsign: string;
+			task: string;
+			claims: string[];
+			lane: string;
+			holders: Map<string, string>;
+			members: string[];
+			described: boolean;
+		}
 	>;
+	/** When the last full brief was sent; 0 asks for one (a compaction or a new callsign). */
 	fullAt: number;
 	/** When the last brief or update was sent. */
 	toldAt: number;
@@ -193,12 +217,11 @@ export interface Focus {
 
 const NO_FOCUS: Focus = { paths: new Set(), contacts: new Set() };
 
-/** A full brief is repeated at most this often; in between, only what changed is sent. */
-const FULL_BRIEF_EVERY_MS = 30 * 60_000;
 /**
- * An update that would only say peers moved on to new tasks waits until this long after the last
- * one, or until there is other news to carry it. Agents re-state their task often, and an update
- * for each re-statement costs every teammate a message about nothing they must act on.
+ * An update that would only say peers moved on to new tasks or to another worktree waits until
+ * this long after the last one, or until there is other news to carry it. Agents re-state their
+ * task often and may edit in two checkouts by turns, and an update for each costs every teammate
+ * a message about nothing they must act on.
  */
 export const TASK_ONLY_HOLD_MS = 5 * 60_000;
 
@@ -279,6 +302,12 @@ function rosterEntry(unit: Unit, now: number): string {
 	}`;
 }
 
+/** Where a unit works, as an update tells it: `on lane-b in worktree /repo-b`. */
+function laneText(peer: Presence): string {
+	const { lane, branch } = workplace(peer);
+	return `${branch ? `on ${branch} ` : ""}in ${laneName(lane)}`;
+}
+
 function stateOf(units: readonly Unit[], now: number, described: ReadonlySet<string>): BriefState["peers"] {
 	return new Map(
 		units.map((u) => [
@@ -287,6 +316,7 @@ function stateOf(units: readonly Unit[], now: number, described: ReadonlySet<str
 				callsign: u.peer.callsign,
 				task: u.peer.task ?? "",
 				claims: unitClaims(u, now),
+				lane: laneText(u.peer),
 				holders: claimHolders(u, now),
 				members: u.subagents.map((s) => s.id),
 				described: described.has(u.peer.id),
@@ -308,13 +338,15 @@ function describeUnit(unit: Unit, self: Presence, peers: readonly Presence[], no
 }
 
 /**
- * The brief a new prompt starts with. The first one (and one every half hour) describes the team:
- * every peer in a small team, else the peers whose work touches this agent's (`focus`), with the
- * rest on a roster line. After that only the changes are sent — joins, leaves, claims taken or
- * released, a callsign change, and task changes of the peers that touch this agent's work — and
- * nothing at all when nothing changed. A rostered peer whose work comes near this agent's is
- * described once, when it does. Returns the text to send (or null) and the state to compare the
- * next brief against.
+ * The brief a new prompt starts with. The first one (and the first after a compaction, which may
+ * have dropped it from the context) describes the team: every peer in a small team, else the
+ * peers whose work touches this agent's (`focus`), with the rest on a roster line. After that
+ * only the changes are sent — joins, leaves, claims taken or released, a callsign change, and
+ * task changes and moves to another worktree or branch of the peers that touch this agent's work
+ * — and nothing at all when nothing changed. The full brief is not repeated on a timer: the
+ * first one and every update since are still in the context. A rostered peer whose work comes
+ * near this agent's is described once, when it does. Returns the text to send (or null) and the
+ * state to compare the next brief against.
  */
 export function renderBrief(
 	self: Presence,
@@ -335,7 +367,7 @@ export function renderBrief(
 	const parent = self.parent ? peers.find((p) => p.id === self.parent) : undefined;
 	const you = `you are "${self.callsign}"${parent ? `, a subagent of ${parent.callsign}` : ""}`;
 
-	if (!previous || (units.length > 0 && now - previous.fullAt > FULL_BRIEF_EVERY_MS)) {
+	if (!previous || (units.length > 0 && previous.fullAt === 0)) {
 		const described = units.filter((u) => relevant.has(u.peer.id)).slice(0, MAX_DESCRIBED);
 		const ids = new Set(described.map((u) => u.peer.id));
 		const roster = units.filter((u) => !ids.has(u.peer.id));
@@ -355,6 +387,13 @@ export function renderBrief(
 		lines.push(
 			"Stay out of their claimed paths, re-read files they changed before editing, and use the telecom tool to coordinate when your work overlaps theirs.",
 		);
+		// An agent put to work by a peer's message (no prompt of its own) has no task to show, and
+		// its teammates' briefs then say nothing about what it does.
+		if (!self.task) {
+			lines.push(
+				'Peers see no task for you: once you know what you are working on, set it with telecom({ action: "status", message: "…" }).',
+			);
+		}
 		return { text: lines.join("\n"), summary, state: { peers: stateOf(units, now, ids), fullAt: now, toldAt: now } };
 	}
 
@@ -367,10 +406,12 @@ export function renderBrief(
 		return describeUnit(unit, self, all, now).map((l, i) => (i === 0 ? l.replace(/^• /, `• ${label}: `) : l));
 	};
 	const changes: string[] = [];
-	/** Far units whose news was held back: what this agent still knows of their task and claims. */
-	const held = new Map<string, { task: string; claims: string[] }>();
-	/** Near units whose task changed: the task this agent was told before. */
-	const taskMoves = new Map<string, string>();
+	/** Far units whose news was held back: what this agent still knows of their task, claims and lane. */
+	const held = new Map<string, { task: string; claims: string[]; lane: string }>();
+	/** Near units whose task or lane changed: what this agent was told before. */
+	const moves = new Map<string, { task: string; lane: string }>();
+	/** The update lines that only say a peer moved on (task or lane). */
+	let moveLines = 0;
 	// A subagent folded into a unit last time, now a unit of its own: its parent left, it stayed.
 	const foldedInto = new Map<string, string>();
 	for (const before of previous.peers.values()) for (const id of before.members) foldedInto.set(id, before.callsign);
@@ -400,12 +441,21 @@ export function renderBrief(
 			// A release of a claim this agent was told about is news: it may be keeping out of it.
 			const dropped = before.claims.filter((c) => !after.claims.includes(c));
 			if (dropped.length) changes.push(`• ${name} released ${dropped.join(", ")}`);
-			held.set(peer.id, { task: before.task, claims: before.claims.filter((c) => after.claims.includes(c)) });
+			held.set(peer.id, {
+				task: before.task,
+				claims: before.claims.filter((c) => after.claims.includes(c)),
+				lane: before.lane,
+			});
 			continue;
 		}
-		if (before.task !== after.task && after.task) {
-			changes.push(`• ${name} is now on: ${clip(after.task, 140)}`);
-			taskMoves.set(peer.id, before.task);
+		const newTask = before.task !== after.task && after.task !== "";
+		if (newTask) changes.push(`• ${name} is now on: ${clip(after.task, 140)}`);
+		// Where its claims bind and its copies of files lie: the full brief said, so a move is news.
+		const newLane = before.lane !== after.lane;
+		if (newLane) changes.push(`• ${name} now works ${after.lane}`);
+		if (newTask || newLane) {
+			moves.set(peer.id, { task: before.task, lane: before.lane });
+			moveLines += Number(newTask) + Number(newLane);
 		}
 		const added = after.claims.filter((c) => !before.claims.includes(c));
 		const dropped = before.claims.filter((c) => !after.claims.includes(c));
@@ -424,11 +474,12 @@ export function renderBrief(
 		const entry = state.peers.get(id);
 		if (entry) Object.assign(entry, told);
 	}
-	// Only task changes, soon after the last update: hold them (as not yet told) for the next one.
-	if (changes.length > 0 && changes.length === taskMoves.size && now - previous.toldAt < TASK_ONLY_HOLD_MS) {
-		for (const [id, task] of taskMoves) {
+	// Only peers moving on, soon after the last update: hold it (as not yet told) for the next one.
+	// A peer that moved back meanwhile is then no news at all.
+	if (changes.length > 0 && changes.length === moveLines && now - previous.toldAt < TASK_ONLY_HOLD_MS) {
+		for (const [id, told] of moves) {
 			const entry = state.peers.get(id);
-			if (entry) entry.task = task;
+			if (entry) Object.assign(entry, told);
 		}
 		return { text: null, summary, state };
 	}

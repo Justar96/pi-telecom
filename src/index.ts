@@ -26,7 +26,7 @@
  * Messaging is derived from @tinoy/pi-ipc (MIT, github.com/tinoy1336/pi-extensions); the team
  * layer — projects, callsigns, briefs, change notices, claims and the guard — is new.
  */
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import type {
 	AgentToolUpdateCallback,
 	ExtensionAPI,
@@ -189,6 +189,8 @@ export default function telecom(pi: ExtensionAPI): void {
 	let widget: { tui: TUI; component: TeamWidget } | null = null;
 	let panel: { tui: TUI; component: BoardPanel } | null = null;
 	let unavailable: string | null = null;
+	/** The footer text last set (see `showStatus`). */
+	let shownStatus: string | undefined;
 
 	const awareness = new Awareness();
 	const ledger = createAskLedger();
@@ -261,8 +263,9 @@ export default function telecom(pi: ExtensionAPI): void {
 		if (name) self.name = name;
 		else delete self.name;
 		const written = transport.writePresence(self);
-		// One failed write leaves the previous record in place and the next publish retries it, so
-		// only a write that keeps failing is worth a warning.
+		// One failed write leaves the previous record in place, and the next tick writes again (a
+		// claim or a release must not wait for the heartbeat to reach peers), so only a write that
+		// keeps failing is worth a warning.
 		presenceFailures = written.ok ? 0 : presenceFailures + 1;
 		if (!written.ok && presenceFailures >= PRESENCE_FAILURES_REPORTED) report("presence", written.reason);
 		lastHeartbeat = Date.now();
@@ -382,7 +385,7 @@ export default function telecom(pi: ExtensionAPI): void {
 				claims: self.claims.length,
 				asks: ledger.inbound().length,
 			};
-			u.setStatus("telecom", statusText(status, paint()));
+			showStatus(statusText(status, paint()));
 			if (widgetOn) showWidget();
 			if (panel) {
 				panel.component.refresh();
@@ -393,10 +396,22 @@ export default function telecom(pi: ExtensionAPI): void {
 		}
 	}
 
+	/**
+	 * Set the footer, only when its text changed: pi redraws the screen for every `setStatus`, and
+	 * the team refresh runs every second. The text carries the theme's colours, so a theme change
+	 * still shows.
+	 */
+	function showStatus(text: string | undefined): void {
+		const u = ui();
+		if (!u || text === shownStatus) return;
+		u.setStatus("telecom", text);
+		shownStatus = text;
+	}
+
 	/** The footer while this session is off: shown only after the human turned it off. */
 	function showOff(why?: string): void {
 		try {
-			ui()?.setStatus("telecom", offStatus(paint(), why));
+			showStatus(offStatus(paint(), why));
 		} catch {
 			/* no UI */
 		}
@@ -460,12 +475,15 @@ export default function telecom(pi: ExtensionAPI): void {
 		taskExplicit = explicit;
 	}
 
-	/** A prompt becomes the task unless it only answers the agent: one word ("continue", "yes"),
-	 *  or a short follow-up while a task set on purpose stands. */
+	/** A prompt becomes the task unless it only answers or asks the agent something: one word
+	 *  ("continue", "yes"), a short follow-up while a task set on purpose stands, or a short
+	 *  question ("you tested ?") while any task stands. */
 	function taskFromPrompt(me: Presence, prompt: string): void {
 		const words = prompt.trim().split(/\s+/).length;
 		if (words < 2 || (taskExplicit && words < NEW_DIRECTION_WORDS)) return;
-		setTask(me, prompt.split("\n").find((l) => l.trim()) ?? prompt, false);
+		const first = prompt.split("\n").find((l) => l.trim()) ?? prompt;
+		if (me.task && words < NEW_DIRECTION_WORDS && first.trim().endsWith("?")) return;
+		setTask(me, first, false);
 	}
 
 	function claimTtlMinutes(): number {
@@ -860,6 +878,9 @@ export default function telecom(pi: ExtensionAPI): void {
 			for (const failure of drained?.failed ?? []) report("inbound", failure);
 		});
 		if (!self) return; // handling may have backed this session off
+		// The last write of our record failed (on Windows, a reader held the file): peers still see
+		// the record before it, so write it again now.
+		if (presenceFailures > 0) step("presence", publish);
 		if (tickCount % TEAM_REFRESH_TICKS === 0) step("team", refreshTeam);
 		step("notices", () => flushNotices());
 		step("asks", () => ledger.expire(Date.now()));
@@ -1074,7 +1095,7 @@ export default function telecom(pi: ExtensionAPI): void {
 		self = null;
 		hideWidget();
 		try {
-			ui()?.setStatus("telecom", undefined);
+			showStatus(undefined);
 		} catch {
 			/* no UI */
 		}
@@ -1171,6 +1192,8 @@ export default function telecom(pi: ExtensionAPI): void {
 
 	on("session_start", (_event, ctx) => {
 		ctxRef = ctx;
+		// pi clears extension statuses when it rebinds a session: set the footer again.
+		shownStatus = undefined;
 		cfg = readConfig();
 		const remembered = rememberedEnabled(ctx);
 		enabled = remembered ?? !cfg.disabled;
@@ -1357,9 +1380,14 @@ export default function telecom(pi: ExtensionAPI): void {
 		if (!self || !transport) return;
 		const now = Date.now();
 		self.recent = [{ path, op, at: now }, ...self.recent.filter((r) => r.path !== path)].slice(0, RECENT_CAP);
-		// Working inside a claim keeps it alive.
+		// Working inside a claim keeps it alive. Claims are written against the checkout this agent
+		// started in, but it may edit a worktree of its own: the same repository path there counts.
+		const place = awareness.placeOf(path, self);
+		const asStarted = place ? join(self.projectRoot, place.rel) : path;
 		for (const claim of self.claims) {
-			if (matchesClaim(path, claim.pattern, root())) claim.expiresAt = now + cfg.claimTtlMs;
+			if (matchesClaim(path, claim.pattern, root()) || matchesClaim(asStarted, claim.pattern, root())) {
+				claim.expiresAt = now + cfg.claimTtlMs;
+			}
 		}
 		publish();
 		const data: FileChangedData = { path, op, ...summarizeOwnChange(op, event, created) };
@@ -1617,11 +1645,37 @@ export default function telecom(pi: ExtensionAPI): void {
 		return { conflicts, lanes };
 	}
 
+	/**
+	 * A claim pattern as it is stored: as given when it lies in the checkout this agent started in.
+	 * An absolute path into another worktree of the repository (agents often start in the main
+	 * checkout and work in one of their own) names the same repository path, so it is stored
+	 * relative, and binds in every checkout this agent works in. `null` outside the repository.
+	 */
+	function claimPattern(me: Presence, pattern: string): string | null {
+		if (isWithin(absolutePattern(pattern, me.projectRoot), me.projectRoot)) return pattern;
+		const path = resolve(me.projectRoot, pattern);
+		const place = awareness.placeOf(path, me);
+		return place ? displayPath(path, place.checkout) : null;
+	}
+
+	/** Why paths outside the repository were not claimed, and what to do instead. */
+	function outsideRefusal(me: Presence, outside: readonly string[]): string {
+		return `${outside.join(", ")} ${outside.length === 1 ? "is" : "are"} outside this repository (${me.projectRoot} and its worktrees), and claims cover only its files. Peers who read a file there still hear when you change it, and the guard still stops a write over a change you have not read. To keep others out of one, tell them: telecom({ action: "broadcast", message: "editing …; please leave it to me until I say" }).`;
+	}
+
 	function claimAction({ me, params, message }: ActionCall): ToolResult {
-		const patterns = (params.paths ?? []).map((p) => p.trim()).filter(Boolean);
-		if (patterns.length === 0) return fail('"claim" needs `paths` — project-relative paths or globs');
-		const outside = patterns.filter((p) => !isWithin(absolutePattern(p, me.projectRoot), me.projectRoot));
-		if (outside.length > 0) return fail(`claims must be inside the project (${me.projectRoot}): ${outside.join(", ")}`);
+		const asked = (params.paths ?? []).map((p) => p.trim()).filter(Boolean);
+		if (asked.length === 0) return fail('"claim" needs `paths` — project-relative paths or globs');
+		const patterns: string[] = [];
+		const outside: string[] = [];
+		for (const raw of asked) {
+			const pattern = claimPattern(me, raw);
+			if (pattern === null) outside.push(raw);
+			else if (!patterns.includes(pattern)) patterns.push(pattern);
+		}
+		// Like a held path below, a path outside the repository does not cost the ones inside it.
+		const away = outside.length > 0 ? outsideRefusal(me, outside) : "";
+		if (patterns.length === 0) return fail(away, { refused: outside });
 		const now = Date.now();
 		const { conflicts, lanes } = claimConflicts(me, patterns, now);
 		// A held path does not cost the free ones: models that got an all-or-nothing refusal
@@ -1637,8 +1691,9 @@ export default function telecom(pi: ExtensionAPI): void {
 			refusal = `${conflicts.map((c) => c.what).join("; ")}. ${
 				repeated ? `Nothing has changed since this was last refused: retrying will not help. ` : ""
 			}Ask ${owners.join(" or ")} to release or split it — telecom({ action: "ask", to: "${owners[0]}", message: "…" }) — or pick other work.`;
-			if (granted.length === 0) return fail(refusal, { refused: [...held] });
+			if (granted.length === 0) return fail(away ? `${refusal}\n${away}` : refusal, { refused: [...held, ...outside] });
 		}
+		const refused = [...held, ...outside];
 		// Stored without closing punctuation (a clip "…" stays): it is quoted mid-sentence elsewhere.
 		const note = message ? clip(message, CLAIM_NOTE_CAP).replace(/[\s.!?]+$/, "") : "";
 		for (const pattern of granted) {
@@ -1654,10 +1709,10 @@ export default function telecom(pi: ExtensionAPI): void {
 		return ok(
 			`claimed ${granted.join(", ")}${note ? ` — ${note}` : ""}. Peers editing there are held back and you are told. Release with telecom({ action: "release" }) when done; idle claims expire after ${claimTtlMinutes()} min.${overlap}${
 				refusal ? `\nNot claimed: ${refusal}` : ""
-			}`,
+			}${away ? `\nNot claimed: ${away}` : ""}`,
 			{
 				claims: me.claims.map((c) => c.pattern),
-				...(held.size > 0 ? { refused: [...held] } : {}),
+				...(refused.length > 0 ? { refused } : {}),
 				...(lanes.length > 0 ? { laneOverlaps: lanes.length } : {}),
 			},
 		);

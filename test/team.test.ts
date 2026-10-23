@@ -3,13 +3,13 @@
  * files on disk. Each scenario uses its own project directory so they cannot see each other.
  */
 import assert from "node:assert/strict";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, constants, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
 import { findProjectRoot, findRepo } from "../src/project.ts";
 import { openTransport, processStartTicks, WIRE_VERSION } from "../src/transport.ts";
 import { escapeRegExp } from "../src/util.ts";
-import { eventually, makeProject, makeWorktree, NOTICE_WAIT_MS, PLAIN_THEME, Session, session, sleep, stopSessions, track } from "./harness.ts";
+import { eventually, makeProject, makeWorktree, NOTICE_WAIT_MS, PLAIN_THEME, SCRATCH, Session, session, sleep, stopSessions, track } from "./harness.ts";
 
 // Per test: every live session ticks and reads every presence record, so sessions left over
 // from earlier tests slow later ones until they time out (Windows file I/O especially).
@@ -1221,4 +1221,157 @@ test("send/ask with paths reach whoever claims them, else whoever changed them l
 	const nobody = await a.tool({ action: "ask", paths: ["docs/**"], message: "?" });
 	assert.ok(nobody.isError);
 	assert.match(nobody.text, /no other agent claims or recently changed docs\/\*\*\. .*telecom\(\{ action: "broadcast", paths: \["docs\/\*\*"\]/);
+});
+
+// ---------------------------------------------------------------- 0.4.2: fixes from a five-agent audit
+
+/** This session's presence record as peers read it. */
+function recordOf(s: Session) {
+	return openTransport(process.env.PI_TELECOM_DIR as string).readPeers().find((p) => p.id === s.id);
+}
+
+/** libuv's open flag for a handle that shares nothing (Windows only; fs.constants lacks it). */
+const UV_FS_O_EXLOCK = 0x10000000;
+
+/**
+ * Make writes of a session's presence record fail until the returned function runs. On Windows,
+ * hold the record open with no sharing, as a virus scanner can for longer than the rename
+ * retries last; elsewhere, take write permission from the directory.
+ */
+function failPresenceWrites(s: Session): () => void {
+	const dir = join(process.env.PI_TELECOM_DIR as string, "presence");
+	if (process.platform === "win32") {
+		const fd = openSync(join(dir, `${s.id}.json`), UV_FS_O_EXLOCK | constants.O_RDONLY);
+		return () => closeSync(fd);
+	}
+	chmodSync(dir, 0o500);
+	return () => chmodSync(dir, 0o700);
+}
+
+test(
+	"durability: a failed presence write is written again on the next tick, so a claim reaches peers at once",
+	{ skip: process.getuid?.() === 0 ? "root writes to any directory" : false },
+	async () => {
+		const proj = makeProject("p-presence-retry");
+		const a = await session(proj);
+		const b = await session(proj);
+		const board = async () => (await b.tool({ action: "board" })).text;
+		const release = failPresenceWrites(a);
+		try {
+			assert.ok(!(await a.tool({ action: "claim", paths: ["src/x.ts"] })).isError);
+			assert.doesNotMatch(await board(), /claims: src\/x\.ts/, "the write failed: peers still see the record before it");
+		} finally {
+			release();
+		}
+		// Well before the 15 s heartbeat.
+		await eventually(async () => assert.match(await board(), /claims: src\/x\.ts/));
+	},
+);
+
+test("claims: a path in your own worktree is claimed as the repository path; one outside the repository is refused with what to do", async () => {
+	const proj = makeProject("p-claim-paths");
+	const wt = makeWorktree(proj, "wa", "lane-a");
+	mkdirSync(join(wt, "src"), { recursive: true });
+	writeFileSync(join(wt, "src", "x.ts"), "x\n");
+	const notes = join(SCRATCH, "p-claim-paths-notes");
+	mkdirSync(notes, { recursive: true });
+	const team = join(notes, "TEAM.md");
+	writeFileSync(team, "plan\n");
+	const a = await session(proj);
+	const b = await session(proj);
+	const res = await a.tool({ action: "claim", paths: [join(wt, "src", "x.ts"), team], message: "parser" });
+	assert.ok(!res.isError, res.text);
+	assert.match(res.text, /^claimed src\/x\.ts — parser\./, "stored as the repository path");
+	assert.match(res.text, /\nNot claimed: .*TEAM\.md is outside this repository .*telecom\(\{ action: "broadcast"/);
+	assert.deepEqual(res.details.refused, [team]);
+	// The claim binds in the worktree alpha works in.
+	await a.read(join(wt, "src", "x.ts"));
+	await a.edit(join(wt, "src", "x.ts"), "x", "A");
+	await b.read(join(wt, "src", "x.ts"));
+	assert.match((await b.edit(join(wt, "src", "x.ts"), "A", "B")).blocked ?? "", /inside alpha's claim "src\/x\.ts"/);
+
+	const only = await a.tool({ action: "claim", paths: [team] });
+	assert.ok(only.isError);
+	assert.match(only.text, /outside this repository .*the guard still stops a write over a change you have not read/);
+	// …which holds for files outside the repository.
+	await b.read(team);
+	await a.read(team);
+	await a.edit(team, "plan", "plan v2");
+	assert.match((await b.write(team, "mine\n")).blocked ?? "", /alpha edited .*TEAM\.md/);
+});
+
+test("claims: edits in the worktree an agent works in keep its claims alive", async () => {
+	const proj = makeProject("p-claim-keepalive");
+	const wt = makeWorktree(proj, "wa", "lane-a");
+	mkdirSync(join(wt, "src"), { recursive: true });
+	writeFileSync(join(wt, "src", "x.ts"), "x\n");
+	const a = await session(proj);
+	await a.tool({ action: "claim", paths: ["src/x.ts"] });
+	const before = recordOf(a)?.claims[0]?.expiresAt ?? 0;
+	await sleep(20); // the clock must move for a renewal to show
+	await a.read(join(wt, "src", "x.ts"));
+	await a.edit(join(wt, "src", "x.ts"), "x", "A");
+	assert.ok((recordOf(a)?.claims[0]?.expiresAt ?? 0) > before, "an edit in its worktree is work inside the claim");
+});
+
+test("status: a short question asks the agent something; it does not replace its task", async () => {
+	const proj = makeProject("p-question-task");
+	const a = await session(proj);
+	const taskOf = async () => (await a.tool({ action: "status" })).text;
+	await a.prompt("you tested ?");
+	assert.match(await taskOf(), /you tested \?/, "with no task yet, even a question says something");
+	await a.prompt("fix the flaky upload test");
+	for (const question of ["you tested ?", "- what is t3code did ?", "is the retry logic covered?"]) await a.prompt(question);
+	assert.match(await taskOf(), /fix the flaky upload test/);
+	await a.prompt("can you drop that and port the importer to streaming reads, so big files never sit in memory?");
+	assert.match(await taskOf(), /port the importer to streaming reads/, "a long question is a new direction");
+});
+
+test("the footer is set only when its text changes", async () => {
+	const proj = makeProject("p-footer");
+	const a = await session(proj);
+	let sets = 0;
+	const set = a.ctx.ui.setStatus;
+	a.ctx.ui.setStatus = (key: string, text: string | undefined) => {
+		sets++;
+		set(key, text);
+	};
+	await sleep(200); // several team refreshes (every 2 ticks of 20 ms)
+	assert.equal(sets, 0, "an unchanged team sets nothing");
+	await session(proj);
+	await eventually(() => assert.match(a.status ?? "", /1 peer/));
+	assert.equal(sets, 1);
+});
+
+test("briefs: a peer moving to another worktree is news; an edit outside the repository is not a move", async () => {
+	const proj = makeProject("p-brief-lane");
+	const wt = makeWorktree(proj, "wb", "lane-b");
+	mkdirSync(join(wt, "src"), { recursive: true });
+	writeFileSync(join(wt, "src", "x.ts"), "x\n");
+	const notes = join(SCRATCH, "p-brief-lane-notes");
+	mkdirSync(notes, { recursive: true });
+	const a = await session(proj);
+	const b = await session(proj);
+	await b.prompt("port the parser");
+	assert.match((await a.prompt("first"))?.message?.content ?? "", /1 other agent is working/);
+	await b.read(join(wt, "src", "x.ts"));
+	await b.edit(join(wt, "src", "x.ts"), "x", "B");
+	await b.write(join(notes, "plan.md"), "notes\n");
+	await b.tool({ action: "claim", paths: ["src/x.ts"] });
+	const delta = (await a.prompt("next"))?.message?.content ?? "";
+	assert.match(delta, /team update/);
+	assert.match(delta, new RegExp(`bravo now works on lane-b in worktree ${escapeRegExp(wt)}\n`));
+	assert.match(delta, /bravo claimed src\/x\.ts/);
+	assert.equal(await a.prompt("again"), undefined, "told once");
+	assert.match((await a.tool({ action: "board" })).text, /• bravo \[\w+\] on lane-b {2}in worktree /, "the board agrees");
+});
+
+test("briefs: an agent put to work by a peer's message is asked to set its task; one with a task is not", async () => {
+	const proj = makeProject("p-brief-no-task");
+	const a = await session(proj);
+	const b = await session(proj);
+	await a.prompt("lead the port");
+	const woken = await b.fire("before_agent_start", { messageType: "custom", message: {}, systemPrompt: "", systemPromptOptions: {} });
+	assert.match(woken?.message?.content ?? "", /Peers see no task for you: .*telecom\(\{ action: "status", message: "…" \}\)/);
+	assert.doesNotMatch((await a.prompt("next"))?.message?.content ?? "", /no task for you/);
 });

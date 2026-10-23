@@ -95,8 +95,9 @@ repository. It is kept across a resume, and `/telecom name ops` changes it. Each
 publishes:
 
 - busy or idle, and its task: one set with `status` or `/telecom run`, else the first line of its
-  latest prompt. A one-word prompt ("continue") never becomes the task, and a task set with
-  `status` is replaced only by a prompt of 10 words or more, not by a short reply;
+  latest prompt. A one-word prompt ("continue") never becomes the task, a task set with `status`
+  is replaced only by a prompt of 10 words or more, not by a short reply, and a short question
+  ("you tested?") replaces no task;
 - its checkout and git branch;
 - its claims;
 - the last 12 files it changed through pi's `edit` and `write` tools;
@@ -105,10 +106,12 @@ publishes:
 ### Team briefs
 
 The brief is added at the start of a prompt. The first one describes every peer. After that, a
-brief lists only changes: a peer joined or left, changed its callsign or task, or claimed or
-released a path. A peer editing files is not listed; change notices cover that. With no peers,
-or no changes, nothing is added. A full brief is sent again after a compaction, and at most every
-30 minutes otherwise.
+brief lists only changes: a peer joined or left, changed its callsign or task, claimed or released
+a path, or moved to another worktree or branch. A peer editing files is not listed; change notices
+cover that. With no peers, or no changes, nothing is added. A full brief is sent again only after
+a compaction or a callsign change, since the first one and every update since are still in the
+context. An agent that has no task yet (it was put to work by a peer's message) is reminded in its
+full brief to set one with `status`.
 
 With more than three other agents (subagents not counted), a brief describes only the peers near
 this agent's work, at most six. A peer is near when it changed a file this agent is working with,
@@ -167,11 +170,15 @@ telecom({ action: "claim", paths: ["src/auth/**"], message: "refactor" })
 ```
 
 Patterns are project-relative paths or globs (`src/auth`, `src/**/*.test.ts`, `src/{api,db}/**`).
+An absolute path into a worktree of the repository is claimed as the same repository path, so it
+binds in every checkout the agent works in. A path outside the repository can't be claimed; the
+rest of the call is granted, and the result says how to tell peers instead.
 A path that overlaps a peer's claim in the same checkout is not claimed: the rest of the call is
 granted, and the result names the owner to ask. Overlaps with a claim in another worktree are
 allowed, with a note, and a subagent may claim part of its parent's claim.
 A claim ends when it is released, when its session ends, or after 2 hours without an edit inside
-it (`PI_TELECOM_CLAIM_TTL_MIN`). When a claim ends, peers that were held back by it are told.
+it, in any checkout the agent works in (`PI_TELECOM_CLAIM_TTL_MIN`). When a claim ends, peers that
+were held back by it are told.
 
 ### Worktrees
 

@@ -109,10 +109,12 @@ uninitialized binding.
   gone (children share their host's pid; `hostBeats`). A suspended process falls behind as a
   whole, so its children stay.
 - **The loop** (`tick()` in `index.ts`, every 500 ms, `unref`'d, never throws: a throw from a
-  timer would crash the host process): leave if pi disposed the runtime → drain the inbox → refresh the
+  timer would crash the host process): leave if pi disposed the runtime → drain the inbox → write
+  our record again if its last write failed (peers still see the one before it) → refresh the
   team every 2nd tick (repair our own record, detect the same session open twice, resolve callsign
   collisions, notice joins and leaves) → flush pending change notices → expire asks → heartbeat
-  every 15 s (expire claims, re-read the branch, sweep dead records).
+  every 15 s (expire claims, re-read the branch, sweep dead records). The footer is set only when
+  its text changes: every `setStatus` redraws the TUI.
 - **The guard's one-time parts** (a lane note, telling a lane claim's owner) are proposed by the
   verdict and committed in `tool_result` only when the call succeeded, so a call blocked by a
   later check, or one that fails, does not use them up. A claim that blocks is told at once. An
@@ -154,10 +156,15 @@ uninitialized binding.
 - **Briefs with many agents.** Up to `DESCRIBE_ALL_UP_TO` other units (a top-level agent with its
   subagents folded in), a brief describes everyone. Beyond that it describes only units that
   touch this agent's focus (`Focus`: `awareness.focusPaths()` and the sessions it messaged
-  with), and the rest share a roster line. Deltas hold back a far unit's task changes and new
+  with), and the rest share a roster line. Deltas hold back a far unit's task, lane and new
   claims, but always report joins, departures, callsign changes and releases of told claims.
   `BriefState` stores what the model was TOLD, so held-back news is reported once the unit is
   near again; `holders` (current, per claim) decides which claims a departure frees.
+- **Full briefs and updates.** A full brief goes out once, then again only when `fullAt` is 0
+  (a compaction, a callsign change): everything told since is still in the context, so a timed
+  repeat only spends tokens. An update made only of moves (a near unit's new task or lane, where
+  `workplace` is the checkout of its newest in-repository edit) waits up to `TASK_ONLY_HOLD_MS`
+  for other news; a unit that moves back meanwhile is no news at all.
 
 ## Rules the code must keep
 

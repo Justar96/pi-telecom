@@ -469,3 +469,29 @@ test("briefs: a task change alone is held, then told once the hold has passed", 
 	const later = renderBrief(me, [me, peer("bravo", "two")], { ...held.state, toldAt: Date.now() - TASK_ONLY_HOLD_MS - 1 });
 	assert.match(later.text ?? "", /bravo is now on: two/, "held, never dropped");
 });
+
+test("briefs: a move to another worktree is held like a task change, a move back is no news, and nothing repeats on a timer", () => {
+	const base = realpathSync.native(mkdtempSync(join(tmpdir(), "telecom-brief-lane-")));
+	const main = join(base, "main");
+	mkdirSync(join(main, ".git", "worktrees", "wt"), { recursive: true });
+	writeFileSync(join(main, ".git", "HEAD"), "ref: refs/heads/main\n");
+	writeFileSync(join(main, ".git", "worktrees", "wt", "HEAD"), "ref: refs/heads/lane\n");
+	writeFileSync(join(main, ".git", "worktrees", "wt", "commondir"), "../..\n");
+	const wt = join(base, "wt");
+	mkdirSync(wt);
+	writeFileSync(join(wt, ".git"), `gitdir: ${join(main, ".git", "worktrees", "wt")}\n`);
+	const peer = (id: string, recent: Presence["recent"] = []): Presence => ({
+		v: 1, id, callsign: id, pid: process.pid, ticks: null, cwd: main, projectRoot: main, repo: findRepo(main), role: "main",
+		state: "busy", task: "port", claims: [], recent, startedAt: 1, heartbeatAt: Date.now(),
+	});
+	const me = peer("alpha");
+	const stayed = peer("bravo");
+	const moved = peer("bravo", [{ path: join(wt, "src", "x.ts"), op: "edit", at: Date.now() }]);
+	const old = Date.now() - TASK_ONLY_HOLD_MS - 1;
+	const first = renderBrief(me, [me, stayed], null);
+	assert.equal(renderBrief(me, [me, stayed], { ...first.state, fullAt: Date.now() - 24 * 3_600_000, toldAt: old }).text, null, "an unchanged team is never briefed again on a timer");
+	const held = renderBrief(me, [me, moved], first.state);
+	assert.equal(held.text, null, "right after a brief, a move alone waits");
+	assert.match(renderBrief(me, [me, moved], { ...held.state, toldAt: old }).text ?? "", /bravo now works on lane in worktree /);
+	assert.equal(renderBrief(me, [me, stayed], { ...held.state, toldAt: old }).text, null, "back where it was told: nothing to tell");
+});
