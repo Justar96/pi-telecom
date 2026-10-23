@@ -92,6 +92,11 @@ export function setBounded<K, V>(map: Map<K, V>, key: K, value: V, cap: number):
 	}
 }
 
+/** One map key for a pair, such as a peer and a path: joined by NUL, which neither contains. */
+export function pairKey(a: string, b: string): string {
+	return `${a}\u0000${b}`;
+}
+
 /** True when `path` names an existing regular file. */
 export function fileExists(path: string): boolean {
 	try {

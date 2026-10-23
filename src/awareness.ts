@@ -25,7 +25,7 @@ import type { GuardMode } from "./config.ts";
 import { matchesClaim } from "./glob.ts";
 import { displayPath, laneIn, laneName, type Place, type PlaceCache, placeOf, sameRepo, workingCheckout } from "./project.ts";
 import type { Claim, Presence } from "./transport.ts";
-import { ago, fileFingerprint, setBounded } from "./util.ts";
+import { ago, fileFingerprint, pairKey, setBounded } from "./util.ts";
 
 export interface PeerChange {
 	peerId: string;
@@ -186,7 +186,7 @@ export class Awareness {
 	}
 
 	private firstLaneNote(peerId: string, path: string): boolean {
-		const key = `${peerId}\u0000${path}`;
+		const key = pairKey(peerId, path);
 		if (this.laneNoted.has(key)) return false;
 		setBounded(this.laneNoted, key, true, CHANGE_CAP);
 		return true;
@@ -199,7 +199,7 @@ export class Awareness {
 
 	/** A claim's owner was told about an edit to `path`: not again within the contest window. */
 	noteContested(ownerId: string, path: string): void {
-		this.contested.set(`${ownerId}\u0000${path}`, Date.now());
+		this.contested.set(pairKey(ownerId, path), Date.now());
 	}
 
 	/**
@@ -226,7 +226,7 @@ export class Awareness {
 					break;
 				}
 			}
-			const key = `${peer.id}\u0000${path}`;
+			const key = pairKey(peer.id, path);
 			if (!hit || this.laneNoted.has(key)) continue;
 			keys.push(key);
 			first ??= peer.callsign;
@@ -370,7 +370,7 @@ export class Awareness {
 					unenforced ??= `⚠ telecom: ${what}, but ${peer.callsign} has not checked in for ${ago(peer.heartbeatAt).replace(" ago", "")}, so the claim is not enforced. Tell them what you changed when they are back.`;
 					continue;
 				}
-				const key = `${peer.id}\u0000${path}`;
+				const key = pairKey(peer.id, path);
 				const warnedAt = this.contested.get(key);
 				if (mode === "standard" && warnedAt !== undefined && now - warnedAt < CONTEST_WINDOW_MS) {
 					return {
@@ -400,7 +400,7 @@ export class Awareness {
 
 	/** A claim from another checkout: advisory. The owner is told (by the caller, on success). */
 	private laneClaim(path: string, peer: Presence, claim: Claim, what: string, now: number): Verdict & { action: "warn" } {
-		const warnedAt = this.contested.get(`${peer.id}\u0000${path}`);
+		const warnedAt = this.contested.get(pairKey(peer.id, path));
 		const tell = warnedAt === undefined || now - warnedAt >= CONTEST_WINDOW_MS;
 		return {
 			action: "warn",
