@@ -6,6 +6,41 @@ All notable changes to `@justar_96/pi-telecom`. The format follows
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-10-24
+
+### Changed
+
+- A full team brief is no longer resent every 30 minutes: the first one and every update since
+  are still in the context. It is resent only after a compaction or a callsign change.
+- Team updates report a peer that moved to another worktree or branch, held for other news like a
+  task change.
+- An agent with no task (one put to work by a peer's message) is asked in its full brief to set
+  one with `status`, so peers see more than its callsign.
+
+### Fixed
+
+- A presence write that fails (on Windows, a reader holding the record longer than the rename
+  retries) is written again on the next tick. Before, peers saw the old record, without a new
+  claim or release, until the next heartbeat 15 seconds later.
+- A claim given as an absolute path into a worktree of the repository is stored as the
+  repository path, so it binds in every checkout its owner works in. A path outside the
+  repository is not claimed: the rest of the call is granted, and the result says how to tell
+  peers instead. Before, such a claim matched nothing.
+- Edits in a worktree its owner works in keep a claim alive. Before, only edits in the checkout
+  where the session started did, so such a claim expired 2 hours after it was made.
+- A peer's edit outside the repository no longer moves it, on the board and in briefs, back to
+  the checkout it started in.
+- A short question ("you tested ?") no longer replaces the task peers see; a question of 10 words
+  or more still does.
+- The footer is set only when its text changes. Before, every team refresh set it, and each set
+  redraws the TUI.
+- A claim's result in the transcript shows the paths it left out (a path outside the repository)
+  under what it claimed. Before, the panel showed only the claimed paths.
+- The team widget names the worktree a peer works in, not the checkout it started in.
+- Unanswered asks from peers are kept up to 64 at a time, and the times this agent was warned
+  about a peer's claim up to 512, the oldest giving way. Before, a flood of either grew without
+  bound.
+
 ## [0.4.1] - 2026-10-23
 
 ### Fixed
@@ -229,7 +264,8 @@ First release.
   presence repairs itself.
 - Prompt cache unaffected: 84.4 % hit rate with and without telecom on Claude Sonnet 5.5.
 
-[Unreleased]: https://github.com/Justar96/pi-telecom/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/Justar96/pi-telecom/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/Justar96/pi-telecom/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/Justar96/pi-telecom/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/Justar96/pi-telecom/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Justar96/pi-telecom/compare/v0.2.0...v0.3.0
