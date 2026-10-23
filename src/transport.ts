@@ -20,6 +20,7 @@
  * validates, and a record that does not validate is skipped (presence) or removed (inbox) —
  * never trusted. Nothing runs at import time.
  */
+import { createHash } from "node:crypto";
 import {
 	lstatSync,
 	mkdirSync,
@@ -30,13 +31,12 @@ import {
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
-import { createHash } from "node:crypto";
 import { homedir, tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { CALLSIGN_PATTERN } from "./callsign.ts";
 import { ENV } from "./config.ts";
 import { WAITS_CAP } from "./ledger.ts";
-import { messageOf, shortId } from "./util.ts";
+import { clip, messageOf, shortId } from "./util.ts";
 
 export const WIRE_VERSION = 1;
 /** Largest envelope text, in UTF-8 bytes. */
@@ -312,12 +312,10 @@ function isPath(value: unknown): value is string {
 	return str(value) && value.length <= LIMITS.path && !CONTROL_CHARS.test(value);
 }
 
-/** One line, at most `max` characters. */
+/** One line, at most `max` characters, with no control characters; `undefined` when empty. */
 function line(value: unknown, max: number): string | undefined {
 	if (typeof value !== "string") return undefined;
-	const flat = value.replace(CONTROL_RUNS, " ").replace(/\s+/g, " ").trim();
-	if (!flat) return undefined;
-	return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`;
+	return clip(value.replace(CONTROL_RUNS, " "), max) || undefined;
 }
 
 function parseClaims(value: unknown): Claim[] {
@@ -406,7 +404,8 @@ export function parseEnvelope(value: unknown): Envelope | null {
 		kind: r.kind as EnvelopeKind,
 		text: r.text,
 		...(isId(r.answerTo) ? { answerTo: r.answerTo } : {}),
-		...(typeof r.topic === "string" ? { topic: r.topic } : {}),
+		// Validated above for an event; on any other kind it means nothing, so it is not passed on.
+		...(r.kind === "event" ? { topic: r.topic as string } : {}),
 		...(r.data !== undefined ? { data: r.data } : {}),
 		...(r.human === true ? { human: true } : {}),
 		...(r.kind === "message" && r.human === true && r.triggerTurn === true ? { triggerTurn: true } : {}),

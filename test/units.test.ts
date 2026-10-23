@@ -163,6 +163,15 @@ test("ledger: answer, timeout, interruption, peer gone, late replies", async () 
 	assert.equal(ledger.outboundCount(), 0);
 });
 
+test("ledger: a flood of inbound asks stays bounded, the oldest giving way", () => {
+	const ledger = createAskLedger();
+	for (let i = 0; i < 200; i++) ledger.noteInbound({ id: `ask-${i}`, from: "peer", fromCallsign: "bravo", text: `q${i}`, at: i });
+	const kept = ledger.inbound();
+	assert.ok(kept.length < 200, `bounded: ${kept.length}`);
+	assert.equal(kept.at(-1)?.id, "ask-199", "the newest is kept");
+	assert.equal(ledger.resolveInbound("ask-0"), null, "the oldest gave way");
+});
+
 test("transport: peer records are sanitised before they can reach a model", () => {
 	const base = {
 		v: 1, id: "s1", callsign: "bravo", pid: 1, ticks: null, cwd: "/x", projectRoot: "/x",
@@ -186,6 +195,8 @@ test("transport: peer records are sanitised before they can reach a model", () =
 	const env = parseEnvelope({ v: 1, id: "e", ts: 1, from: "abcdef123", fromCallsign: "x\ny", to: "b", kind: "message", text: "" });
 	assert.equal(env?.fromCallsign, "bcdef123", "a bad sender callsign falls back to the short id");
 	assert.equal(parseEnvelope({ v: 1, id: "e", ts: 1, from: "a", to: "b", kind: "event", topic: "Bad Topic!", text: "" }), null);
+	const topical = parseEnvelope({ v: 1, id: "e", ts: 1, from: "a", to: "b", kind: "message", topic: `x\n${"y".repeat(5_000)}`, text: "" });
+	assert.equal(topical?.topic, undefined, "a topic is checked, and kept, only on an event");
 });
 
 test("config: PI_TELECOM_MAX_WAKES=0 means never wake", () => {

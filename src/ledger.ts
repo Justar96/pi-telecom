@@ -164,6 +164,9 @@ export function waitedOn(start: WaitNode, peers: readonly WaitNode[]): Set<strin
 }
 
 const ABANDONED_CAP = 64;
+/** Inbound asks kept at once. Each is a peer's question and is listed on the board, so a flood
+ *  of them must not grow without limit; the oldest gives way (its asker times out). */
+const INBOUND_CAP = 64;
 
 /** What a late answer needs to name the ask it answers. */
 function lateOf(ask: PendingAsk): LateAsk {
@@ -184,7 +187,7 @@ export function createAskLedger(): AskLedger {
 
 	return {
 		noteInbound(ask) {
-			inbound.set(ask.id, { ...ask, reminded: false });
+			setBounded(inbound, ask.id, { ...ask, reminded: false }, INBOUND_CAP);
 		},
 
 		resolveInbound(askId, from) {

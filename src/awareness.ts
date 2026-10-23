@@ -199,7 +199,7 @@ export class Awareness {
 
 	/** A claim's owner was told about an edit to `path`: not again within the contest window. */
 	noteContested(ownerId: string, path: string): void {
-		this.contested.set(pairKey(ownerId, path), Date.now());
+		setBounded(this.contested, pairKey(ownerId, path), Date.now(), CHANGE_CAP);
 	}
 
 	/**
@@ -378,7 +378,7 @@ export class Awareness {
 						note: `⚠ telecom: ${what}. You went ahead after the warning; ${peer.callsign} has been told.`,
 					};
 				}
-				this.contested.set(key, now);
+				setBounded(this.contested, key, now, CHANGE_CAP);
 				return {
 					action: "block",
 					contested: { owner: peer, claim },

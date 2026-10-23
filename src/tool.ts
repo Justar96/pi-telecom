@@ -1,6 +1,6 @@
 /**
  * tool — the static half of the `telecom` tool: name, schema, model-facing text, renderers, and
- * the result shape. The `execute` half needs the session's state and lives in `index.ts`.
+ * the result shape. The `execute` half needs the session's state and lives in `actions.ts`.
  *
  * Everything here is fixed at registration and must stay fixed: the description, snippet and
  * guidelines are part of every session's cached prompt prefix, so they carry no callsigns, counts
@@ -260,6 +260,8 @@ function resultLines(
 			// "claimed src/auth/** — reason": the call above already shows the reason.
 			const lines = [`${tick} ${say(splitOnce(first.slice(0, cut), " — ")[0])}`, muted(held)];
 			if (note !== undefined) lines.push(`${theme.fg("warning", "⚠")} ${theme.fg("warning", note)}`);
+			// "Not claimed: …": the paths left out (a peer holds them, or they are outside the repository).
+			for (const l of rest) lines.push(`${theme.fg("warning", "⚠")} ${muted(l)}`);
 			return lines;
 		}
 		case "release":

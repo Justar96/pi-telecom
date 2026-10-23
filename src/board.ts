@@ -461,7 +461,10 @@ export function renderBrief(
 		const free = [...before.holders.keys()].filter((c) => !present.has(before.holders.get(c) ?? id)).sort();
 		changes.push(`• ${before.callsign} left${free.length ? ` (its claims ${free.join(", ")} are free)` : ""}`);
 	}
-	const state = { peers: stateOf(units, now, described), fullAt: previous.fullAt, toldAt: previous.toldAt };
+	// The comparison is done, so `current` becomes the new state as is: building it again would walk
+	// every unit's checkouts and read its branch a second time.
+	for (const [id, entry] of current) entry.described = described.has(id);
+	const state = { peers: current, fullAt: previous.fullAt, toldAt: previous.toldAt };
 	for (const [id, told] of held) {
 		const entry = state.peers.get(id);
 		if (entry) Object.assign(entry, told);

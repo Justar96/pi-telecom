@@ -4,11 +4,15 @@
  * per agent, model instructions dimmed, rows that fit) and the commands' TUI and RPC paths.
  */
 import assert from "node:assert/strict";
+import { basename, join } from "node:path";
 import { afterEach, test } from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
+import { findProjectRoot, findRepo } from "../src/project.ts";
 import { agentColor, MESSAGE_TYPES, paintCallsigns, PLAIN, registerRenderers, styleBoard } from "../src/render.ts";
+import { TOOL_SPEC } from "../src/tool.ts";
+import { escapeRegExp } from "../src/util.ts";
 import { COMMANDS, helpText, statusText, widgetLines } from "../src/view.ts";
-import { eventually, makeProject, PLAIN_THEME, Session, session, stopSessions } from "./harness.ts";
+import { eventually, makeProject, makeWorktree, PLAIN_THEME, Session, session, stopSessions } from "./harness.ts";
 
 // Per test: every live session ticks and reads every presence record, so sessions left over
 // from earlier tests slow later ones until they time out (Windows file I/O especially).
@@ -100,6 +104,29 @@ test("view: the widget lists this agent first, subagents under their parent, and
 	assert.ok(lines.some((l) => /charlie .*in p-docs/.test(l)), "another checkout is named by its directory");
 	assert.ok(lines.some((l) => /… \d+ more · \/telecom shows everyone/.test(l)));
 	assert.ok(lines.some((l) => /\? bravo asks {2}is login\(\) final\?/.test(l)));
+});
+
+test("view: the widget names the worktree a peer works in, not the checkout it started in", () => {
+	const root = findProjectRoot(makeProject("p-widget-lane"));
+	const wt = makeWorktree(root, "wb", "lane-b");
+	const started = { cwd: root, projectRoot: root, repo: findRepo(root) };
+	const self = presence("a", "alpha", started);
+	const bravo = presence("b", "bravo", { ...started, recent: [{ path: join(wt, "src", "x.ts"), op: "edit", at: now }] });
+	const lines = widgetLines({ self, peers: [self, bravo], asks: [], now }, PLAIN, 100);
+	assert.match(lines.find((l) => /● bravo |○ bravo /.test(l)) ?? "", new RegExp(`in ${escapeRegExp(basename(wt))}`), lines.join("\n"));
+	assert.doesNotMatch(lines.find((l) => /alpha/.test(l)) ?? "", / in /, "this agent works where it started");
+});
+
+test("render: a claim result shows the paths it left out under what it claimed", () => {
+	const text = [
+		'claimed src/x.ts — parser. Peers editing there are held back and you are told. Release with telecom({ action: "release" }) when done; idle claims expire after 120 min.',
+		"Not claimed: /notes/TEAM.md is outside this repository (/work/p and its worktrees), and claims cover only its files.",
+	].join("\n");
+	const result = { content: [{ type: "text", text }], details: { ok: true } };
+	const rendered = (TOOL_SPEC as any).renderResult(result, { expanded: true, isPartial: false }, PLAIN_THEME, { args: { action: "claim" } });
+	const out = rendered.render(160).join("\n");
+	assert.match(out, /✓ claimed src\/x\.ts/);
+	assert.match(out, /⚠ Not claimed: \/notes\/TEAM\.md is outside this repository/);
 });
 
 test("view: the help names every command", () => {

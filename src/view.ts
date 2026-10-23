@@ -20,7 +20,7 @@ import {
 } from "@earendil-works/pi-tui";
 import { UNRESPONSIVE_MS } from "./awareness.ts";
 import { type BoardScope, familyOrder, liveClaims } from "./board.ts";
-import { sameRepo } from "./project.ts";
+import { type PlaceCache, sameRepo, workingCheckout } from "./project.ts";
 import {
 	boardCallsigns,
 	callsignText,
@@ -136,9 +136,9 @@ function pad(text: string, width: number): string {
 /**
  * The widget: a rule, then one row per agent (this one first, each subagent under its parent)
  * with its state, task, and on the right its claims or the checkout it works in, then the asks
- * waiting on this agent. Every row fits `width`.
+ * waiting on this agent. Every row fits `width`. `places` saves walking the tree on every redraw.
  */
-export function widgetLines(snap: TeamSnapshot, paint: Paint, width: number): string[] {
+export function widgetLines(snap: TeamSnapshot, paint: Paint, width: number, places?: PlaceCache): string[] {
 	const { self, now } = snap;
 	const team = snap.peers.filter((p) => p.id !== self.id && sameRepo(p, self));
 	const rows = familyOrder([self, ...team]);
@@ -164,8 +164,10 @@ export function widgetLines(snap: TeamSnapshot, paint: Paint, width: number): st
 		if (p.id === self.id) extras.push(paint.fg("accent", "you"));
 		const claims = liveClaims(p, now);
 		if (claims.length > 0) extras.push(paint.fg("muted", `claims ${claims[0]?.pattern}${claims.length > 1 ? ` +${claims.length - 1}` : ""}`));
-		// Another checkout: named by its directory, which is how worktrees are usually told apart.
-		if (p.projectRoot !== self.projectRoot) extras.push(paint.fg("muted", `in ${basename(p.projectRoot)}`));
+		// Another checkout, where the agent works as the board says it (not where it started): named
+		// by its directory, which is how worktrees are usually told apart.
+		const working = workingCheckout(p, places);
+		if (working !== self.projectRoot) extras.push(paint.fg("muted", `in ${basename(working)}`));
 		const tail = wide && extras.length > 0 ? extras.join(paint.fg("dim", " · ")) : "";
 		const head = ` ${mark.dot} ${name}  ${pad(mark.word, 4)}  `;
 		const room = width - visibleWidth(head) - (tail ? visibleWidth(tail) + 2 : 0);
@@ -194,6 +196,8 @@ export class TeamWidget implements Component {
 	private readonly theme: Theme;
 	private readonly source: () => TeamSnapshot | null;
 	private cache: { width: number; lines: string[] } | undefined;
+	/** Each folder's checkout, kept across redraws: the widget redraws on every team refresh. */
+	private readonly places: PlaceCache = new Map();
 
 	constructor(theme: Theme, source: () => TeamSnapshot | null) {
 		this.theme = theme;
@@ -203,7 +207,7 @@ export class TeamWidget implements Component {
 	render(width: number): string[] {
 		if (this.cache?.width === width) return this.cache.lines;
 		const snap = this.source();
-		const lines = snap ? widgetLines(snap, this.theme, width) : [];
+		const lines = snap ? widgetLines(snap, this.theme, width, this.places) : [];
 		this.cache = { width, lines };
 		return lines;
 	}
