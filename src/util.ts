@@ -24,6 +24,17 @@ export function ago(at: number, now = Date.now()): string {
 	return `${Math.round(hours / 24)}d ago`;
 }
 
+/** How long since `since`, compactly: "8s", "14m", "3h", "2d". */
+export function elapsed(since: number, now = Date.now()): string {
+	const seconds = Math.max(0, Math.round((now - since) / 1000));
+	if (seconds < 60) return `${seconds}s`;
+	const minutes = Math.round(seconds / 60);
+	if (minutes < 60) return `${minutes}m`;
+	const hours = Math.round(minutes / 60);
+	if (hours < 48) return `${hours}h`;
+	return `${Math.round(hours / 24)}d`;
+}
+
 /** Files larger than this are fingerprinted by size+mtime instead of by content. */
 const HASH_CAP = 8 * 1024 * 1024;
 

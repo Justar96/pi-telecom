@@ -16,7 +16,7 @@
  *     a stale `edit` gets a warning, and a path inside a peer's claim is held back once (the
  *     owner is told) — `PI_TELECOM_GUARD=strict|standard|off`;
  *   - the `telecom` TOOL: board, send, ask (blocks for the reply), reply, broadcast, status,
- *     claim and release;
+ *     claim, release and log (the team's history: broadcasts, tasks, claims, joins and leaves);
  *   - the `/telecom` COMMAND for the human: the board, renaming, messaging an agent directly,
  *     and a live board widget.
  *
@@ -39,14 +39,16 @@ import { registerLifecycle } from "./lifecycle.ts";
 import { registerRenderers } from "./render.ts";
 import { Runtime } from "./runtime.ts";
 import { registerTurns } from "./turns.ts";
+import { createWaiting } from "./waiting.ts";
 
 export default function telecom(pi: ExtensionAPI): void {
 	const rt = new Runtime(pi);
 	registerRenderers(pi);
-	const inbound = createInbound(rt);
+	const waiting = createWaiting(rt);
+	const inbound = createInbound(rt, waiting);
 	const guard = registerGuard(rt);
-	const life = registerLifecycle(rt, inbound, guard);
+	const life = registerLifecycle(rt, inbound, guard, waiting);
 	registerTurns(rt, inbound);
-	registerTool(rt);
+	registerTool(rt, waiting);
 	registerCommand(rt, life, inbound);
 }

@@ -19,7 +19,7 @@ import {
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import { UNRESPONSIVE_MS } from "./awareness.ts";
-import { type BoardScope, familyOrder, liveClaims } from "./board.ts";
+import { type BoardScope, familyOrder, idleFor, liveClaims } from "./board.ts";
 import { type PlaceCache, sameRepo, workingCheckout } from "./project.ts";
 import {
 	boardCallsigns,
@@ -33,7 +33,7 @@ import {
 	styleBoard,
 } from "./render.ts";
 import type { Presence } from "./transport.ts";
-import { plural } from "./util.ts";
+import { elapsed, plural } from "./util.ts";
 
 /** The widget lists at most this many agents; `/telecom` shows everyone. */
 const WIDGET_AGENTS = 8;
@@ -45,6 +45,8 @@ const NAME_CAP = 16;
 const NARROW = 60;
 /** Rows the board panel keeps for its frame (rules, title, hints) and for the chat above it. */
 const PANEL_CHROME_ROWS = 12;
+/** A widget row names the tool a busy agent is in with at most this many columns. */
+const STEP_TOOL_CAP = 12;
 
 // ------------------------------------------------------------------ the commands
 
@@ -62,6 +64,7 @@ export const COMMANDS: readonly CommandSpec[] = [
 	{ name: "run", args: "<prompt>", about: "start work in every session in this repository, this one too" },
 	{ name: "msg", args: "<agent> <text>", about: "message an agent as its human (wakes it when idle)" },
 	{ name: "broadcast", args: "<text>", about: "tell every agent in this repository" },
+	{ name: "log", about: "what the team did: broadcasts, tasks, claims, joins and leaves" },
 	{ name: "widget", about: "show or hide the live team above the editor" },
 	{ name: "release", about: "drop every claim this agent holds" },
 	{ name: "name", args: "<callsign>", about: "rename this agent" },
@@ -128,6 +131,14 @@ function stateOf(peer: Presence, self: Presence, now: number): StateKind {
 	return peer.state;
 }
 
+/** The state word a widget row shows: `busy bash 14m` in a long tool call, `idle 12m`, `wait`, `away`. */
+function stateWord(peer: Presence, kind: StateKind, now: number): string {
+	if (kind === "busy" && peer.step) return `busy ${truncateToWidth(peer.step.tool, STEP_TOOL_CAP, "…")} ${elapsed(peer.step.since, now)}`;
+	const idle = kind === "idle" ? idleFor(peer, now) : null;
+	if (idle) return `idle ${idle}`;
+	return kind === "waiting" ? "wait" : kind;
+}
+
 /** Pad `text` (which may carry colour) to `width` visible columns. */
 function pad(text: string, width: number): string {
 	return text + " ".repeat(Math.max(0, width - visibleWidth(text)));
@@ -147,6 +158,8 @@ export function widgetLines(snap: TeamSnapshot, paint: Paint, width: number, pla
 	const shown = rows.slice(0, WIDGET_AGENTS);
 	const nameWidth = Math.min(NAME_CAP, Math.max(...shown.map((p) => p.callsign.length + depthOf(p) * 2)));
 	const wide = width >= NARROW;
+	const words = new Map(shown.map((p) => [p.id, stateWord(p, stateOf(p, self, now), now)]));
+	const stateWidth = Math.max(4, ...[...words.values()].map((w) => visibleWidth(w)));
 	const lines: string[] = [];
 
 	const title = ` ${paint.fg("accent", "📡")} ${paint.bold(plainText(paint, "telecom"))} `;
@@ -157,7 +170,7 @@ export function widgetLines(snap: TeamSnapshot, paint: Paint, width: number, pla
 
 	for (const p of shown) {
 		const kind = stateOf(p, self, now);
-		const mark = stateMark(paint, kind, kind === "waiting" ? "wait" : kind);
+		const mark = stateMark(paint, kind, words.get(p.id) ?? kind);
 		const depth = depthOf(p);
 		const name = pad(`${depth ? paint.fg("dim", "└ ") : ""}${callsignText(paint, truncateToWidth(p.callsign, nameWidth - depth * 2, "…"))}`, nameWidth);
 		const extras: string[] = [];
@@ -169,7 +182,7 @@ export function widgetLines(snap: TeamSnapshot, paint: Paint, width: number, pla
 		const working = workingCheckout(p, places);
 		if (working !== self.projectRoot) extras.push(paint.fg("muted", `in ${basename(working)}`));
 		const tail = wide && extras.length > 0 ? extras.join(paint.fg("dim", " · ")) : "";
-		const head = ` ${mark.dot} ${name}  ${pad(mark.word, 4)}  `;
+		const head = ` ${mark.dot} ${name}  ${pad(mark.word, stateWidth)}  `;
 		const room = width - visibleWidth(head) - (tail ? visibleWidth(tail) + 2 : 0);
 		const task = p.task
 			? plainText(paint, truncateToWidth(p.task, Math.max(0, room), "…"))

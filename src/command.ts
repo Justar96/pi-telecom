@@ -1,8 +1,8 @@
 /**
  * command — `/telecom`, for the human: the board (a live panel in the TUI, text for an RPC
  * client), the command list, turning telecom off and on, renaming, team tasks, messages,
- * broadcasts and releasing claims. Nothing here reaches the model except a team task or a message
- * the human sends.
+ * broadcasts, the team log and releasing claims. Nothing here reaches the model except a team
+ * task or a message the human sends.
  */
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { resolveTarget, stateHint } from "./address.ts";
@@ -11,6 +11,7 @@ import { CALLSIGN_PATTERN, NATO } from "./callsign.ts";
 import { readConfig } from "./config.ts";
 import type { Inbound } from "./inbound.ts";
 import type { Lifecycle } from "./lifecycle.ts";
+import { broadcastText, LOG_SHOWN, renderLog } from "./log.ts";
 import { callsignText } from "./render.ts";
 import { OFF_TEXT, type Runtime } from "./runtime.ts";
 import { deliveryReport } from "./tool.ts";
@@ -193,7 +194,13 @@ export function registerCommand(rt: Runtime, life: Lifecycle, inbound: Inbound):
 					return;
 				}
 				const { reached, failed } = rt.deliverEach(net, peers, "broadcast", text, { human: true });
+				if (reached.length > 0) rt.logEntry("broadcast", broadcastText(text, [], true));
 				say(`broadcast to ${deliveryReport(reached, failed)}`, failed.length ? "warning" : "info");
+				return;
+			}
+			case "log": {
+				const all = rt.teamLog();
+				ctx.ui.notify(renderLog(all.slice(-LOG_SHOWN), { self: me.id, total: all.length }), "info");
 				return;
 			}
 			case "release": {

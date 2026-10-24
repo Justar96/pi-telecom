@@ -99,7 +99,10 @@ publishes:
   is replaced only by a prompt of 10 words or more, not by a short reply, and a short question
   ("you tested?") replaces no task;
 - its checkout and git branch;
-- its claims;
+- how long it has been idle, or, inside one long tool call, which tool and for how long
+  (`bravo [busy · bash 14m]` on the board). A message to such a peer says it waits for that call
+  to end;
+- its claims and locks, its place in line for a lock, and whom it says it is waiting for;
 - the last 12 files it changed through pi's `edit` and `write` tools;
 - the sessions its open asks are waiting on.
 
@@ -112,6 +115,14 @@ cover that. With no peers, or no changes, nothing is added. A full brief is sent
 a compaction or a callsign change, since the first one and every update since are still in the
 context. An agent that has no task yet (it was put to work by a peer's message) is reminded in its
 full brief to set one with `status`.
+
+If a teammate joins or leaves while an agent is in a run, the agent hears it during the run as a
+short team update, and its next brief doesn't repeat it. An idle agent is not woken for this; it
+gets the news in its next brief. The human's notices name who joined and who left
+(`📡 bravo left; foxtrot joined`). A record missing from one refresh (a cleaned runtime directory,
+for example) is not a departure, in the notices or in briefs: a peer counts as gone after it is
+missing twice in a row, or at once when its process has exited or it left on purpose
+(`/telecom off`, `/new`).
 
 With more than three other agents (subagents not counted), a brief describes only the peers near
 this agent's work, at most six. A peer is near when it changed a file this agent is working with,
@@ -179,6 +190,44 @@ allowed, with a note, and a subagent may claim part of its parent's claim.
 A claim ends when it is released, when its session ends, or after 2 hours without an edit inside
 it, in any checkout the agent works in (`PI_TELECOM_CLAIM_TTL_MIN`). When a claim ends, peers that
 were held back by it are told.
+
+### Locks and waits
+
+Some shared things are not files: the build directory, the test runner, a port. Claim them by
+name with an `@`:
+
+```
+telecom({ action: "claim", paths: ["@cargo"], message: "release build" })
+```
+
+A lock matches no file and is shared by every worktree of the repository. If someone holds it,
+the claim is refused with the holder, since when, its state, and the call to queue: add
+`queue: true` to wait in line. When the lock frees (released, its holder left, or it expired), the
+first agent in line gets it and is woken (`📡 @cargo is yours now (charlie released it)`). Two
+agents taking a free lock at the same moment settle on the earlier claim; the other goes back to
+its place at the front of the line, and is told if it already thought the lock was its own.
+Edits don't renew a lock, so claim it again within the claim TTL to keep it (once it has expired,
+claiming it again is a new claim), and release it when done. To claim a path that starts with `@`, write it as `./@…`.
+
+An agent blocked on a teammate says so:
+
+```
+telecom({ action: "status", message: "waiting for the green run", waitingFor: ["charlie"] })
+```
+
+It is woken when charlie finishes a run, takes up a new task, or leaves, and the wait ends when
+charlie messages it. A status set without `waitingFor` clears it. The board lists locks with their
+queues (`@cargo — charlie (queue: echo, bravo)`), shows who waits for whom, and flags agents
+waiting on each other in a cycle; each agent on a cycle is told once.
+
+### Team log
+
+Telecom keeps a short history for each repository: who joined and left, task changes, broadcasts,
+claims and releases, and who took a lock from the line after whom. A session that joins late, or whose context was compacted, can read what was
+decided without opening other agents' transcripts. Agents call `telecom({ action: "log" })`,
+optionally with `paths` to see only entries about those files, and a full brief points to it when
+teammates have logged. Humans run `/telecom log`. Direct messages, asks and answers are private
+and never logged. A session that has left stays in the log for 24 hours.
 
 ### Worktrees
 
@@ -255,12 +304,13 @@ The `telecom` tool:
 |---|---|---|
 | `board` | `scope?` | Lists the agents in this repository: state, task, claims, recent changes, and asks waiting on this agent. `scope: "machine"` lists every agent on the machine. |
 | `send` | `to` or `paths`, `message` | Sends a message to one agent. Starts a turn if the agent is idle (see the wake limit below). |
-| `ask` | `to` or `paths`, `message`, `timeoutSec?` | Sends a question and waits for the answer (default 300 s, at most 1 h). An answer that arrives after the wait ended is delivered as a message. |
+| `ask` | `to` or `paths`, `message`, `timeoutSec?`, `wait?` | Sends a question and waits for the answer (default 300 s, at most 1 h). An answer that arrives after the wait ended is delivered as a message. With `wait: false` it returns at once, and the answer arrives later as a message (see below). |
 | `reply` | `message`, `askId?` | Answers an inbound ask. `askId` can be omitted when only one ask is waiting. |
 | `broadcast` | `message`, `paths?`, `scope?` | Sends a message to every agent in the repository. Never starts a turn. |
-| `status` | `message` | Sets the task peers see. |
-| `claim` | `paths`, `message?` | Reserves paths or globs. |
-| `release` | `paths?` | Releases those claims, or all of them. |
+| `status` | `message`, `waitingFor?` | Sets the task peers see, and whom this agent waits for. |
+| `claim` | `paths`, `message?`, `queue?` | Reserves paths or globs, or takes `@name` locks; `queue: true` waits in line for a held lock. |
+| `release` | `paths?` | Releases those claims, or all of them, and leaves the line for a lock. Releasing nothing is a no-op. |
+| `log` | `paths?` | The team's recent history in this repository (see [Team log](#team-log)). |
 
 `to` is a callsign, session name or id as the board shows it.
 
@@ -282,6 +332,14 @@ Delivery rules:
 - **Wake limit.** Direct messages and late answers start at most 6 turns per minute per agent
   (`PI_TELECOM_MAX_WAKES`). Beyond that, they arrive without starting a turn. Messages steered
   into a busy session do not use this allowance. Explicit tasks from `/telecom run` bypass it.
+- **Messages during an ask.** While an ask waits on a peer, messages from that peer are held and
+  shown in the ask's result ahead of the answer, in the order sent, so a newer answer is never read
+  before an older message. If the ask ends without an answer, they are delivered as usual.
+- **Asks that don't wait.** `ask` with `wait: false` delivers the question and returns at once.
+  The answer arrives later as a message that starts a turn. If none comes within `timeoutSec`
+  (default 1800 s, at most 3600 s), the asker gets a notice that starts no turn, also after a
+  `/reload`; a later answer still arrives. Use it for "tell me when your job is done" instead of a long timeout or a polling
+  loop. Such an ask creates no wait-for edge and never interrupts the receiver's own wait.
 - **Asks always start a turn**, since the asker is waiting. An agent about to stop with an
   unanswered ask is reminded once.
 - **Wait cycles.** Each agent publishes which sessions its asks are waiting on. An ask to an agent
@@ -311,6 +369,7 @@ Delivery rules:
 /telecom name <callsign>     rename this session
 /telecom widget              show or hide a live team list above the editor
 /telecom release             release every claim this session holds
+/telecom log                 the team log for this repository
 /telecom help                list the commands, including while telecom is off
 ```
 
@@ -396,12 +455,13 @@ about 950 prompt tokens to every session.
   `/telecom all` show agents in other repositories.
 - **Shared directory.** `$XDG_RUNTIME_DIR/pi-telecom`, or a directory under the OS temporary
   folder: `pi-telecom-<uid>` on Unix, `pi-telecom-<user hash>` on Windows. It holds one presence
-  record and one inbox per session. Files are written under a temporary name and then renamed,
+  record, one inbox and one log file per session. Files are written under a temporary name and then renamed,
   so a reader never sees a partial file. Unix roots must belong to the user and have mode `0700`;
   Windows uses the user's temporary folder and inherited Windows permissions. Temporarily locked
   messages stay queued, and one file's cleanup failure does not stop the rest of the inbox.
 - **Liveness.** A record is live while its process is. On Linux the process start time must also
-  match, so a reused process id isn't mistaken for a live session. Records of exited sessions are
+  match, so a reused process id isn't mistaken for a live session; when `/proc` can't be read for
+  another reason, the process id alone decides, so a live peer is never taken for dead. Records of exited sessions are
   removed. Subagents share their host's process, so they are also checked by heartbeat (see
   [Subagents](#subagents)). A suspended process stops all of its sessions at once, so their
   records are kept.

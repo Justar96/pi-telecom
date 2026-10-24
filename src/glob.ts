@@ -6,12 +6,42 @@
  *   - `*` matches within one path segment, `?` one character, `**` any depth: `src/**\/*.test.ts`
  *   - `{a,b}` alternates: `src/{api,db}/**`
  * A trailing `/` or `/**` on a plain directory means the same thing as the bare directory.
+ *
+ * A pattern that starts with `@` (`@cargo`, `@runtime`) is a named RESOURCE, not a path: a lock
+ * on something the team shares that is not a file (a build directory, the test runner, a port).
+ * It matches no file and overlaps only the same resource, so the edit guard, change notices and
+ * addressing by path never see it. Resource names are not filenames, so they compare without case.
+ * An older telecom reads `@cargo` as the relative path `<checkout>/@cargo`: it matches no real file
+ * (unless a folder by that name exists), overlaps the same name, and overlaps a claim on the whole
+ * checkout (`.`, `**`), which only makes that older peer more careful.
  */
 import { isAbsolute, normalize, parse, resolve, sep } from "node:path";
 import { displayPath, isWithin } from "./project.ts";
 import { escapeRegExp } from "./util.ts";
 
 const GLOB_CHARS = /[*?[{]/;
+/** A resource name: `@`, then a letter or digit, then letters, digits, `.`, `_` or `-`. */
+const RESOURCE_NAME = /^@[a-z0-9][a-z0-9._-]{0,47}$/i;
+
+/** Is this claim pattern a named resource (`@cargo`) rather than a path? Valid or not, it is never a path. */
+export function isResource(pattern: string): boolean {
+	return pattern.trim().startsWith("@");
+}
+
+/** Is `value` a well-formed resource name? Claims and peers' queue entries must be. */
+export function isResourceName(value: unknown): value is string {
+	return typeof value === "string" && RESOURCE_NAME.test(value);
+}
+
+/** The form a resource is stored and compared in: trimmed, lowercase. */
+export function resourceKey(pattern: string): string {
+	return pattern.trim().toLowerCase();
+}
+
+/** Do two claim patterns name the same resource? */
+export function sameResource(a: string, b: string): boolean {
+	return isResource(a) && isResource(b) && resourceKey(a) === resourceKey(b);
+}
 
 /** Glob syntax always uses `/`; native Windows inputs accept either separator. Do not rewrite
  *  backslashes on POSIX, where they can be literal filename characters. */
@@ -93,6 +123,8 @@ export function absolutePattern(pattern: string, root: string): string {
  * an absolute pattern outside the owner's checkout.
  */
 export function laneRelativePattern(pattern: string, ownerRoot: string): string | null {
+	// A resource is the repository's, not a checkout's: it reads the same in every lane.
+	if (isResource(pattern)) return resourceKey(pattern);
 	const trimmed = globPath(pattern.trim()).replace(/^\.\//, "");
 	if (!isAbsolute(trimmed)) return trimmed;
 	return isWithin(trimmed, ownerRoot) ? displayPath(trimmed, ownerRoot) : null;
@@ -105,6 +137,7 @@ export function matchesClaim(path: string, pattern: string, root: string): boole
 
 /** `matchesClaim` with the pattern compiled once, for testing many paths against one claim. */
 export function claimMatcher(pattern: string, root: string): (path: string) => boolean {
+	if (isResource(pattern)) return () => false;
 	const anchored = absolutePattern(pattern, root);
 	const literal = literalRootLength(anchored, root);
 	const glob = anchored.slice(literal);
@@ -126,6 +159,7 @@ export function claimMatcher(pattern: string, root: string): (path: string) => b
 
 /** Do two claim patterns overlap? Exact for plain paths; conservative for globs. */
 export function claimsOverlap(a: string, b: string, root: string): boolean {
+	if (isResource(a) || isResource(b)) return sameResource(a, b);
 	const left = absolutePattern(a, root);
 	const right = absolutePattern(b, root);
 	const leftGlob = globIndex(left, root) !== -1;

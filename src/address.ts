@@ -5,14 +5,20 @@
  * presence records and decides; the caller delivers.
  */
 import { UNRESPONSIVE_MS } from "./awareness.ts";
+import { idleFor } from "./board.ts";
 import { blockedOnMe, isForegroundChild } from "./family.ts";
 import { claimMatcher, claimsOverlap, laneRelativePattern } from "./glob.ts";
 import { displayPath, inCheckout, laneName, sameRepo } from "./project.ts";
 import type { Presence } from "./transport.ts";
-import { ago, idMatches, shortId } from "./util.ts";
+import { ago, elapsed, idMatches, shortId } from "./util.ts";
 
 /** A partial id shorter than this is too likely to match by accident. */
 const MIN_ID_PREFIX = 4;
+/**
+ * A peer's published step older than this is named to a sender: the peer is inside one long call,
+ * so "before their next step" would mislead. Below it the call is likely to end soon.
+ */
+export const LONG_STEP_MS = 60_000;
 
 /** `via`: how a target found by path was picked ("claims …", "changed … ago"), for the result. */
 export type Target = { ok: true; peer: Presence; via?: string } | { ok: false; reason: string };
@@ -124,7 +130,14 @@ export function stateHint(peer: Presence, self: Presence, peers: readonly Presen
 		if (blockedOnMe(self, peer, peers)) return "busy waiting for your run to end — it reads this after you finish";
 		const child = peers.find((c) => c.state === "busy" && isForegroundChild(c, peer));
 		if (child) return `busy waiting on its subagent ${child.callsign} — it reads this when that run ends`;
+		// One long call (a test suite, a build, a subagent): nothing reaches its model until it ends,
+		// and an ask that waits for it may time out first.
+		const step = peer.step;
+		if (step && Date.now() - step.since >= LONG_STEP_MS) {
+			return `busy in ${step.tool} for ${elapsed(step.since)} — it reads this when that call ends. A blocking ask may time out before then; telecom({ action: "ask", to: "${peer.callsign}", message: "…", wait: false }) returns at once`;
+		}
 		return "busy — it reaches them before their next step";
 	}
-	return "idle — this wakes them";
+	const idle = idleFor(peer);
+	return idle ? `idle for ${idle} — this wakes them` : "idle — this wakes them";
 }

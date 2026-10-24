@@ -4,7 +4,9 @@
  * Layout under the root (0700 and owned by this user on Unix; per-user temp storage on Windows):
  *
  *   presence/<session-id>.json        one record per live session, rewritten only by its owner
+ *   presence/<session-id>.left        empty: that session left on purpose (see `markLeft`)
  *   inbox/<session-id>/<seq>-<id>.json one file per envelope, renamed into place atomically
+ *   log/<session-id>.jsonl            the team log, rewritten only by its owner (see log.ts)
  *
  * Derived from @tinoy/pi-ipc / @tinoy/pi-ext-lib `ipc.ts` (MIT), with these changes:
  *   - the root falls back to a private directory under the OS temp dir when `$XDG_RUNTIME_DIR`
@@ -35,6 +37,7 @@ import { homedir, tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { CALLSIGN_PATTERN } from "./callsign.ts";
 import { ENV } from "./config.ts";
+import { isResourceName } from "./glob.ts";
 import { WAITS_CAP } from "./ledger.ts";
 import { clip, messageOf, shortId } from "./util.ts";
 
@@ -51,6 +54,11 @@ const WINDOWS_DEVICE = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i;
 const UNPARSEABLE_GRACE_MS = 5_000;
 /** An inbox without a presence record is kept this long, so a starting session can publish first. */
 const ORPHAN_INBOX_GRACE_MS = 60_000;
+/**
+ * A leave marker is kept this long. Peers need it only until their next team refresh (a second or
+ * two), so this is ample; the sweep removes it afterwards.
+ */
+const LEFT_MARK_KEEP_MS = 60_000;
 /** Waits between attempts to rename over a file Windows reports as locked (77 ms at most). */
 const RENAME_RETRY_MS = [2, 5, 10, 20, 40];
 /**
@@ -61,6 +69,19 @@ const RENAME_RETRY_MS = [2, 5, 10, 20, 40];
  * session in it at once, so their records fall behind together and none is dropped.
  */
 export const CHILD_SILENT_MS = 5 * 60_000;
+/**
+ * A peer's timestamp may lie this far in our future. Sessions share one machine and one clock, so
+ * this only absorbs a write racing our read; a time further ahead is a forged or broken record,
+ * and would show as a negative duration.
+ */
+const FUTURE_SKEW_MS = 60_000;
+/** A tool name as a peer may publish it: an identifier, the way pi and MCP servers name tools. */
+const TOOL_PATTERN = /^[A-Za-z0-9_.:-]{1,128}$/;
+
+/** Most teammates one agent may declare it waits for (`blockedOn`). */
+export const BLOCKED_CAP = 8;
+/** Most resource locks one agent may wait in line for (`queued`). */
+export const QUEUED_CAP = 8;
 
 export type Result<T> = ({ ok: true } & T) | { ok: false; reason: string };
 
@@ -74,6 +95,20 @@ export interface Claim {
 	since: number;
 	/** Refreshed whenever the owner edits inside the claim. */
 	expiresAt: number;
+}
+
+/** The tool call a busy agent is inside: it reads nothing it is sent until the call ends. */
+export interface Step {
+	/** The tool's name, as pi reports it (`bash`, `subagent`, …). */
+	tool: string;
+	since: number;
+}
+
+/** A place in the line for a resource lock. */
+export interface QueueEntry {
+	/** The resource, as `resourceKey` stores it (`@cargo`). */
+	pattern: string;
+	since: number;
 }
 
 export interface RecentFile {
@@ -108,7 +143,21 @@ export interface Presence {
 	waitingOn?: string[];
 	/** When the oldest of those asks started. */
 	waitingSince?: number;
+	/**
+	 * Teammates this agent declared it waits for (`status` with `waitingFor`), by session id. Kept
+	 * apart from `waitingOn`: a declared wait blocks no tool call, so it is no edge of the ask
+	 * graph (`closesCycle`). Absent when it waits for no one, and on an older telecom.
+	 */
+	blockedOn?: string[];
+	/** Resource locks (`@cargo`) this agent waits in line for, and since when; the earliest live
+	 *  waiter takes a lock when it frees. */
+	queued?: QueueEntry[];
 	state: "idle" | "busy";
+	/** When `state` last changed (idle ↔ busy). Optional: older peers do not send it. */
+	stateSince?: number;
+	/** While busy: the tool call that has run longest, once it has run `STEP_PUBLISH_AFTER_MS`
+	 *  (runtime.ts). A short call is not published: it would rewrite the record on every step. */
+	step?: Step;
 	task?: string;
 	taskAt?: number;
 	claims: Claim[];
@@ -140,6 +189,11 @@ export interface Envelope {
 	human?: boolean;
 	/** An explicit human request to run a task; bypasses the automatic peer wake limit. */
 	triggerTurn?: boolean;
+	/**
+	 * For `ask`: the asker is not waiting (`wait: false`), so the ask closes no wait cycle and the
+	 * reply reaches it as a message. Older peers ignore it and treat the ask as a blocking one.
+	 */
+	async?: true;
 	/**
 	 * For `broadcast`: the paths or globs it is about, in the sender's checkout. Agents working
 	 * there get it at once; the rest at their next prompt. Absent: it is about everyone.
@@ -217,15 +271,25 @@ function userKey(): string {
 
 /** Start time of a process in clock ticks since boot (Linux), or `null`. */
 export function processStartTicks(pid: number): number | null {
+	return readStartTicks(pid) ?? null;
+}
+
+/**
+ * `processStartTicks`, but `undefined` when `/proc/<pid>/stat` could not be read for a reason
+ * other than the process being gone (out of file descriptors, a restricted `/proc`). Liveness must
+ * not read that as death: every session's sweep would then unlink a live peer's record, and the
+ * team would see it leave and rejoin.
+ */
+export function readStartTicks(pid: number, read: (path: string) => string = (path) => readFileSync(path, "utf8")): number | null | undefined {
 	if (process.platform !== "linux" || !Number.isSafeInteger(pid) || pid <= 0) return null;
 	try {
-		const line = readFileSync(`/proc/${pid}/stat`, "utf8");
+		const line = read(`/proc/${pid}/stat`);
 		// comm (field 2) is parenthesised and may contain spaces or ')': split after the LAST ')'.
 		const fields = line.slice(line.lastIndexOf(")") + 2).split(" ");
 		const ticks = Number(fields[19]);
 		return Number.isFinite(ticks) && ticks > 0 ? ticks : null;
-	} catch {
-		return null;
+	} catch (error) {
+		return isErrno(error, "ENOENT") || isErrno(error, "ESRCH") ? null : undefined;
 	}
 }
 
@@ -249,9 +313,47 @@ export function hostBeats(records: readonly Presence[], now = Date.now()): Map<n
 	return beats;
 }
 
+/** The order `readPeers` returns records in: oldest session first. */
+export function byStart(a: Presence, b: Presence): number {
+	return a.startedAt - b.startedAt || a.id.localeCompare(b.id);
+}
+
+/**
+ * Which sessions seen at the last team refresh have left, as of this one. A live session's record
+ * can be missing for a moment: a sweeper that misjudged its liveness (a `/proc` read that failed
+ * for want of file descriptors, say) unlinks it, or the runtime directory is cleaned, and its owner
+ * writes it again on its next refresh. So a record missing for the first time is only `departing`,
+ * and still counts as present; it is `gone` once it is missing a second refresh in a row, or at
+ * once when its process is provably dead. `known` is the last refresh's view, departing records
+ * included; `departing` the ids that were already missing then.
+ */
+export function settleDepartures(
+	known: ReadonlyMap<string, Presence>,
+	read: readonly Presence[],
+	departing: ReadonlySet<string>,
+	alive: (record: Presence) => boolean = (record) => isLive(record),
+): { departing: Map<string, Presence>; gone: Presence[] } {
+	const present = new Set(read.map((r) => r.id));
+	const next = new Map<string, Presence>();
+	const gone: Presence[] = [];
+	for (const [id, record] of known) {
+		if (present.has(id)) continue;
+		// A dead process proves the departure. A live one proves nothing: a session that leaves
+		// cleanly (`/telecom off`, `/new`, a finished subagent) outlives its record in its process.
+		if (departing.has(id) || !alive(record)) gone.push(record);
+		else next.set(id, record);
+	}
+	return { departing: next, gone };
+}
+
 function isAlive(pid: number, ticks: number | null): boolean {
 	if (!Number.isSafeInteger(pid) || pid <= 0) return false;
-	if (ticks !== null && process.platform === "linux") return processStartTicks(pid) === ticks;
+	if (ticks !== null && process.platform === "linux") {
+		const now = readStartTicks(pid);
+		// Unreadable is not gone: fall back to signalling the pid, which cannot see pid reuse but
+		// cannot mistake a live peer for a dead one either.
+		if (now !== undefined) return now === ticks;
+	}
 	try {
 		process.kill(pid, 0);
 		return true;
@@ -297,8 +399,11 @@ const LIMITS = {
 	claims: 32,
 	recent: 24,
 	waits: WAITS_CAP,
+	blocked: BLOCKED_CAP,
+	queued: QUEUED_CAP,
 	broadcastPaths: 16,
 	summary: 120,
+	tool: 40,
 	excerptLines: 4,
 	excerptLine: 100,
 } as const;
@@ -308,12 +413,12 @@ const CONTROL_RUNS = new RegExp(`${CONTROL_CHARS.source}+`, "g");
 
 /** A path as a peer may send it: bounded, and without control characters that could break out
  *  of the line it is shown on. Paths are compared as keys, so they are refused, never rewritten. */
-function isPath(value: unknown): value is string {
+export function isPath(value: unknown): value is string {
 	return str(value) && value.length <= LIMITS.path && !CONTROL_CHARS.test(value);
 }
 
 /** One line, at most `max` characters, with no control characters; `undefined` when empty. */
-function line(value: unknown, max: number): string | undefined {
+export function line(value: unknown, max: number): string | undefined {
 	if (typeof value !== "string") return undefined;
 	return clip(value.replace(CONTROL_RUNS, " "), max) || undefined;
 }
@@ -331,6 +436,22 @@ function parseClaims(value: unknown): Claim[] {
 	return out;
 }
 
+/** Queue entries name resources only (never paths), so a hostile entry cannot smuggle text. */
+function parseQueued(value: unknown, now: number): QueueEntry[] {
+	if (!Array.isArray(value)) return [];
+	const out: QueueEntry[] = [];
+	for (const raw of value.slice(0, LIMITS.queued)) {
+		const q = raw as Partial<QueueEntry> | null;
+		// `since` orders the line, so a forged 0 (or a time ahead of ours) would jump it: only a
+		// plausible past time counts. A peer can still write a plausible earlier time than the truth
+		// and get ahead of honest waiters: that is the trust boundary every peer field has (these
+		// are this user's own sessions), and telecom is a teammate, not a security boundary.
+		if (!q || !isResourceName(q.pattern) || !past(q.since, now)) continue;
+		out.push({ pattern: q.pattern.toLowerCase(), since: q.since });
+	}
+	return out;
+}
+
 function parseRecent(value: unknown): RecentFile[] {
 	if (!Array.isArray(value)) return [];
 	const out: RecentFile[] = [];
@@ -342,6 +463,19 @@ function parseRecent(value: unknown): RecentFile[] {
 		out.push({ path: r.path, op: r.op, at: r.at });
 	}
 	return out;
+}
+
+/** A time a peer reports for something that already happened: finite, positive, not ahead of us. */
+function past(value: unknown, now: number): value is number {
+	return num(value) && value > 0 && value <= now + FUTURE_SKEW_MS;
+}
+
+function parseStep(value: unknown, now: number): { step?: Step } {
+	const s = value as Partial<Step> | null;
+	if (typeof s !== "object" || s === null || typeof s.tool !== "string" || !TOOL_PATTERN.test(s.tool) || !past(s.since, now)) {
+		return {};
+	}
+	return { step: { tool: clip(s.tool, LIMITS.tool), since: s.since } };
 }
 
 export function parsePresence(value: unknown): Presence | null {
@@ -358,6 +492,7 @@ export function parsePresence(value: unknown): Presence | null {
 	const branch = line(r.branch, LIMITS.branch);
 	const model = line(r.model, LIMITS.model);
 	const task = line(r.task, LIMITS.task);
+	const now = Date.now();
 	return {
 		v: WIRE_VERSION,
 		id: r.id,
@@ -368,10 +503,14 @@ export function parsePresence(value: unknown): Presence | null {
 		projectRoot: r.projectRoot,
 		role: r.role === "child" ? "child" : "main",
 		state: r.state === "busy" ? "busy" : "idle",
+		// Both optional (older peers do not send them), and shown only: nothing decides on them.
+		...(past(r.stateSince, now) ? { stateSince: r.stateSince } : {}),
+		...parseStep(r.step, now),
 		...(isPath(r.repo) ? { repo: r.repo } : {}),
 		...(isId(r.parent) ? { parent: r.parent } : {}),
 		...(Array.isArray(r.waitingOn) ? { waitingOn: r.waitingOn.filter(isId).slice(0, LIMITS.waits) } : {}),
 		...(num(r.waitingSince) ? { waitingSince: r.waitingSince } : {}),
+		...blockedAndQueued(r, now),
 		claims: parseClaims(r.claims),
 		recent: parseRecent(r.recent),
 		startedAt: r.startedAt,
@@ -382,6 +521,12 @@ export function parsePresence(value: unknown): Presence | null {
 		...(task ? { task } : {}),
 		...(num(r.taskAt) ? { taskAt: r.taskAt } : {}),
 	};
+}
+
+function blockedAndQueued(r: Record<string, unknown>, now: number): { blockedOn?: string[]; queued?: QueueEntry[] } {
+	const blockedOn = Array.isArray(r.blockedOn) ? [...new Set(r.blockedOn.filter(isId))].slice(0, LIMITS.blocked) : [];
+	const queued = parseQueued(r.queued, now);
+	return { ...(blockedOn.length > 0 ? { blockedOn } : {}), ...(queued.length > 0 ? { queued } : {}) };
 }
 
 export function parseEnvelope(value: unknown): Envelope | null {
@@ -409,6 +554,7 @@ export function parseEnvelope(value: unknown): Envelope | null {
 		...(r.data !== undefined ? { data: r.data } : {}),
 		...(r.human === true ? { human: true } : {}),
 		...(r.kind === "message" && r.human === true && r.triggerTurn === true ? { triggerTurn: true } : {}),
+		...(r.kind === "ask" && r.async === true ? { async: true as const } : {}),
 		...broadcastPaths(r),
 	};
 }
@@ -535,7 +681,8 @@ function renameRetrying(from: string, to: string): void {
 	}
 }
 
-function writeAtomic(dir: string, name: string, body: string): Result<object> {
+/** Write `name` in `dir` whole: to a temporary name, then renamed over it (presence, inbox, team log). */
+export function writeAtomic(dir: string, name: string, body: string): Result<object> {
 	tmpCounter += 1;
 	const tmp = join(dir, `.tmp-${process.pid}-${tmpCounter}`);
 	try {
@@ -565,7 +712,7 @@ function readJson(path: string): unknown {
 	}
 }
 
-function isErrno(error: unknown, code: string): boolean {
+export function isErrno(error: unknown, code: string): boolean {
 	return (error as NodeJS.ErrnoException | null)?.code === code;
 }
 
@@ -576,6 +723,17 @@ export interface Transport {
 	readonly root: string;
 	writePresence(record: Presence): Result<object>;
 	removePresence(id: string): void;
+	/**
+	 * Mark that session `id` left on purpose (`/telecom off`, `/new`, a finished subagent). Its
+	 * process may live on, so without this a peer could not tell its missing record from one a
+	 * sweeper removed by mistake, and would count it present for one more refresh
+	 * (`settleDepartures`). Older sessions ignore the file.
+	 */
+	markLeft(id: string): void;
+	/** Whether session `id` left on purpose (`markLeft`). Only asked about a record that is missing. */
+	hasLeft(id: string): boolean;
+	/** Take back a leave mark: session `id` is back (`/telecom on`, a resume). */
+	clearLeft(id: string): void;
 	/** Every live session on the machine, this one included. */
 	readPeers(): Presence[];
 	/** Remove the records (and inboxes) of sessions that are gone. Returns the ids removed. */
@@ -627,6 +785,35 @@ export function openTransport(root: string): Transport {
 			rmSync(join(presenceDir, `${id}.json`), { force: true });
 		},
 
+		markLeft(id) {
+			if (!isId(id)) return;
+			try {
+				mkdirSync(presenceDir, { recursive: true, mode: 0o700 });
+				writeFileSync(join(presenceDir, `${id}.left`), "");
+			} catch {
+				/* best effort: peers then count the departure one refresh later */
+			}
+		},
+
+		hasLeft(id) {
+			if (!isId(id)) return false;
+			try {
+				lstatSync(join(presenceDir, `${id}.left`));
+				return true;
+			} catch {
+				return false;
+			}
+		},
+
+		clearLeft(id) {
+			if (!isId(id)) return;
+			try {
+				rmSync(join(presenceDir, `${id}.left`), { force: true });
+			} catch {
+				/* a stale mark only matters while the record is missing, and the sweep removes it */
+			}
+		},
+
 		readPeers() {
 			const read = new Map<string, Presence>();
 			for (const name of presenceFiles()) {
@@ -645,7 +832,7 @@ export function openTransport(root: string): Transport {
 			const beats = hostBeats(records);
 			return records
 				.filter((r) => isLive(r, beats.get(r.pid)))
-				.sort((a, b) => a.startedAt - b.startedAt || a.id.localeCompare(b.id));
+				.sort(byStart);
 		},
 
 		sweep() {
@@ -683,6 +870,20 @@ export function openTransport(root: string): Transport {
 					} catch {
 						/* a locked inbox can be reclaimed by the orphan sweep on a later tick */
 					}
+				}
+			}
+			// Leave marks matter only until every peer's next refresh.
+			let marks: string[] = [];
+			try {
+				marks = readdirSync(presenceDir).filter((n) => n.endsWith(".left") && !n.startsWith("."));
+			} catch {
+				/* no presence directory yet */
+			}
+			for (const name of marks) {
+				try {
+					if (Date.now() - lstatSync(join(presenceDir, name)).mtimeMs >= LEFT_MARK_KEEP_MS) rmSync(join(presenceDir, name), { force: true });
+				} catch {
+					/* raced with another sweeper */
 				}
 			}
 			// An inbox with no presence record belongs to a session that has gone (a message can

@@ -14,10 +14,11 @@
  */
 import { UNRESPONSIVE_MS } from "./awareness.ts";
 import { lineOf } from "./family.ts";
-import { claimMatcher, claimsOverlap, laneRelativePattern } from "./glob.ts";
+import { claimMatcher, claimsOverlap, isResource, laneRelativePattern, sameResource } from "./glob.ts";
+import { callsignsOf, declaredCycles, lineFor, lockLines } from "./locks.ts";
 import { displayPath, inCheckout, type Lane, laneIn, laneName, type PlaceCache, placeOf, readBranch, sameRepo, workingCheckout } from "./project.ts";
 import type { Presence } from "./transport.ts";
-import { ago, clip, plural, shortId } from "./util.ts";
+import { ago, clip, elapsed, plural, shortId } from "./util.ts";
 
 const RECENT_SHOWN = 4;
 /** The board lists at most this many agents; a result the model reads must stay bounded. */
@@ -28,6 +29,8 @@ const MAX_DEPTH = 16;
 const DESCRIBE_ALL_UP_TO = 3;
 /** A brief describes at most this many agents in full; the rest go on the roster. */
 const MAX_DESCRIBED = 6;
+/** An idle peer is shown with how long it has been idle from this long on; "idle 3s" says nothing. */
+const IDLE_SHOWN_AFTER_MS = 60_000;
 
 function label(peer: Presence, viewer: Presence, peers: readonly Presence[]): string {
 	const name = peer.name && peer.name !== peer.callsign ? ` "${clip(peer.name, 30)}"` : "";
@@ -76,11 +79,29 @@ function workplace(peer: Presence, cache?: PlaceCache): { checkout: string; lane
 	return { checkout, lane: laneIn(checkout, peer), branch: read ? clip(read, 100) : peer.branch };
 }
 
-/** One peer, as a block of lines, as `viewer` sees it. `peers` name a subagent's parent. */
+/**
+ * A peer's state with how long it has held it: `busy · bash 14m` (the long tool call it is in),
+ * `idle 12m`. For the board, read on demand. Briefs show the bare state: a time there is stale by
+ * the next turn, and would make every brief differ from the last.
+ */
+export function liveState(peer: Presence, now = Date.now()): string {
+	if (peer.state === "busy") return peer.step ? `busy · ${peer.step.tool} ${elapsed(peer.step.since, now)}` : "busy";
+	const idle = idleFor(peer, now);
+	return idle ? `idle ${idle}` : "idle";
+}
+
+/** How long an idle peer has been idle ("12m"), once that is long enough to say; else null. */
+export function idleFor(peer: Presence, now = Date.now()): string | null {
+	if (peer.state !== "idle" || peer.stateSince === undefined || now - peer.stateSince < IDLE_SHOWN_AFTER_MS) return null;
+	return elapsed(peer.stateSince, now);
+}
+
+/** One peer, as a block of lines, as `viewer` sees it. `peers` name a subagent's parent. `live`
+ *  (the board) adds how long it has been busy in a step or idle (`liveState`). */
 function describePeer(
 	peer: Presence,
 	viewer: Presence,
-	opts: { self?: boolean; now?: number; peers?: readonly Presence[]; waits?: boolean } = {},
+	opts: { self?: boolean; now?: number; peers?: readonly Presence[]; waits?: boolean; live?: boolean } = {},
 ): string[] {
 	const now = opts.now ?? Date.now();
 	const lines: string[] = [];
@@ -96,7 +117,9 @@ function describePeer(
 	let state =
 		!opts.self && now - peer.heartbeatAt > UNRESPONSIVE_MS
 			? `unresponsive, last seen ${ago(peer.heartbeatAt, now)}`
-			: peer.state;
+			: opts.live && !opts.self
+				? liveState(peer, now)
+				: peer.state;
 	if (opts.waits && peer.waitingOn?.length) {
 		const on = peer.waitingOn.map((id) =>
 			id === viewer.id ? "you" : ((opts.peers ?? []).find((p) => p.id === id)?.callsign ?? shortId(id)),
@@ -105,6 +128,9 @@ function describePeer(
 	}
 	lines.push(`• ${label(peer, viewer, opts.peers ?? [])} [${state}]${branch}${where}${you}  id ${shortId(peer.id)}`);
 	if (peer.task) lines.push(`    task: ${clip(peer.task, 140)}${peer.taskAt ? ` (${ago(peer.taskAt, now)})` : ""}`);
+	// Declared waits and places in line for a lock: what holds this agent up.
+	if (peer.blockedOn?.length) lines.push(`    waiting for: ${callsignsOf(peer.blockedOn, opts.peers ?? [], viewer.id).join(", ")}`);
+	if (peer.queued?.length) lines.push(`    queued for: ${peer.queued.map((q) => q.pattern).join(", ")}`);
 	const claims = liveClaims(peer, now);
 	if (claims.length > 0) {
 		// Claims made together share their note: say it once per group, not once per path.
@@ -156,9 +182,16 @@ export function renderBoard(input: BoardInput): string {
 			? `📡 You are ${self.callsign}. No other agent is live ${where}.`
 			: `📡 You are ${self.callsign}. ${plural(others.length, "other agent")} live ${where}:`,
 	);
-	for (const peer of others.slice(0, MAX_LISTED)) lines.push(...describePeer(peer, self, { peers: input.peers, waits: true }));
+	for (const peer of others.slice(0, MAX_LISTED)) lines.push(...describePeer(peer, self, { peers: input.peers, waits: true, live: true }));
 	if (others.length > MAX_LISTED) lines.push(`… and ${others.length - MAX_LISTED} more`);
 	lines.push("", ...describePeer(self, self, { self: true, peers: input.peers }));
+	const team = [self, ...others.filter((p) => sameRepo(p, self))];
+	const locks = lockLines(team, self.id, Date.now());
+	if (locks.length > 0) lines.push("", "Locks (claim one with queue: true to wait in line):", ...locks.map((l) => `  ${l}`));
+	for (const cycle of declaredCycles(team)) {
+		const names = callsignsOf(cycle, team, "");
+		lines.push("", `⚠ Wait cycle: ${names.join(" → ")} — each declared it waits for the next, so none of them moves until one goes ahead.`);
+	}
 	if (input.inboundAsks.length > 0) {
 		lines.push("", `Unanswered asks (a peer is blocked waiting — answer with action "reply"):`);
 		for (const ask of input.inboundAsks) {
@@ -191,6 +224,9 @@ export interface BriefState {
 			holders: Map<string, string>;
 			members: string[];
 			described: boolean;
+			/** The locks it waits in line for, and whom it declared it waits for, as last told. */
+			queued: string[];
+			waits: string[];
 		}
 	>;
 	/** When the last full brief was sent; 0 asks for one (a compaction or a new callsign). */
@@ -216,6 +252,23 @@ const NO_FOCUS: Focus = { paths: new Set(), contacts: new Set() };
  * a message about nothing they must act on.
  */
 export const TASK_ONLY_HOLD_MS = 5 * 60_000;
+
+/** `@cargo (yours)` or `@cargo (held by charlie)`: a lock as an update names it. */
+function lockHolderText(name: string, self: Presence, all: readonly Presence[], now: number): string {
+	if (liveClaims(self, now).some((c) => sameResource(c.pattern, name))) return `${name} (yours)`;
+	const holder = all.find((p) => liveClaims(p, now).some((c) => sameResource(c.pattern, name)));
+	return holder ? `${name} (held by ${holder.callsign})` : name;
+}
+
+/** The locks this agent holds that others wait in line for: worth knowing, to release them soon. */
+function yourLocks(self: Presence, all: readonly Presence[], now: number): string | null {
+	const lines = liveClaims(self, now)
+		.filter((c) => isResource(c.pattern))
+		.map((c) => ({ name: c.pattern, line: lineFor(c.pattern, all).filter((w) => w.peer.id !== self.id) }))
+		.filter((l) => l.line.length > 0)
+		.map((l) => `${l.name} (queue: ${l.line.map((w) => w.peer.callsign).join(", ")})`);
+	return lines.length > 0 ? `Your locks others wait for: ${lines.join("; ")}. Release each as soon as you are done.` : null;
+}
 
 /** One entry of a brief: a peer, and the subagents folded into it. */
 interface Unit {
@@ -265,6 +318,12 @@ function claimHolders(unit: Unit, now: number): Map<string, string> {
 /** Does `member`'s work touch this agent's? */
 function touches(member: Presence, self: Presence, focus: Focus, now: number): boolean {
 	if (focus.contacts.has(member.id)) return true;
+	// Waits bind two agents whatever files they work on: one declared it waits for the other, or
+	// waits in line for a lock the other holds.
+	if (member.blockedOn?.includes(self.id) || self.blockedOn?.includes(member.id)) return true;
+	const holds = (holder: Presence, waiter: Presence) =>
+		(waiter.queued ?? []).some((q) => liveClaims(holder, now).some((c) => sameResource(c.pattern, q.pattern)));
+	if (holds(self, member) || holds(member, self)) return true;
 	if (member.parent !== undefined && member.parent === self.parent) return true;
 	const otherLane = member.projectRoot !== self.projectRoot;
 	for (const r of member.recent) {
@@ -285,13 +344,13 @@ function unitTouches(unit: Unit, self: Presence, focus: Focus, now: number): boo
 	return touches(unit.peer, self, focus, now) || unit.subagents.some((s) => touches(s, self, focus, now));
 }
 
-/** A unit as one roster entry: who, what, and what they hold. */
-function rosterEntry(unit: Unit, now: number): string {
+/** A unit as one roster entry: who, what, what they hold, and whom they wait for. */
+function rosterEntry(unit: Unit, now: number, waits: readonly string[] = []): string {
 	const claims = unitClaims(unit, now);
 	const folded = unit.subagents.length > 0 ? ` +${plural(unit.subagents.length, "subagent")}` : "";
 	return `${unit.peer.callsign} [${unit.peer.state}]${unit.peer.task ? ` ${clip(unit.peer.task, 40)}` : ""}${folded}${
 		claims.length > 0 ? ` (claims ${claims.join(", ")})` : ""
-	}`;
+	}${waits.length > 0 ? ` — waiting for ${waits.join(", ")}` : ""}`;
 }
 
 /** Where a unit works, as an update tells it: `on lane-b in worktree /repo-b`. */
@@ -300,11 +359,14 @@ function laneText(peer: Presence): string {
 	return `${branch ? `on ${branch} ` : ""}in ${laneName(lane)}`;
 }
 
-function stateOf(units: readonly Unit[], now: number, described: ReadonlySet<string>): BriefState["peers"] {
+function stateOf(units: readonly Unit[], now: number, described: ReadonlySet<string>, self: Presence, all: readonly Presence[]): BriefState["peers"] {
 	return new Map(
 		units.map((u) => [
 			u.peer.id,
 			{
+				// Names only, never times: an update compares these, and a clock must not make news.
+				queued: (u.peer.queued ?? []).map((q) => q.pattern),
+				waits: callsignsOf(u.peer.blockedOn ?? [], all, self.id),
 				callsign: u.peer.callsign,
 				task: u.peer.task ?? "",
 				claims: unitClaims(u, now),
@@ -372,13 +434,15 @@ export function renderBrief(
 		];
 		for (const unit of described) lines.push(...describeUnit(unit, self, all, now));
 		if (roster.length > 0) {
-			const listed = roster.slice(0, MAX_LISTED).map((u) => rosterEntry(u, now));
+			const listed = roster.slice(0, MAX_LISTED).map((u) => rosterEntry(u, now, callsignsOf(u.peer.blockedOn ?? [], all, self.id)));
 			if (roster.length > MAX_LISTED) listed.push(`… and ${roster.length - MAX_LISTED} more`);
 			lines.push(`${described.length > 0 ? "Also here, not near your work so far" : "None of them is near your work so far"}: ${listed.join("; ")}`);
 		}
 		lines.push(
 			"Stay out of their claimed paths, re-read files they changed before editing, and use the telecom tool to coordinate when your work overlaps theirs.",
 		);
+		const waitedFor = yourLocks(self, all, now);
+		if (waitedFor) lines.push(waitedFor);
 		// An agent put to work by a peer's message (no prompt of its own) has no task to show, and
 		// its teammates' briefs then say nothing about what it does.
 		if (!self.task) {
@@ -386,10 +450,10 @@ export function renderBrief(
 				'Peers see no task for you: once you know what you are working on, set it with telecom({ action: "status", message: "…" }).',
 			);
 		}
-		return { text: lines.join("\n"), summary, state: { peers: stateOf(units, now, ids), fullAt: now, toldAt: now } };
+		return { text: lines.join("\n"), summary, state: { peers: stateOf(units, now, ids, self, all), fullAt: now, toldAt: now } };
 	}
 
-	const current = stateOf(units, now, new Set());
+	const current = stateOf(units, now, new Set(), self, all);
 	const described = new Set<string>();
 	let describedNow = 0;
 	const describe = (unit: Unit, label: string): string[] => {
@@ -399,7 +463,7 @@ export function renderBrief(
 	};
 	const changes: string[] = [];
 	/** Far units whose news was held back: what this agent still knows of their task, claims and lane. */
-	const held = new Map<string, { task: string; claims: string[]; lane: string }>();
+	const held = new Map<string, { task: string; claims: string[]; lane: string; queued: string[]; waits: string[] }>();
 	/** Near units whose task or lane changed: what this agent was told before. */
 	const moves = new Map<string, { task: string; lane: string }>();
 	/** The update lines that only say a peer moved on (task or lane). */
@@ -437,6 +501,8 @@ export function renderBrief(
 				task: before.task,
 				claims: before.claims.filter((c) => after.claims.includes(c)),
 				lane: before.lane,
+				queued: before.queued ?? [],
+				waits: before.waits ?? [],
 			});
 			continue;
 		}
@@ -453,6 +519,12 @@ export function renderBrief(
 		const dropped = before.claims.filter((c) => !after.claims.includes(c));
 		if (added.length) changes.push(`• ${name} claimed ${added.join(", ")}`);
 		if (dropped.length) changes.push(`• ${name} released ${dropped.join(", ")}`);
+		const inLine = after.queued.filter((q) => !(before.queued ?? []).includes(q));
+		if (inLine.length) changes.push(`• ${name} queued for ${inLine.map((q) => lockHolderText(q, self, all, now)).join(", ")}`);
+		// A new declared wait is news; one cleared is not (the agent is simply back at work).
+		if (after.waits.length > 0 && after.waits.join(", ") !== (before.waits ?? []).join(", ")) {
+			changes.push(`• ${name} is waiting for ${after.waits.join(", ")}`);
+		}
 	}
 	// Every session still here, folded or not: a leaving unit's claims held by one of them are not free.
 	const present = new Set(units.flatMap((u) => [u.peer.id, ...u.subagents.map((s) => s.id)]));

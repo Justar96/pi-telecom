@@ -11,13 +11,25 @@
 import type { ExtensionAPI, ExtensionContext, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import type { TUI } from "@earendil-works/pi-tui";
 import { Awareness } from "./awareness.ts";
-import { type BoardScope, type BriefState, renderBoard } from "./board.ts";
+import { type BoardScope, type BriefState, renderBoard, renderBrief } from "./board.ts";
 import { CALLSIGN_PATTERN } from "./callsign.ts";
 import { readConfig, type TelecomConfig } from "./config.ts";
-import { createAskLedger, WAITS_CAP } from "./ledger.ts";
+import { isResource, sameResource } from "./glob.ts";
+import { createAskLedger, type HeldMessage, WAITS_CAP } from "./ledger.ts";
+import { type LogEntry, type LogKind, TeamLog } from "./log.ts";
 import { type PlaceCache, sameRepo } from "./project.ts";
-import { type Paint, PLAIN, type TelecomMessageDetails } from "./render.ts";
-import { type Envelope, type Presence, type TelecomEvent, type Transport, WIRE_VERSION } from "./transport.ts";
+import { MESSAGE_TYPES, type Paint, PLAIN, type TelecomMessageDetails } from "./render.ts";
+import {
+	byStart,
+	type Envelope,
+	isLive,
+	type Presence,
+	type Step,
+	type TelecomEvent,
+	type Transport,
+	settleDepartures,
+	WIRE_VERSION,
+} from "./transport.ts";
 import { clip, messageOf, newId, setBounded } from "./util.ts";
 import { type BoardPanel, offStatus, statusText, type TeamSnapshot, TeamWidget, widgetLines } from "./view.ts";
 
@@ -35,6 +47,14 @@ const WAKE_WINDOW_MS = 60_000;
 const TASK_CAP = 160;
 /** Sessions this agent has talked with directly; they stay relevant in its briefs. */
 const CONTACTS_CAP = 256;
+/**
+ * A tool call that has run this long is published as this agent's `step`, so a sender learns that
+ * a message waits for the call to end. Shorter calls are not: publishing each would rewrite the
+ * record on every step, and "before their next step" is then true anyway.
+ */
+export const STEP_PUBLISH_AFTER_MS = 15_000;
+/** Tool calls tracked at once; bounded in case a call's end never comes. */
+const RUNNING_CAP = 64;
 
 /**
  * How a message reaches the model (AGENTS.md, "Delivery to the model"). `wake` starts a turn when
@@ -59,13 +79,25 @@ export class Runtime {
 	lastHeartbeat = 0;
 	/** Consecutive failed writes of our record; the loop writes it again while this is not 0. */
 	presenceFailures = 0;
-	/** The live records as of the last read (`readPeers`), this session's included. */
+	/** The live records as of the last read (`readPeers`), this session's included. Fresh, but a
+	 *  record missing from one read may be back on the next: who is in the team is `present`. */
 	peers: Presence[] = [];
+	/**
+	 * The team as the last team refresh settled it, this session included: records missing from
+	 * that read for the first time are kept (`settleDepartures`). Briefs, the footer and widget, and
+	 * the line for a lock go by this (or by `presentNow`), so a one-read miss is never told as a
+	 * leave and then, a second later, as a join.
+	 */
+	present: Presence[] = [];
+	/** The sessions the last refresh found missing but still counts in `present`. */
+	private departing = new Set<string>();
 	briefState: BriefState | null = null;
 	/** The current task was set on purpose, so only a new direction from a prompt replaces it. */
 	taskExplicit = false;
 	readonly awareness = new Awareness();
 	readonly ledger = createAskLedger();
+	/** This session's part of the team log, and the reader of everyone's (`log.ts`). */
+	readonly log = new TeamLog();
 	/** Sessions this agent has talked with directly; they stay relevant in its briefs. */
 	readonly contacts = new Map<string, true>();
 	/** Who was held back by each of our claims (pattern → peer id → callsign), so a release can tell them. */
@@ -81,6 +113,10 @@ export class Runtime {
 	private shownStatus: string | undefined;
 	private readonly wakeTimes: number[] = [];
 	private readonly reported = new Set<string>();
+	/** Tool calls running now (call id → tool, start), kept locally until one runs long (`publishStep`). */
+	private readonly running = new Map<string, Step>();
+	/** The call whose step our published record shows, if any. */
+	private stepCall: string | null = null;
 
 	/**
 	 * Every hook is registered through this. pi treats a throwing `tool_call` handler as a veto —
@@ -161,6 +197,50 @@ export class Runtime {
 		return this.peers;
 	}
 
+	/**
+	 * Settle a read against the team of the last refresh (`present`): a record missing for the first
+	 * time stays, one missing twice in a row, or whose process is dead, or that left on purpose
+	 * (`Transport.markLeft`), is gone. With `commit` (the team refresh) the result becomes `present`;
+	 * without it, only sessions seen for the first time are added to it.
+	 */
+	settleTeam(read: readonly Presence[], commit: boolean): Presence[] {
+		const selfId = this.self?.id;
+		const known = new Map(this.present.filter((p) => p.id !== selfId).map((p) => [p.id, p]));
+		const settled = settleDepartures(
+			known,
+			read.filter((p) => p.id !== selfId),
+			this.departing,
+			(record) => isLive(record) && !(this.transport?.hasLeft(record.id) ?? false),
+		);
+		const present = settled.departing.size === 0 ? [...read] : [...read, ...settled.departing.values()].sort(byStart);
+		if (commit) {
+			this.present = present;
+			this.departing = new Set(settled.departing.keys());
+		} else {
+			// A session first seen now has joined, whatever the next refresh reads: a brief may tell
+			// the model so before that refresh, and a miss on the read after must not then be a leave.
+			const seen = new Set(this.present.map((p) => p.id));
+			const joined = read.filter((p) => !seen.has(p.id));
+			if (joined.length > 0) this.present = [...this.present, ...joined].sort(byStart);
+		}
+		return present;
+	}
+
+	/** Start the team over from `read`: this session joined, or left (`[]`). */
+	resetTeam(read: readonly Presence[]): void {
+		this.present = [...read];
+		this.departing = new Set();
+	}
+
+	/**
+	 * The team as of now: `read` (a fresh read by default) settled against the last refresh's team,
+	 * which only the refresh updates (bar newcomers, see `settleTeam`). For what must be both current
+	 * and debounced: a brief, the line for a lock.
+	 */
+	presentNow(read: readonly Presence[] = this.readPeers()): Presence[] {
+		return this.settleTeam(read, false);
+	}
+
 	/** Live peers in this repository (this checkout or a sibling worktree), this session excluded. */
 	team(peers: readonly Presence[] = this.peers): Presence[] {
 		const me = this.self;
@@ -169,7 +249,9 @@ export class Runtime {
 
 	/** The task peers see for this agent. */
 	setTask(me: Presence, text: string, explicit: boolean): void {
+		const before = me.task;
 		me.task = clip(text, TASK_CAP);
+		if (me.task !== before) this.logEntry("task", `task: ${me.task}`);
 		me.taskAt = Date.now();
 		this.taskExplicit = explicit;
 	}
@@ -182,6 +264,70 @@ export class Runtime {
 		if (waits.since !== undefined) this.self.waitingSince = waits.since;
 		else delete this.self.waitingSince;
 		this.publish();
+	}
+
+	/** Mark this agent busy or idle; `stateSince` says since when, for peers' hints and boards. */
+	setState(me: Presence, state: Presence["state"]): void {
+		if (me.state !== state || me.stateSince === undefined) me.stateSince = Date.now();
+		me.state = state;
+		if (state === "idle") this.endSteps();
+	}
+
+	/** A tool call started. Only noted: the tick publishes it once it runs long (`publishStep`). */
+	noteStepStart(callId: string, tool: string): void {
+		setBounded(this.running, callId, { tool, since: Date.now() }, RUNNING_CAP);
+	}
+
+	/** A tool call ended. The record is written again only if it showed this call. */
+	noteStepEnd(callId: string): void {
+		if (!this.running.delete(callId) || this.stepCall !== callId) return;
+		this.stepCall = null;
+		if (this.self) delete this.self.step;
+		// Another call still running long takes its place in the same write.
+		if (!this.publishStep()) this.publish();
+	}
+
+	/**
+	 * From the tick: publish the oldest call still running once it has run `STEP_PUBLISH_AFTER_MS`.
+	 * Returns whether it wrote the record.
+	 */
+	publishStep(now = Date.now()): boolean {
+		const me = this.self;
+		if (!me || me.state !== "busy" || this.stepCall) return false;
+		// Insertion order is start order, so the first entry is the oldest call.
+		const oldest = this.running.entries().next().value;
+		if (!oldest || now - oldest[1].since < STEP_PUBLISH_AFTER_MS) return false;
+		this.stepCall = oldest[0];
+		me.step = { ...oldest[1] };
+		this.publish();
+		return true;
+	}
+
+	/** Forget the calls in flight: the run ended, or this session left the switchboard. */
+	endSteps(): void {
+		this.running.clear();
+		this.stepCall = null;
+		if (this.self) delete this.self.step;
+	}
+
+	/**
+	 * The team brief for this agent now, compared with what it was told before (`briefState`, which
+	 * then records what this one tells). A null text: nothing to tell.
+	 */
+	nextBrief(me: Presence, peers: readonly Presence[] = this.presentNow()): { text: string | null; details: MessageDetails } {
+		const brief = renderBrief(me, peers, this.briefState, {
+			paths: this.awareness.focusPaths(),
+			contacts: new Set(this.contacts.keys()),
+		});
+		this.briefState = brief.state;
+		return {
+			text: brief.text,
+			details: {
+				summary: brief.summary,
+				// Display only: the renderer paints these names in each agent's colour.
+				callsigns: [me.callsign, ...this.team(peers).map((p) => p.callsign)],
+			},
+		};
 	}
 
 	/** Remember a peer this agent talked with: its work stays relevant in this agent's briefs. */
@@ -209,12 +355,14 @@ export class Runtime {
 	releaseClaims(me: Presence, patterns: readonly string[]): string[] {
 		me.claims = me.claims.filter((c) => !patterns.includes(c.pattern));
 		this.publish();
+		this.logEntry("release", `released ${patterns.join(", ")}`, patterns);
 		const told = this.tellReleased(me, patterns);
 		this.updateStatus();
 		return told;
 	}
 
-	/** Tell the peers held back by `patterns` that they are free; returns their callsigns. */
+	/** Tell the peers held back by `patterns` that they are free; returns their callsigns. Peers
+	 *  queued for a released lock are told too: the first of them takes it at once. */
 	tellReleased(me: Presence, patterns: readonly string[]): string[] {
 		if (patterns.length === 0) return [];
 		const waiting = new Map<string, string>();
@@ -222,13 +370,39 @@ export class Runtime {
 			for (const [id, callsign] of this.contesters.get(pattern) ?? []) waiting.set(id, callsign);
 			this.contesters.delete(pattern);
 		}
-		const live = new Set(this.readPeers().map((p) => p.id));
+		const peers = this.readPeers();
+		const locks = patterns.filter(isResource);
+		if (locks.length > 0) {
+			for (const peer of this.team(peers)) {
+				if (peer.queued?.some((q) => locks.some((l) => sameResource(l, q.pattern)))) waiting.set(peer.id, peer.callsign);
+			}
+		}
+		const live = new Set(peers.map((p) => p.id));
 		for (const id of waiting.keys()) {
 			if (live.has(id)) {
 				this.sendEvent(id, { topic: "claim.released", data: { patterns: [...patterns] } }, `${me.callsign} released ${patterns.join(", ")}`);
 			}
 		}
 		return [...waiting.values()];
+	}
+
+	// ------------------------------------------------------------------ the team log
+
+	/** Log something this agent did that teammates need later; written on the next tick. */
+	logEntry(kind: LogKind, text: string, paths: readonly string[] = []): void {
+		if (this.self) this.log.record(this.self, kind, text, paths);
+	}
+
+	/** Write this agent's log file if something was logged since the last write. */
+	flushLog(): void {
+		const written = this.log.flush();
+		if (written && !written.ok && written.report) this.report("log", written.reason);
+	}
+
+	/** The team log of this repository, oldest first: live sessions and recently departed ones. */
+	teamLog(peers: readonly Presence[] = this.readPeers()): LogEntry[] {
+		const me = this.self;
+		return me ? this.log.read(me, new Set(peers.map((p) => p.id))) : [];
 	}
 
 	// ------------------------------------------------------------------ the wire
@@ -291,6 +465,21 @@ export class Runtime {
 		}
 	}
 
+	/**
+	 * Deliver a peer's direct message. Shared by the inbox and by an ask that ends unanswered:
+	 * the messages its peer sent meanwhile were held with it (`AskLedger.hold`), and are delivered
+	 * then exactly as they would have been on arrival.
+	 */
+	injectMessage(msg: HeldMessage): boolean {
+		const human = msg.human ? " (from their human)" : "";
+		return this.inject(
+			MESSAGE_TYPES.message,
+			`**📡 Message from ${msg.fromCallsign}${human}**\n\n${msg.text}\n\n(Reply only if needed: action "send", to "${msg.fromCallsign}".)`,
+			{ from: msg.from, fromCallsign: msg.fromCallsign, id: msg.id, tone: "accent" },
+			"wake",
+		);
+	}
+
 	private allowWake(): boolean {
 		const now = Date.now();
 		while (this.wakeTimes.length > 0 && now - (this.wakeTimes[0] as number) > WAKE_WINDOW_MS) this.wakeTimes.shift();
@@ -350,7 +539,7 @@ export class Runtime {
 		if (!me || !this.ui()) return;
 		try {
 			// Rebuilt on every refresh, so a theme change shows up within a second.
-			const mates = this.team();
+			const mates = this.team(this.present);
 			const peers = mates.filter((p) => p.role !== "child");
 			const status = {
 				callsign: me.callsign,
@@ -423,7 +612,7 @@ export class Runtime {
 	}
 
 	private snapshot(): TeamSnapshot | null {
-		return this.self ? { self: this.self, peers: this.peers, asks: this.ledger.inbound(), now: Date.now() } : null;
+		return this.self ? { self: this.self, peers: this.present, asks: this.ledger.inbound(), now: Date.now() } : null;
 	}
 
 	/** Show the widget, or redraw it: a component in the TUI, plain lines for an RPC client. */

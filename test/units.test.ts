@@ -136,7 +136,7 @@ test("ledger: answer, timeout, interruption, peer gone, late replies", async () 
 	const meta = { to: "peer", toCallsign: "bravo", text: "q?" };
 	const answered = ledger.awaitAnswer("a1", meta, 10_000);
 	assert.ok(ledger.settle("a1", "yes", "bravo", "peer"));
-	assert.deepEqual(await answered, { ok: true, text: "yes", fromCallsign: "bravo" });
+	assert.deepEqual(await answered, { ok: true, text: "yes", fromCallsign: "bravo", held: [] });
 
 	const timed = ledger.awaitAnswer("a2", meta, 1);
 	await new Promise((r) => setTimeout(r, 5));

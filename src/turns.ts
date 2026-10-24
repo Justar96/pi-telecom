@@ -1,12 +1,13 @@
 /**
  * turns — what telecom does around each run of the agent: at the start, mark it busy, take the
- * task from the prompt and hand the model a team brief; before it settles, remind it of asks it
+ * task from the prompt and hand the model a team brief; while it runs, note the tool call it is
+ * inside (the `step` peers see once a call runs long); before it settles, remind it of asks it
  * still owes an answer; once settled, mark it idle and deliver the change notices it was spared
  * mid-run.
  */
-import { renderBrief } from "./board.ts";
 import type { Inbound } from "./inbound.ts";
 import { adoptRepo } from "./lifecycle.ts";
+import { LOG_HINT } from "./log.ts";
 import { MESSAGE_TYPES, type TelecomMessageDetails } from "./render.ts";
 import { type Runtime, taskLine } from "./runtime.ts";
 import type { Presence } from "./transport.ts";
@@ -35,28 +36,39 @@ export function registerTurns(rt: Runtime, inbound: Inbound): void {
 		rt.ctx = ctx;
 		const me = rt.self;
 		if (!me) return;
-		me.state = "busy";
+		rt.setState(me, "busy");
 		if (event.messageType === "user" && event.prompt.trim()) taskFromPrompt(me, event.prompt);
 		adoptRepo(me);
 		rt.publish();
-		const brief = renderBrief(me, rt.readPeers(), rt.briefState, {
-			paths: rt.awareness.focusPaths(),
-			contacts: new Set(rt.contacts.keys()),
-		});
-		rt.briefState = brief.state;
+		const fullBefore = rt.briefState?.fullAt;
+		const brief = rt.nextBrief(me);
 		if (!brief.text) return;
+		// A full brief (the first, or after a compaction) shows the team as it is now, not what was
+		// decided before: point to the log when teammates have written to it.
+		const full = rt.briefState?.fullAt !== fullBefore;
+		const content = full && rt.teamLog(rt.peers).some((e) => e.session !== me.id) ? `${brief.text}\n${LOG_HINT}` : brief.text;
 		return {
 			message: {
 				customType: MESSAGE_TYPES.brief,
-				content: brief.text,
+				content,
 				display: true,
-				details: {
-					summary: brief.summary,
-					// Display only: the renderer paints these names in each agent's colour.
-					callsigns: [me.callsign, ...rt.team().map((p) => p.callsign)],
-				} satisfies TelecomMessageDetails,
+				details: brief.details,
 			},
 		};
+	});
+
+	// The tool call a run is inside, for peers deciding whether a message reaches it soon. Noted
+	// here and published from the tick only once it runs long (`STEP_PUBLISH_AFTER_MS`). A call
+	// another tool made is part of that tool's step. pi reports no `tool_result` for a blocked or
+	// aborted call, but always a `tool_execution_end`, so both end it.
+	rt.on("tool_call", (event) => {
+		if (rt.self && !event.parentToolCallId) rt.noteStepStart(event.toolCallId, event.toolName);
+	});
+	rt.on("tool_result", (event) => {
+		rt.noteStepEnd(event.toolCallId);
+	});
+	rt.on("tool_execution_end", (event) => {
+		rt.noteStepEnd(event.toolCallId);
 	});
 
 	rt.on("agent_before_settle", (event) => {
@@ -64,13 +76,17 @@ export function registerTurns(rt: Runtime, inbound: Inbound): void {
 		const due = rt.ledger.inbound().filter((a) => !a.reminded);
 		if (due.length === 0) return;
 		for (const ask of due) ask.reminded = true;
-		const list = due.map((a) => `  ${a.id} from ${a.fromCallsign}: ${clip(a.text, 120)}`).join("\n");
+		const list = due.map((a) => `  ${a.id} from ${a.fromCallsign}${a.async ? " (not blocked)" : ""}: ${clip(a.text, 120)}`).join("\n");
+		// An ask made with `wait: false` blocks nobody, but its asker still counts on the reply.
+		const blocked = due.some((a) => !a.async);
+		const heading = blocked ? `${plural(due.length, "peer")} still blocked on your reply` : `${plural(due.length, "ask")} still waiting for your reply`;
+		const why = blocked ? `even "I can't help with that" unblocks them` : `even "I can't help with that" tells them where they stand`;
 		return {
 			entries: [
 				{
 					type: "custom_message",
 					customType: MESSAGE_TYPES.reminder,
-					content: `**📡 ${plural(due.length, "peer")} still blocked on your reply**\n${list}\nAnswer each with telecom({ action: "reply", askId: "…", message: "…" }) before you stop — even "I can't help with that" unblocks them.`,
+					content: `**📡 ${heading}**\n${list}\nAnswer each with telecom({ action: "reply", askId: "…", message: "…" }) before you stop — ${why}.`,
 					display: true,
 					details: { tone: "warning" } satisfies TelecomMessageDetails,
 				},
@@ -81,7 +97,7 @@ export function registerTurns(rt: Runtime, inbound: Inbound): void {
 
 	rt.on("agent_settled", () => {
 		if (!rt.self) return;
-		rt.self.state = "idle";
+		rt.setState(rt.self, "idle");
 		inbound.flushNotices(true);
 		rt.publish();
 		rt.updateStatus();

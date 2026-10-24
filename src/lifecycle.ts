@@ -12,14 +12,24 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { childCallsign, mustYield, pickCallsign } from "./callsign.ts";
 import { readConfig } from "./config.ts";
 import { detectLineage, parentOf } from "./family.ts";
+import { isResource } from "./glob.ts";
 import type { Guard } from "./guard.ts";
 import type { Inbound } from "./inbound.ts";
-import type { LateAsk } from "./ledger.ts";
+import type { AsyncAsk, EndedAsync, LateAsk } from "./ledger.ts";
 import { findProjectRoot, findRepo, readBranch, sameRepo } from "./project.ts";
 import { MESSAGE_TYPES } from "./render.ts";
 import { rememberedCallsign, rememberedEnabled, type Runtime } from "./runtime.ts";
-import { type Claim, openTransport, type Presence, processStartTicks, transportRoot, WIRE_VERSION } from "./transport.ts";
-import { messageOf, plural } from "./util.ts";
+import {
+	type Claim,
+	openTransport,
+	type Presence,
+	processStartTicks,
+	type QueueEntry,
+	transportRoot,
+	WIRE_VERSION,
+} from "./transport.ts";
+import { clip, messageOf, plural } from "./util.ts";
+import type { Waiting } from "./waiting.ts";
 
 const HEARTBEAT_MS = 15_000;
 /** The team is re-read every this many ticks; the inbox is drained on every tick. */
@@ -40,10 +50,15 @@ interface Handoff {
 	taskAt?: number;
 	/** The task was set with `status` or by a team task, not taken from a prompt. */
 	taskExplicit?: boolean;
-	inboundAsks: Array<{ id: string; from: string; fromCallsign: string; text: string; at: number }>;
+	inboundAsks: Array<{ id: string; from: string; fromCallsign: string; text: string; at: number; async?: true }>;
 	contesters: Array<[string, Array<[string, string]>]>;
 	/** Asks whose answer now arrives late: it must still wake the replacement runtime. */
 	abandonedAsks?: Array<[string, LateAsk]>;
+	/** Asks made with `wait: false` still open: the replacement still says when one goes unanswered. */
+	asyncAsks?: Array<[string, AsyncAsk]>;
+	/** Places in line for locks, and declared waits: a reload must not lose them. */
+	queued?: QueueEntry[];
+	blockedOn?: string[];
 }
 
 export interface Lifecycle {
@@ -66,11 +81,12 @@ export function adoptRepo(me: Presence): void {
 	if (repo !== me.projectRoot) me.repo = repo;
 }
 
-export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard): Lifecycle {
+export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard, waiting: Waiting): Lifecycle {
 	let timer: ReturnType<typeof setInterval> | null = null;
 	let tickCount = 0;
-	/** The team as of the last refresh, with each member's role (subagents come and go quietly). */
-	let teamIds = new Map<string, Presence["role"]>();
+	/** The team as of the last refresh, with each member's role (subagents come and go quietly)
+	 *  and callsign (the human is told who left by name). */
+	let teamIds = new Map<string, { role: Presence["role"]; callsign: string }>();
 
 	// ------------------------------------------------------------------ the loop
 
@@ -110,9 +126,15 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard): 
 		// The last write of our record failed (on Windows, a reader held the file): peers still see
 		// the record before it, so write it again now.
 		if (rt.presenceFailures > 0) rt.step("presence", () => rt.publish());
+		rt.step("step", () => rt.publishStep());
 		if (tickCount % TEAM_REFRESH_TICKS === 0) rt.step("team", refreshTeam);
 		rt.step("notices", () => inbound.flushNotices());
-		rt.step("asks", () => rt.ledger.expire(Date.now()));
+		rt.step("log", () => rt.flushLog());
+		rt.step("asks", () => {
+			for (const ask of rt.ledger.expire(Date.now())) {
+				tellUnanswered(ask, `No reply within ${Math.round(ask.timeoutMs / 1000)}s. If one comes later, it still arrives as a message. Decide without it, or ask again: telecom({ action: "ask", to: "${ask.toCallsign}", message: "…", wait: false }).`);
+			}
+		});
 		if (Date.now() - rt.lastHeartbeat >= HEARTBEAT_MS) rt.step("heartbeat", heartbeat);
 	}
 
@@ -135,8 +157,14 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard): 
 			// Our record vanished (a sweep raced a rewrite, or the runtime dir was cleaned): restore it.
 			rt.publish();
 		}
-		const live = new Set(peers.map((p) => p.id));
-		rt.ledger.failPeerGone((id) => !live.has(id));
+		// Departures are debounced (`settleDepartures`): a record missing from one read may be back on
+		// the next, and a false leave would fail asks to the peer and tell everyone it left and joined.
+		// The footer and widget redrawn below, and the briefs, show this same team.
+		const present = rt.settleTeam(peers, true);
+		const live = new Set(present.map((p) => p.id));
+		for (const ask of rt.ledger.failPeerGone((id) => !live.has(id))) {
+			tellUnanswered(ask, "Their session ended before it answered. Decide without it, or ask whoever took over their work.");
+		}
 		const gone = new Set(rt.ledger.inbound().map((ask) => ask.from).filter((id) => !live.has(id)));
 		if (gone.size > 0) rt.ledger.dropInboundFrom(gone);
 		if (mustYield(me, peers)) {
@@ -144,19 +172,54 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard): 
 			yieldCallsign(me, peers);
 			rt.notifyUser(`📡 callsign ${old} was taken; you are now ${me.callsign}`);
 		}
-		const mates = rt.team(peers);
-		const ids = new Map(mates.map((p) => [p.id, p.role]));
+		const mates = rt.team(present);
+		const ids = new Map(mates.map((p) => [p.id, { role: p.role, callsign: p.callsign }]));
 		// Subagents come and go with every delegation; their arrivals are not news for the human.
+		// Keyed by session, so a peer that renames itself has neither left nor joined.
 		const joined = mates.filter((p) => !teamIds.has(p.id) && p.role !== "child");
-		const left = [...teamIds].filter(([id, role]) => !ids.has(id) && role !== "child");
-		if (tickCount > STARTUP_TICKS && (joined.length > 0 || left.length > 0)) {
-			const parts: string[] = [];
-			if (joined.length) parts.push(`${joined.map((p) => p.callsign).join(", ")} joined`);
-			if (left.length) parts.push(`${plural(left.length, "agent")} left`);
-			rt.notifyUser(`📡 ${parts.join("; ")}`);
-		}
+		const left = [...teamIds].filter(([id, was]) => !ids.has(id) && was.role !== "child").map(([, was]) => was.callsign);
 		teamIds = ids;
+		if (joined.length > 0 || left.length > 0) {
+			if (tickCount > STARTUP_TICKS) {
+				const parts: string[] = [];
+				if (left.length) parts.push(`${left.join(", ")} left`);
+				if (joined.length) parts.push(`${joined.map((p) => p.callsign).join(", ")} joined`);
+				rt.notifyUser(`📡 ${parts.join("; ")}`);
+			}
+			// Not held for the startup ticks: a model briefed already compares with its brief.
+			tellTeamNews(me, present);
+		}
+		// Locks freed and teammates moved: the waits this agent declared or queued for. Races for a
+		// lock are judged on this read alone: a record kept only because it is departing must not
+		// win one (`Waiting.refresh`).
+		rt.step("waiting", () => waiting.refresh(present, peers));
 		rt.updateStatus();
+	}
+
+	/**
+	 * An ask made with `wait: false` ended without an answer. Nothing waits on it, so this is news,
+	 * not a reason to start a turn: passive (AGENTS.md, rule 8).
+	 */
+	function tellUnanswered(ask: EndedAsync, why: string): void {
+		rt.inject(
+			MESSAGE_TYPES.reply,
+			`**📡 ${ask.toCallsign} did not answer your ask** "${clip(ask.text, 80)}" (${ask.id})\n\n${why}`,
+			{ fromCallsign: ask.toCallsign, tone: "warning" },
+			"passive",
+		);
+	}
+
+	/**
+	 * A teammate joined or left while this agent is in a run: tell the model now, not at its next
+	 * prompt, which may be an hour away. It is the brief's own update (`nextBrief`), so the next
+	 * brief does not repeat it, and it follows the brief's relevance rules. Passive: an idle agent
+	 * is not woken for it (rule 8) and hears it in its next brief instead. Only an agent that was
+	 * briefed already, and is not due a full brief (after a compaction), which its next prompt sends.
+	 */
+	function tellTeamNews(me: Presence, present: readonly Presence[]): void {
+		if (me.state !== "busy" || !rt.briefState || rt.briefState.fullAt === 0) return;
+		const update = rt.nextBrief(me, present);
+		if (update.text) rt.inject(MESSAGE_TYPES.brief, update.text, update.details, "passive");
 	}
 
 	/** Converge on unique callsigns: the younger of two sessions with the same word moves. */
@@ -174,15 +237,18 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard): 
 		if (!me || !rt.transport) return;
 		const now = Date.now();
 		const before = me.claims.length;
+		const lapsed = me.claims.filter((c) => c.expiresAt <= now).map((c) => c.pattern);
+		const locks = me.claims.filter((c) => c.expiresAt <= now && isResource(c.pattern)).map((c) => c.pattern);
 		me.claims = me.claims.filter((c) => c.expiresAt > now);
 		const expired = before - me.claims.length;
 		if (expired > 0) {
-			rt.inject(
-				MESSAGE_TYPES.claim,
-				`**📡 ${plural(expired, "claim")} expired**\n\nNo activity inside ${expired === 1 ? "it" : "them"} for ${rt.claimTtlMinutes()} minutes, so peers may work there now. Claim again if you still need it.`,
-				{},
-				"passive",
-			);
+			rt.logEntry("release", `claim expired unused: ${lapsed.join(", ")}`, lapsed);
+			// Edits renew a path claim but never a lock: a lock is renewed only by claiming it again.
+			const why =
+				locks.length === 0
+					? `No activity inside ${expired === 1 ? "it" : "them"} for ${rt.claimTtlMinutes()} minutes, so peers may work there now.`
+					: `${locks.join(", ")} ${locks.length === 1 ? "was" : "were"} not claimed again within ${rt.claimTtlMinutes()} minutes (edits do not renew a lock), so the next in line may take ${locks.length === 1 ? "it" : "them"} now.`;
+			rt.inject(MESSAGE_TYPES.claim, `**📡 ${plural(expired, "claim")} expired**\n\n${why} Claim again if you still need it.`, {}, "passive");
 		}
 		adoptRepo(me);
 		const branch = readBranch(me.projectRoot);
@@ -194,6 +260,7 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard): 
 		} catch (error) {
 			rt.report("sweep", error);
 		}
+		rt.step("log", () => rt.log.sweep(() => new Set(rt.readPeers().map((p) => p.id))));
 	}
 
 	// ------------------------------------------------------------------ leaving
@@ -204,13 +271,18 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard): 
 		timer = null;
 		inbound.clear();
 		guard.clear();
+		rt.endSteps();
+		waiting.clear();
 		rt.briefState = null;
+		rt.resetTeam([]);
 	}
 
 	/** Leave the switchboard without touching the records, which belong to someone else now. */
 	function backOff(reason: string): void {
 		halt();
 		rt.self = null;
+		// The log file is the other process's now, like the record: nothing pending is written.
+		rt.log.abandon();
 		rt.ledger.abandonAll(`telecom disconnected: ${reason}. Run /telecom on to reconnect before asking again.`);
 		rt.unavailable = reason;
 		rt.showOff("session open elsewhere");
@@ -220,6 +292,13 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard): 
 	function stop(keepLine = false): void {
 		halt();
 		const { transport, self: me } = rt;
+		// A reload is not a departure: the next runtime of this session continues the same log.
+		// Subagents come and go with every delegation; their arrivals and departures are not history.
+		if (me && !keepLine && me.role !== "child") rt.logEntry("leave", "left");
+		rt.step("log", () => {
+			const written = rt.log.close();
+			if (written && !written.ok) rt.report("log", written.reason);
+		});
 		if (keepLine) {
 			// A reload: the replacement runtime takes over this record and inbox within moments, so
 			// peers never see this agent leave and nothing sent meanwhile is lost.
@@ -235,6 +314,9 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard): 
 			}
 			// A failed release notice must not leave a disabled session on the switchboard.
 			rt.step("release", () => rt.tellReleased(me, me.claims.map((c) => c.pattern)));
+			// Marked before the record goes, so no peer ever finds it missing without the mark: a
+			// clean leave counts at once, in their next brief and refresh, not one refresh later.
+			transport.markLeft(me.id);
 			try {
 				transport.removePresence(me.id);
 				transport.removeInbox(me.id);
@@ -261,9 +343,12 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard): 
 			...(me.task ? { task: me.task } : {}),
 			...(me.taskAt ? { taskAt: me.taskAt } : {}),
 			...(rt.taskExplicit ? { taskExplicit: true } : {}),
-			inboundAsks: rt.ledger.inbound().map(({ id, from, fromCallsign, text, at }) => ({ id, from, fromCallsign, text, at })),
+			inboundAsks: rt.ledger.inbound().map(({ id, from, fromCallsign, text, at, async }) => ({ id, from, fromCallsign, text, at, ...(async ? { async } : {}) })),
 			contesters: [...rt.contesters].map(([pattern, who]) => [pattern, [...who]]),
 			abandonedAsks: rt.ledger.lateCandidates(),
+			asyncAsks: rt.ledger.asyncOpen(),
+			...(me.queued?.length ? { queued: me.queued } : {}),
+			...(me.blockedOn?.length ? { blockedOn: me.blockedOn } : {}),
 		};
 		rt.transport.writeHandoff(me.id, state);
 	}
@@ -336,6 +421,7 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard): 
 				...(lineage.parent ? { parent: lineage.parent } : {}),
 				waitingOn: [],
 				state: "idle",
+				stateSince: now,
 				claims: handoff?.claims ?? [],
 				recent: [],
 				// A reloaded runtime keeps its seniority, so it never loses its callsign to a newcomer.
@@ -345,19 +431,29 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard): 
 				...(ctx.model?.id ? { model: ctx.model.id } : {}),
 				...(handoff?.task ? { task: handoff.task } : {}),
 				...(handoff?.taskAt ? { taskAt: handoff.taskAt } : {}),
+				...(Array.isArray(handoff?.queued) && handoff.queued.length > 0 ? { queued: handoff.queued } : {}),
+				...(Array.isArray(handoff?.blockedOn) && handoff.blockedOn.length > 0 ? { blockedOn: handoff.blockedOn } : {}),
 			};
 			rt.self = me;
+			// The log continues what this session's file holds (a resume, a reload); a reload is no join.
+			rt.log.open(transport.root, id);
+			if (!handoff && lineage.role !== "child") rt.logEntry("join", "joined");
 			rt.taskExplicit = handoff?.taskExplicit === true;
 			for (const ask of handoff?.inboundAsks ?? []) rt.ledger.noteInbound(ask);
 			if (Array.isArray(handoff?.abandonedAsks)) rt.ledger.restoreAbandoned(handoff.abandonedAsks);
+			if (Array.isArray(handoff?.asyncAsks)) rt.ledger.restoreAsync(handoff.asyncAsks);
 			for (const [pattern, who] of handoff?.contesters ?? []) rt.contesters.set(pattern, new Map(who));
 			if (callsign !== remembered) rt.persistCallsign();
+			// Back after a `/telecom off` or a resume: an old leave mark must not make a later one-read
+			// miss of this record count as a departure.
+			transport.clearLeft(id);
 			rt.publish();
 			rt.peers = transport.readPeers();
 			// Two sessions starting in the same instant can both pick the same free word. Settle it
 			// now, before the first prompt, rather than on the first tick.
 			if (mustYield(me, rt.peers)) yieldCallsign(me, rt.peers);
-			teamIds = new Map(rt.team().map((p) => [p.id, p.role]));
+			rt.resetTeam(rt.peers);
+			teamIds = new Map(rt.team(rt.present).map((p) => [p.id, { role: p.role, callsign: p.callsign }]));
 			tickCount = 0;
 			timer ??= setInterval(tick, rt.cfg.tickMs);
 			timer.unref?.();

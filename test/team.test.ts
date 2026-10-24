@@ -640,7 +640,7 @@ test("tool schema: string enums are flat (Google-compatible), hints and output s
 	};
 	const action = tool.parameters.properties.action;
 	assert.equal(action.anyOf, undefined, "no anyOf: Google rejects unions of literals");
-	assert.deepEqual(action.enum, ["board", "send", "ask", "reply", "broadcast", "status", "claim", "release"]);
+	assert.deepEqual(action.enum, ["board", "send", "ask", "reply", "broadcast", "status", "claim", "release", "log"]);
 	assert.equal(tool.parameters.properties.scope.anyOf, undefined);
 	assert.deepEqual(tool.annotations, { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false });
 	assert.ok(tool.outputSchema.properties.ok);

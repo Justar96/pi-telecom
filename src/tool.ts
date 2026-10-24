@@ -34,7 +34,7 @@ const CALL_PREVIEW_CHARS = 240;
 /** Where a delivery report lists the agents it did not reach; the result renderer looks for it. */
 const FAILED_MARK = " (failed: ";
 
-const TOOL_ACTIONS = ["board", "send", "ask", "reply", "broadcast", "status", "claim", "release"] as const;
+const TOOL_ACTIONS = ["board", "send", "ask", "reply", "broadcast", "status", "claim", "release", "log"] as const;
 export type ToolAction = (typeof TOOL_ACTIONS)[number];
 
 const TOOL_PARAMETERS = Type.Object({
@@ -49,7 +49,12 @@ const TOOL_PARAMETERS = Type.Object({
 				"Project-relative paths or globs. claim/release: what to reserve. send/ask without `to`: reach whoever claims or last changed them. broadcast: what it is about.",
 		}),
 	),
-	timeoutSec: Type.Optional(Type.Number({ description: "ask: seconds to wait (default 300)." })),
+	timeoutSec: Type.Optional(Type.Number({ description: "ask: seconds to wait (default 300; with wait false, 1800)." })),
+	wait: Type.Optional(Type.Boolean({ description: "ask: false returns at once; the answer arrives later as a message." })),
+	queue: Type.Optional(Type.Boolean({ description: "claim: wait in line for a held @lock; you get it, and are woken, when it frees." })),
+	waitingFor: Type.Optional(
+		Type.Array(Type.String(), { description: "status: callsigns you are blocked on; you are woken when one finishes or leaves." }),
+	),
 	scope: Type.Optional(
 		StringEnum(["project", "machine"] as const, { description: 'board/broadcast: "project" (default) or "machine".' }),
 	),
@@ -92,15 +97,18 @@ export const TOOL_SPEC = {
 	description: [
 		"Coordinate with other pi agents working in parallel (this project by default). Agents have callsigns: alpha, bravo, ….",
 		"board: who works here, on what, their claims and recent changes (scope machine: all projects).",
-		"send: message an agent (to = callsign, or paths = whoever owns them); wakes it if idle. ask: same, then wait for the answer. reply: answer an inbound ask (askId).",
-		"broadcast: tell the whole project (never wakes idle agents); with paths, agents working elsewhere get it at their next prompt. status: set the task peers see (message).",
-		"claim: reserve paths/globs so peers stay out (message = why). release: give them back (all if paths omitted).",
+		"send: message an agent (to = callsign, or paths = whoever owns them); wakes it if idle. ask: same, then wait for the answer (wait false: don't). reply: answer an inbound ask (askId).",
+		"broadcast: tell the whole project (never wakes idle agents); with paths, agents working elsewhere get it at their next prompt. status: set the task peers see (message), and whom you wait for (waitingFor).",
+		'claim: reserve paths/globs so peers stay out (message = why); "@name" (e.g. "@cargo") is a lock on a shared non-file resource. release: give them back (all if paths omitted).',
+		"log: what the team did earlier — broadcasts, tasks, claims, joins (paths: only entries about them).",
 	].join("\n"),
 	promptSnippet: "Coordinate with parallel pi agents: team board, message/ask/reply, broadcast, claim paths",
 	promptGuidelines: [
 		"When 📡 telecom shows other agents in this project: claim an area before a large change and release it after; re-read a file a peer changed before editing it; reply to a peer's ask promptly (they are blocked).",
 		"Message peers only for real coordination (requests, handoffs, shared-interface changes) — no acknowledgements; each message costs the recipient a turn.",
 		"Broadcast only what every agent must act on, with `paths` when it is about files; report progress with `status`, or `send` it to whoever coordinates.",
+		"To hear when a peer's long job ends, ask with `wait: false` (the answer arrives as a message and wakes you), not a long `timeoutSec` or a polling loop.",
+		'Take turns on a shared resource (build, test runner, port) with a lock claim such as "@cargo" (queue: true waits in line), and say whom you wait for with status waitingFor, instead of negotiating leases in messages.',
 	],
 	parameters: TOOL_PARAMETERS,
 	// Hints for permission extensions: telecom only talks to local pi sessions and edits nothing.
@@ -196,7 +204,8 @@ function callHeader(args: Partial<ToolParams>, theme: Theme): string {
 		case "ask":
 			if (who) head += arrow + who;
 			else if (paths.length) head += `${arrow}${muted("whoever owns ")}${pathList}`;
-			if (action === "ask" && args.timeoutSec) head += muted(` · waits up to ${args.timeoutSec}s`);
+			if (action === "ask" && args.wait === false) head += muted(" · does not wait");
+			else if (action === "ask" && args.timeoutSec) head += muted(` · waits up to ${args.timeoutSec}s`);
 			break;
 		case "reply":
 			if (who) head += arrow + who;
@@ -214,6 +223,9 @@ function callHeader(args: Partial<ToolParams>, theme: Theme): string {
 			break;
 		case "board":
 			if (args.scope === "machine") head += muted(" · every agent on this machine");
+			break;
+		case "log":
+			if (paths.length) head += muted(" · about ") + pathList;
 			break;
 	}
 	return head;
@@ -242,7 +254,8 @@ function resultLines(
 			return styleBoard(theme, text, [...names, ...boardCallsigns(text)], { title: true }).split("\n");
 		case "send": {
 			// "sent to bravo (idle — this wakes them)": the delivery, then what it means.
-			const hint = /^(.*) \(([^()]*)\)$/.exec(first);
+			// The hint itself may hold a call (`telecom({ … })`), so it runs to the last parenthesis.
+			const hint = /^(.*?) \((.*)\)$/.exec(first);
 			return hint ? [`${tick} ${say(hint[1] ?? "")}${theme.fg("muted", ` · ${hint[2]}`)}`] : [`${tick} ${say(first)}`];
 		}
 		case "ask": {
@@ -250,6 +263,8 @@ function resultLines(
 				const [why = "", ...more] = text.split("\n\n");
 				return [`${theme.fg("warning", "⚠")} ${theme.fg("warning", why)}`, ...more.join("\n\n").split("\n").map((l) => (isHint(l) ? theme.fg("dim", l) : say(l)))];
 			}
+			// "asked bravo (…) — ask-…": what happened, then the model's guidance, quieter.
+			if (details.async === true) return [`${tick} ${say(first)}`, ...rest.map(muted)];
 			// "alpha answered:\n\n<the answer>": the answer is what the human wants to read.
 			return [`${tick} ${say(first.replace(/:$/, ""))}`, ...rest.join("\n").replace(/^\n+/, "").split("\n").map(say)];
 		}

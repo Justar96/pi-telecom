@@ -107,12 +107,24 @@ try {
 	const boardB = await b.waitFor((r) => isNotify(/You are ops/)(r), 10_000).catch(() => null);
 	check("the callsign survives /reload", Boolean(boardB), b.notifies().slice(-1)[0]);
 
-	// 6. B leaves; A's board empties
+	// 6. B leaves; A's human is told who left, and A's board empties
+	const leftOffset = a.records.length;
 	await b.stop();
+	const leftNotice = await a.waitFor(isNotify(/📡 .*\bops left/), 10_000, leftOffset).catch(() => null);
+	check("the human is told by name which peer left", Boolean(leftNotice), a.notifies().slice(-3).join(" | "));
 	await a.waitFor(isStatus(/solo/), 10_000).catch(() => {});
 	await a.command("/telecom");
 	const board3 = await a.waitFor(isNotify(/No other agent is live/), 10_000).catch(() => null);
 	check("a peer that exits disappears from the board", Boolean(board3), a.notifies().slice(-1)[0]);
+
+	// 6b. the team log, across processes: B's history outlives B, and its real /reload was no leave
+	await a.command("/telecom log");
+	const log = await a.waitFor(isNotify(/📡 Team log/), 10_000).catch(() => null);
+	check(
+		"the team log in A shows its broadcast, and B leaving once, as ops: its real /reload was no departure",
+		Boolean(log && /\bops left/.test(log.message) && log.message.match(/ left/g)?.length === 1 && /heads-up: I'm refactoring the auth module/.test(log.message)),
+		log?.message,
+	);
 
 	// 7. the same session opened in two pi processes: the younger steps back
 	const sessionDir = join(scratch, "sessions");
@@ -178,7 +190,7 @@ try {
 		const laneBoard = await main.waitFor(isNotify(/You are /), 10_000).catch(() => null);
 		check(
 			"an agent in a git worktree is on the main checkout's board, with its lane",
-			Boolean(laneBoard && /• \w+ "lane-agent" \[idle\] on lane-b  in worktree /.test(laneBoard.message)),
+			Boolean(laneBoard && /• \w+ "lane-agent" \[idle(?: \d+[smhd])?\] on lane-b  in worktree /.test(laneBoard.message)),
 			laneBoard?.message ?? main.notifies().slice(-1)[0],
 		);
 		check("agents in other projects are not counted in the repository's team", Boolean(laneBoard && /1 other agent live/.test(laneBoard.message)), laneBoard?.message);

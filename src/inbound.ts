@@ -6,13 +6,14 @@
 import { join } from "node:path";
 import type { PeerChange } from "./awareness.ts";
 import { claimMatcher, claimsOverlap, laneRelativePattern, matchesClaim } from "./glob.ts";
-import { closesCycle, type InboundAsk } from "./ledger.ts";
+import { closesCycle, type HeldMessage, type InboundAsk } from "./ledger.ts";
 import { type PendingNotice, renderNotice } from "./notices.ts";
 import { displayPath, isWithin, laneName, sameRepo } from "./project.ts";
 import { MESSAGE_TYPES } from "./render.ts";
 import { type MessageDetails, type Runtime, taskLine } from "./runtime.ts";
 import { type Envelope, type FileChangedData, parseEvent } from "./transport.ts";
 import { clip, pairKey, setBounded } from "./util.ts";
+import type { Waiting } from "./waiting.ts";
 
 /** Peer changes arriving within this window are folded into one notice. */
 const NOTICE_COALESCE_MS = 1_200;
@@ -30,7 +31,7 @@ export interface Inbound {
 	clear(): void;
 }
 
-export function createInbound(rt: Runtime): Inbound {
+export function createInbound(rt: Runtime, waiting: Waiting): Inbound {
 	const notices = new Map<string, PendingNotice>();
 	let noticeSince = 0;
 	const seen = new Map<string, true>();
@@ -73,19 +74,22 @@ export function createInbound(rt: Runtime): Inbound {
 		const human = env.human ? " (from their human)" : "";
 		const base: MessageDetails = { from: env.from, fromCallsign: from, id: env.id };
 		if (env.kind === "message" || env.kind === "ask" || env.kind === "answer") rt.noteContact(env.from);
+		// The signal a declared wait was for has arrived: the message itself is what wakes the agent.
+		if (env.kind === "message" || env.kind === "answer") waiting.heard(env.from);
 		switch (env.kind) {
-			case "message":
+			case "message": {
 				if (env.human && env.triggerTurn) {
 					runTask(env);
 					return;
 				}
-				rt.inject(
-					MESSAGE_TYPES.message,
-					`**📡 Message from ${from}${human}**\n\n${env.text}\n\n(Reply only if needed: action "send", to "${from}".)`,
-					{ ...base, tone: "accent" },
-					"wake",
-				);
+				const message: HeldMessage = { id: env.id, from: env.from, fromCallsign: from, text: env.text, ...(env.human ? { human: true as const } : {}) };
+				// While this agent is blocked in an ask to the sender, the answer comes back as that
+				// ask's tool result, which the model reads before anything steered in now. So the
+				// message waits with the ask, to be shown ahead of the answer it came before.
+				if (rt.ledger.hold(message)) return;
+				rt.injectMessage(message);
 				return;
+			}
 			case "broadcast": {
 				// A broadcast about paths away from this agent's work waits for its next run instead
 				// of breaking into the current one.
@@ -101,18 +105,21 @@ export function createInbound(rt: Runtime): Inbound {
 					fromCallsign: from,
 					text: env.text,
 					at: env.ts,
+					...(env.async ? { async: true as const } : {}),
 				};
 				rt.ledger.noteInbound(ask);
 				// Stop waiting only when this ask closes a cycle (we, directly or through others,
 				// wait on the asker): then nobody on it could ever answer. Any other ask waits
 				// until our own wait ends. Unknown graph (an older peer on the way): interrupt.
+				// An async asker waits on nobody, so its ask closes no cycle.
 				const me = rt.self;
-				if (me && rt.ledger.outboundCount() > 0 && closesCycle(env.from, { ...me, waitingOn: rt.ledger.waits().on }, rt.readPeers()) !== false) {
+				if (!env.async && me && rt.ledger.outboundCount() > 0 && closesCycle(env.from, { ...me, waitingOn: rt.ledger.waits().on }, rt.readPeers()) !== false) {
 					rt.ledger.interruptAll({ ...ask, reminded: false });
 				}
+				const waiting = env.async ? "they are not waiting; they get your reply when you send it" : "they are blocked until you reply";
 				rt.inject(
 					MESSAGE_TYPES.ask,
-					`**📡 Ask from ${from}${human}** — they are blocked until you reply\n\n${env.text}\n\nReply with telecom({ action: "reply", askId: "${env.id}", message: "<your answer>" }).`,
+					`**📡 Ask from ${from}${human}** — ${waiting}\n\n${env.text}\n\nReply with telecom({ action: "reply", askId: "${env.id}", message: "<your answer>" }).`,
 					{ ...base, tone: "warning", askId: env.id },
 					"wake-always",
 				);
@@ -123,11 +130,12 @@ export function createInbound(rt: Runtime): Inbound {
 				const answerTo = env.answerTo ?? "";
 				if (rt.ledger.settle(answerTo, env.text, from, env.from)) return;
 				const late = rt.ledger.wasAbandoned(answerTo, env.from);
+				// An async ask never blocked, so its answer is not late: a reply to that ask, waking
+				// this agent like a late one.
+				const heading = late ? `${late.async ? "Reply" : "Late reply"} from ${from}** to your ask "${clip(late.text, 80)}"` : `Reply from ${from}**`;
 				rt.inject(
 					MESSAGE_TYPES.reply,
-					late
-						? `**📡 Late reply from ${from}** to your ask "${clip(late.text, 80)}"\n\n${env.text}`
-						: `**📡 Reply from ${from}**\n\n${env.text}`,
+					`**📡 ${heading}\n\n${env.text}`,
 					{ ...base, tone: "accent" },
 					late ? "wake" : "passive",
 				);
@@ -162,9 +170,9 @@ export function createInbound(rt: Runtime): Inbound {
 					);
 					return;
 				}
-				const waiting = rt.contesters.get(pattern) ?? new Map<string, string>();
-				waiting.set(env.from, env.fromCallsign);
-				rt.contesters.set(pattern, waiting);
+				const contesting = rt.contesters.get(pattern) ?? new Map<string, string>();
+				contesting.set(env.from, env.fromCallsign);
+				rt.contesters.set(pattern, contesting);
 				rt.inject(
 					MESSAGE_TYPES.claim,
 					`**📡 ${env.fromCallsign} needs a path you claimed**\n\n${env.fromCallsign} tried to change ${displayPath(path, rt.root())}, inside your claim "${pattern}". They were asked to check with you first. If you no longer need the whole area, narrow or release it: telecom({ action: "release", paths: ["${pattern}"] }).`,
@@ -186,7 +194,11 @@ export function createInbound(rt: Runtime): Inbound {
 				return;
 			}
 			case "claim.released": {
-				const patterns = event.data.patterns.join(", ");
+				// A lock this agent queues for goes to the first in line: it hears only if that is it.
+				const queued = waiting.released(env.from, env.fromCallsign, event.data.patterns);
+				const rest = event.data.patterns.filter((p) => !queued.includes(p));
+				if (queued.length > 0 && rest.length === 0) return;
+				const patterns = rest.join(", ");
 				rt.inject(
 					MESSAGE_TYPES.claim,
 					`**📡 ${env.fromCallsign} released ${patterns || "their claim"}**\n\nYou can work there now.`,

@@ -6,17 +6,32 @@
 import { resolve } from "node:path";
 import type { AgentToolUpdateCallback } from "@earendil-works/pi-coding-agent";
 import { ownerOf, resolveTarget, stateHint, type Target, targetName } from "./address.ts";
+import { UNRESPONSIVE_MS } from "./awareness.ts";
 import { MAX_ASK_TIMEOUT_MS } from "./config.ts";
 import { blockedOnMe, isForegroundChild, lineOf, parentOf } from "./family.ts";
-import { absolutePattern, claimsOverlap, laneRelativePattern } from "./glob.ts";
+import { absolutePattern, claimsOverlap, isResource, isResourceName, laneRelativePattern, resourceKey, sameResource } from "./glob.ts";
 import { type AskOutcome, closesCycle, type InboundAsk, waitedOn } from "./ledger.ts";
+import { broadcastText, entryTouches, LOG_SHOWN, renderLog } from "./log.ts";
+import { callsignsOf, holdsOf, lineFor } from "./locks.ts";
 import { displayPath, isWithin, laneName } from "./project.ts";
 import { OFF_TEXT, type Runtime } from "./runtime.ts";
 import { deliveryReport, fail, ok, TOOL_SPEC, type ToolAction, type ToolParams, type ToolResult } from "./tool.ts";
-import type { Presence, Transport } from "./transport.ts";
-import { clip } from "./util.ts";
+import { BLOCKED_CAP, type Presence, QUEUED_CAP, type Transport } from "./transport.ts";
+import { ago, clip, plural } from "./util.ts";
+import type { Waiting } from "./waiting.ts";
 
 const CLAIM_NOTE_CAP = 120;
+/** A lock holder's task, as a refused claim quotes it. */
+const HOLDER_TASK_CAP = 80;
+/**
+ * How long an ask with `wait: false` stays open when no `timeoutSec` is given. Nothing blocks on
+ * it, so it can outlast a blocking ask's default: it is meant for "tell me when your job is done",
+ * and peers' jobs (a test suite, a build) run for tens of minutes. It is capped like any ask
+ * (`MAX_ASK_TIMEOUT_MS`): a reply after the expiry still arrives, and wakes this agent, as a late
+ * one, so a longer cap would only postpone the "did not answer" notice. The `timeoutSec`
+ * description in `tool.ts` names this default (1800 s): keep the two in step.
+ */
+const ASYNC_ASK_TIMEOUT_MS = 30 * 60_000;
 /** A claim refused again for the same conflicts within this window is a blind retry. */
 const CLAIM_RETRY_WINDOW_MS = 10 * 60_000;
 
@@ -40,12 +55,43 @@ function listAsks(asks: readonly InboundAsk[]): string {
 	return asks.map((a) => `${a.id} (${a.fromCallsign})`).join(", ");
 }
 
+/**
+ * An answered ask's result. The peer's messages sent while the ask waited come first, oldest
+ * first, and are marked as older than the answer: the model reads this result before anything
+ * steered in, so a message shown after the answer would read as the newer instruction.
+ */
+function answerText(asked: string, answer: AskOutcome & { ok: true }): string {
+	if (answer.held.length === 0) return `${asked}:\n\n${answer.text}`;
+	const from = answer.fromCallsign;
+	const count = answer.held.length;
+	const messages = answer.held.map(
+		(m, i) => `**Message ${count > 1 ? `${i + 1} of ${count} ` : ""}from ${m.fromCallsign}${m.human ? " (from their human)" : ""}** (sent before the answer):\n\n${m.text}`,
+	);
+	return `${asked}. Before answering, ${from} sent you ${plural(count, "message")}, shown first in the order sent; the answer, the newest, is last.\n\n${messages.join("\n\n")}\n\n**${from}'s answer** (newest):\n\n${answer.text}`;
+}
+
 /** Why paths outside the repository were not claimed, and what to do instead. */
 function outsideRefusal(me: Presence, outside: readonly string[]): string {
 	return `${outside.join(", ")} ${outside.length === 1 ? "is" : "are"} outside this repository (${me.projectRoot} and its worktrees), and claims cover only its files. Peers who read a file there still hear when you change it, and the guard still stops a write over a change you have not read. To keep others out of one, tell them: telecom({ action: "broadcast", message: "editing …; please leave it to me until I say" }).`;
 }
 
-export function registerTool(rt: Runtime): void {
+/** Why lock names were refused, and how to write a lock (or a path that starts with `@`). */
+function badNameRefusal(names: readonly string[]): string {
+	return `${names.map((n) => JSON.stringify(n)).join(", ")} ${names.length === 1 ? "is not a lock name" : "are not lock names"}: a lock is @ followed by letters, digits, ".", "_" or "-" (at most 48), such as "@cargo". To claim a path that starts with @, write it as "./@…".`;
+}
+
+/** `["@cargo", "@runtime"]`, for the exact call a result suggests. */
+function listCall(names: readonly string[]): string {
+	return `[${names.map((n) => JSON.stringify(n)).join(", ")}]`;
+}
+
+/** How a lock's holder is doing, for a peer refused or queued behind it. */
+function holderState(peer: Presence, now: number): string {
+	const state = now - peer.heartbeatAt > UNRESPONSIVE_MS ? `unresponsive, last seen ${ago(peer.heartbeatAt, now)}` : peer.state;
+	return `${state}${peer.task ? `, task: ${clip(peer.task, HOLDER_TASK_CAP)}` : ""}`;
+}
+
+export function registerTool(rt: Runtime, waiting: Waiting): void {
 	/** The last claim refused for a conflict: an identical retry is told nothing has changed. */
 	let lastClaimRefusal: { key: string; at: number } | null = null;
 
@@ -53,11 +99,41 @@ export function registerTool(rt: Runtime): void {
 		return ok(rt.boardText(params.scope ?? "project"), { callsign: me.callsign, peers: rt.team().map((p) => p.callsign) });
 	}
 
-	function statusAction({ me, message }: ActionCall): ToolResult {
-		if (!message) return ok(`your task as peers see it: ${me.task ?? "(none)"}`);
-		rt.setTask(me, message, true);
+	/**
+	 * Set the task peers see, and whom this agent waits for (`waitingFor`, published as `blockedOn`).
+	 * Setting status without `waitingFor` clears the wait: a new status is a new situation.
+	 */
+	function statusAction({ me, params, message }: ActionCall): ToolResult {
+		const declaring = params.waitingFor !== undefined;
+		if (!message && !declaring) {
+			const waits = me.blockedOn?.length ? `; waiting for ${callsignsOf(me.blockedOn, rt.readPeers(), me.id).join(", ")}` : "";
+			return ok(`your task as peers see it: ${me.task ?? "(none)"}${waits}`);
+		}
+		const peers = rt.readPeers();
+		const ids: string[] = [];
+		for (const name of (params.waitingFor ?? []).map((w) => w.trim()).filter(Boolean)) {
+			const target = resolveTarget(name, me, peers);
+			if (!target.ok) return fail(`waitingFor: ${target.reason} Nothing was changed.`);
+			if (!ids.includes(target.peer.id)) ids.push(target.peer.id);
+		}
+		if (ids.length > BLOCKED_CAP) {
+			return fail(`waitingFor names ${ids.length} agents, and at most ${BLOCKED_CAP} are kept. Name the ones you are blocked on right now. Nothing was changed.`);
+		}
+		const waited = (me.blockedOn?.length ?? 0) > 0;
+		if (message) rt.setTask(me, message, true);
+		if (ids.length > 0) me.blockedOn = ids;
+		else delete me.blockedOn;
+		const cycle = waiting.declare(peers);
 		rt.publish();
-		return ok(`status set — peers now see ${me.callsign}: ${me.task}`);
+		const names = callsignsOf(ids, peers, me.id);
+		const task = message ? `peers now see ${me.callsign}: ${me.task}` : `your task stays: ${me.task ?? "(none)"}`;
+		const waits =
+			ids.length > 0
+				? ` · waiting for ${names.join(", ")}. You are woken when one of them finishes a run, takes up a new task or leaves; a message from one ends your wait on it. Setting status without waitingFor clears it.`
+				: waited
+					? " · no longer waiting for anyone"
+					: "";
+		return ok(`status set — ${task}${waits}${cycle ? `\n${cycle}` : ""}`, ids.length > 0 ? { waitingFor: names } : {});
 	}
 
 	/** The checks `send` and `ask` share: a target (`to`, or whoever owns `paths`) and a message. */
@@ -97,6 +173,7 @@ export function registerTool(rt: Runtime): void {
 				`${peer.callsign} is ${who}, and it is blocked waiting for your run to end, so it cannot read an ask until you finish. Decide yourself and state the assumption in your final answer, or end your run with the question. If you have pi-subagents' contact_supervisor tool, it reaches ${parent?.callsign ?? "your parent"} mid-run: contact_supervisor({ reason: "need_decision", message: "…" }).`,
 			);
 		}
+		if (call.params.wait === false) return askWithoutWaiting(call, target);
 		const deadlock = foregroundDeadlock(me, peer, peers);
 		if (deadlock) return fail(deadlock);
 		const requested = call.params.timeoutSec && call.params.timeoutSec > 0 ? call.params.timeoutSec * 1000 : rt.cfg.askTimeoutMs;
@@ -124,8 +201,14 @@ export function registerTool(rt: Runtime): void {
 		if (connected) rt.publishWaits();
 		if (answer.ok) {
 			const asked = target.via ? `${answer.fromCallsign} (it ${target.via}) answered` : `${answer.fromCallsign} answered`;
-			return ok(`${asked}:\n\n${answer.text}`, { from: answer.fromCallsign, askId: env.id });
+			return ok(answerText(asked, answer), {
+				from: answer.fromCallsign,
+				askId: env.id,
+				...(answer.held.length > 0 ? { heldMessages: answer.held.map((m) => m.id) } : {}),
+			});
 		}
+		// No answer came: what the peer sent meanwhile is delivered as it would have been on arrival.
+		for (const held of answer.held) rt.injectMessage(held);
 		if (answer.interruptedBy) {
 			const by = answer.interruptedBy;
 			return ok(
@@ -138,6 +221,27 @@ export function registerTool(rt: Runtime): void {
 			rt.sendEvent(peer.id, { topic: "ask.withdrawn", data: { askId: env.id } }, `${me.callsign} withdrew an ask`);
 		}
 		return fail(answer.reason, { askId: env.id });
+	}
+
+	/**
+	 * `ask` with `wait: false`: deliver it and return. Nothing waits on the answer, so the ask is
+	 * not published in `waitingOn` (it closes no wait cycle, and nothing interrupts it); the answer
+	 * arrives as a reply message, which wakes this agent like a late answer does.
+	 */
+	function askWithoutWaiting({ me, net, params, message }: ActionCall, target: Target & { ok: true }): ToolResult {
+		const peer = target.peer;
+		const requested = params.timeoutSec && params.timeoutSec > 0 ? params.timeoutSec * 1000 : ASYNC_ASK_TIMEOUT_MS;
+		const timeoutMs = Math.min(requested, MAX_ASK_TIMEOUT_MS);
+		const env = rt.envelope(peer.id, "ask", message, { async: true });
+		const sent = net.deliver(env);
+		if (!sent.ok) return fail(sent.reason);
+		// Tracked after delivery: an answer is drained on a later tick, never within this call.
+		rt.ledger.trackAsync(env.id, { to: peer.id, toCallsign: peer.callsign, text: message }, timeoutMs);
+		rt.noteContact(peer.id);
+		return ok(
+			`asked ${targetName(target)} (${stateHint(peer, me, rt.peers)}) — handle ${env.id}\nYou are not waiting: carry on with other work. The answer arrives as a message and wakes you; if none comes within ${Math.round(timeoutMs / 1000)}s, you are told.`,
+			{ to: peer.callsign, askId: env.id, async: true },
+		);
 	}
 
 	/**
@@ -212,6 +316,7 @@ export function registerTool(rt: Runtime): void {
 		if (peers.length === 0) return fail(`no other agent is live ${scope === "machine" ? "on this machine" : "in this project"}`);
 		const paths = pathsOf(params);
 		const { reached, failed } = rt.deliverEach(net, peers, "broadcast", message, paths.length > 0 ? { paths } : {});
+		if (reached.length > 0) rt.logEntry("broadcast", broadcastText(message, paths), paths);
 		const about = paths.length > 0 ? ` — about ${paths.join(", ")}: agents working there get it now, the rest at their next prompt` : "";
 		return ok(`broadcast to ${deliveryReport(reached, failed)}${about}`, { reached, failed });
 	}
@@ -261,26 +366,109 @@ export function registerTool(rt: Runtime): void {
 		return place ? displayPath(path, place.checkout) : null;
 	}
 
+	/**
+	 * The locks among `names` this agent cannot take now: held by a rival (its lineal family shares,
+	 * as with paths, and unlike a path claim a lock binds across lanes), or free with others in line
+	 * before this agent (they take it within a moment; claiming it would jump the line).
+	 */
+	function lockConflicts(me: Presence, names: readonly string[], now: number): Map<string, string> {
+		/** Lock name → why it is not free: "held by …" or "free, but … is first in line". */
+		const conflicts = new Map<string, string>();
+		if (names.length === 0) return conflicts;
+		const rivals = lockRivals(me);
+		for (const name of names) {
+			const hold = holdsOf(name, rivals, now)[0];
+			if (hold) {
+				const { peer, claim } = hold;
+				conflicts.set(name, `held by ${peer.callsign} since ${ago(claim.since, now)} (${holderState(peer, now)})${claim.note ? ` — ${claim.note}` : ""}`);
+				continue;
+			}
+			const line = lineFor(name, [me, ...rivals]).filter((w) => w.peer.id === me.id || now - w.peer.heartbeatAt <= UNRESPONSIVE_MS);
+			const first = line[0];
+			if (first && first.peer.id !== me.id) conflicts.set(name, `free, but ${first.peer.callsign} is first in line for it and takes it now`);
+		}
+		return conflicts;
+	}
+
+	/**
+	 * The teammates whose locks bind this agent: all but its lineal family. The last read, settled
+	 * against the debounced team (`presentNow`): a holder whose record one read missed still holds
+	 * its lock, and a waiter still has its place, so a claim never jumps either.
+	 */
+	function lockRivals(me: Presence): Presence[] {
+		const present = rt.presentNow(rt.peers);
+		const family = lineOf(me, present);
+		return rt.team(present).filter((p) => !family.has(p.id));
+	}
+
+	/** Put this agent in line for `names` (or keep its place); what it is told about each. */
+	function joinLines(
+		me: Presence,
+		names: readonly string[],
+		conflicts: ReadonlyMap<string, string>,
+		now: number,
+	): { queued: string[]; full: string[]; text: string[] } {
+		const queued: string[] = [];
+		const full: string[] = [];
+		const line = me.queued ?? [];
+		for (const name of names) {
+			if (!line.some((q) => sameResource(q.pattern, name))) {
+				if (line.length >= QUEUED_CAP) {
+					full.push(name);
+					continue;
+				}
+				line.push({ pattern: name, since: now });
+			}
+			queued.push(name);
+		}
+		if (line.length > 0) me.queued = line;
+		const everyone = [me, ...lockRivals(me)];
+		const text = queued.map((name) => {
+			const order = lineFor(name, everyone).map((w) => w.peer);
+			const ahead = order.slice(0, Math.max(0, order.findIndex((p) => p.id === me.id))).map((p) => p.callsign);
+			return `queued for ${name}${conflicts.has(name) ? `, ${conflicts.get(name)}` : ""}${ahead.length > 0 ? `; ahead of you: ${ahead.join(", ")}` : ""}. You get it, and are woken, when it frees, so there is nothing to poll. Leave the line with telecom({ action: "release", paths: ["${name}"] }).`;
+		});
+		if (full.length > 0) {
+			text.push(`Not queued for ${full.join(", ")}: you are already in line for ${QUEUED_CAP} locks. Leave one first: telecom({ action: "release", paths: ["…"] }).`);
+		}
+		return { queued, full, text };
+	}
+
 	function claimAction({ me, params, message }: ActionCall): ToolResult {
 		const asked = pathsOf(params);
-		if (asked.length === 0) return fail('"claim" needs `paths` — project-relative paths or globs');
+		if (asked.length === 0) return fail('"claim" needs `paths` — project-relative paths or globs, or a lock name such as "@cargo"');
 		const patterns: string[] = [];
 		const outside: string[] = [];
+		const badNames: string[] = [];
 		for (const raw of asked) {
+			if (isResource(raw)) {
+				const name = raw.trim();
+				if (!isResourceName(name)) badNames.push(raw);
+				else if (!patterns.includes(resourceKey(name))) patterns.push(resourceKey(name));
+				continue;
+			}
 			const pattern = claimPattern(me, raw);
 			if (pattern === null) outside.push(raw);
 			else if (!patterns.includes(pattern)) patterns.push(pattern);
 		}
 		// Like a held path below, a path outside the repository does not cost the ones inside it.
-		const away = outside.length > 0 ? outsideRefusal(me, outside) : "";
-		if (patterns.length === 0) return fail(away, { refused: outside });
+		const away = [outside.length > 0 ? outsideRefusal(me, outside) : "", badNames.length > 0 ? badNameRefusal(badNames) : ""]
+			.filter(Boolean)
+			.join("\n");
+		if (patterns.length === 0) return fail(away, { refused: [...outside, ...badNames] });
 		const now = Date.now();
-		const { conflicts, lanes } = claimConflicts(me, patterns, now);
+		const paths = patterns.filter((p) => !isResource(p));
+		const locks = patterns.filter(isResource);
+		const { conflicts, lanes } = claimConflicts(me, paths, now);
+		const lockHeld = lockConflicts(me, locks, now);
 		// A held path does not cost the free ones: models that got an all-or-nothing refusal
 		// tended to drop the whole claim and edit unclaimed.
 		const held = new Set(conflicts.map((c) => c.mine));
-		const granted = patterns.filter((p) => !held.has(p));
-		const refused = [...held, ...outside];
+		const grantedPaths = paths.filter((p) => !held.has(p));
+		const grantedLocks = locks.filter((l) => !lockHeld.has(l));
+		const busyLocks = locks.filter((l) => lockHeld.has(l));
+		const line = params.queue === true ? joinLines(me, busyLocks, lockHeld, now) : null;
+		const refused = [...held, ...(line ? line.full : busyLocks), ...outside, ...badNames];
 		let refusal = "";
 		if (conflicts.length > 0) {
 			const owners = [...new Set(conflicts.map((c) => c.owner))];
@@ -290,48 +478,116 @@ export function registerTool(rt: Runtime): void {
 			refusal = `${conflicts.map((c) => c.what).join("; ")}. ${
 				repeated ? `Nothing has changed since this was last refused: retrying will not help. ` : ""
 			}Ask ${owners.join(" or ")} to release or split it — telecom({ action: "ask", to: "${owners[0]}", message: "…" }) — or pick other work.`;
-			if (granted.length === 0) return fail(away ? `${refusal}\n${away}` : refusal, { refused });
+		}
+		if (!line && busyLocks.length > 0) {
+			const one = busyLocks.length === 1;
+			const why = busyLocks.map((l) => `${l} is ${lockHeld.get(l)}`).join("; ");
+			const queue = `Queue for ${one ? "it" : "them"} — you get ${one ? "it" : "each"}, and are woken, when it frees: telecom({ action: "claim", paths: ${listCall(busyLocks)}, queue: true }).`;
+			refusal = [refusal, `${why}. ${queue}`].filter(Boolean).join("\n");
+		}
+		const queuedText = line?.text ?? [];
+		if (grantedPaths.length === 0 && grantedLocks.length === 0 && (line?.queued.length ?? 0) === 0) {
+			return fail([refusal, away, ...queuedText].filter(Boolean).join("\n"), { refused });
 		}
 		// Stored without closing punctuation (a clip "…" stays): it is quoted mid-sentence elsewhere.
 		const note = message ? clip(message, CLAIM_NOTE_CAP).replace(/[\s.!?]+$/, "") : "";
-		for (const pattern of granted) {
+		for (const pattern of grantedPaths) {
 			me.claims = me.claims.filter((c) => c.pattern !== pattern);
 			me.claims.push({ pattern, since: now, expiresAt: now + rt.cfg.claimTtlMs, ...(note ? { note } : {}) });
 		}
+		const renewed: string[] = [];
+		for (const name of grantedLocks) {
+			// Claiming a lock again renews it and keeps its `since`: that decides a race, and says how
+			// long it has been held. Edits never renew a lock; only this does. An expired claim stays
+			// in the record until the heartbeat, but holds nothing: claiming after it is a new claim,
+			// or its old `since` would beat the waiter who took the lock meanwhile.
+			const prior = me.claims.find((c) => c.pattern === name && c.expiresAt > now);
+			if (prior) renewed.push(name);
+			const why = note || prior?.note;
+			me.claims = me.claims.filter((c) => c.pattern !== name);
+			me.claims.push({ pattern: name, since: prior?.since ?? now, expiresAt: now + rt.cfg.claimTtlMs, ...(why ? { note: why } : {}) });
+			me.queued = me.queued?.filter((q) => !sameResource(q.pattern, name));
+		}
+		if (me.queued?.length === 0) delete me.queued;
 		rt.publish();
+		// Another session may have taken a free lock at this same moment: the earlier claim keeps it,
+		// and this one goes first in line.
+		const lost = grantedLocks.length > 0 ? waiting.settleRaces(rt.readPeers()) : [];
 		rt.updateStatus();
+		const taken = grantedLocks.filter((l) => !lost.includes(l) && !renewed.includes(l));
+		const kept = renewed.filter((l) => !lost.includes(l));
+		// Logged once the races are settled: a lock lost at once was never held. A renewal is not
+		// logged: the holder and its `since` stay the same, and the entry that ends the hold (a
+		// release, an expiry, a handoff) says when it ended, so one per renewal would only bury
+		// what teammates need under a line every few minutes for as long as a build runs.
+		const claimed = [...grantedPaths, ...taken];
+		if (claimed.length > 0) rt.logEntry("claim", `claimed ${claimed.join(", ")}${note ? ` — ${note}` : ""}`, claimed);
+		const ttl = rt.claimTtlMinutes();
 		const overlap =
 			lanes.length > 0
 				? ` Note: ${lanes.join("; ")}. Your checkouts are separate, so both claims stand, but the work meets when the branches merge; agree on one owner if it may conflict.`
 				: "";
-		return ok(
-			`claimed ${granted.join(", ")}${note ? ` — ${note}` : ""}. Peers editing there are held back and you are told. Release with telecom({ action: "release" }) when done; idle claims expire after ${rt.claimTtlMinutes()} min.${overlap}${
-				refusal ? `\nNot claimed: ${refusal}` : ""
-			}${away ? `\nNot claimed: ${away}` : ""}`,
-			{
-				claims: me.claims.map((c) => c.pattern),
-				...(refused.length > 0 ? { refused } : {}),
-				...(lanes.length > 0 ? { laneOverlaps: lanes.length } : {}),
-			},
-		);
+		const lines: string[] = [];
+		if (grantedPaths.length > 0) {
+			lines.push(
+				`claimed ${grantedPaths.join(", ")}${note ? ` — ${note}` : ""}. Peers editing there are held back and you are told. Release with telecom({ action: "release" }) when done; idle claims expire after ${ttl} min.${overlap}`,
+			);
+		}
+		if (taken.length > 0) {
+			lines.push(
+				`claimed ${taken.join(", ")}${note ? ` — ${note}` : ""}: yours until you release it — telecom({ action: "release", paths: ${listCall(taken)} }) — and others who claim it are refused and can queue. Edits do not renew a lock: claim it again within ${ttl} min to keep it.`,
+			);
+		}
+		if (kept.length > 0) lines.push(`renewed ${kept.join(", ")}: yours for another ${ttl} min.`);
+		if (lost.length > 0) {
+			lines.push(`${lost.join(", ")}: another agent took ${lost.length === 1 ? "it" : "them"} at the same moment, first. You are first in line, and woken when it frees.`);
+		}
+		lines.push(...queuedText);
+		if (refusal) lines.push(`Not claimed: ${refusal}`);
+		if (away) lines.push(`Not claimed: ${away}`);
+		return ok(lines.join("\n"), {
+			claims: me.claims.map((c) => c.pattern),
+			...(refused.length > 0 ? { refused } : {}),
+			...(lanes.length > 0 ? { laneOverlaps: lanes.length } : {}),
+			...(line && line.queued.length > 0 ? { queued: line.queued } : {}),
+			...(lost.length > 0 ? { lost } : {}),
+		});
 	}
 
 	function releaseAction({ me, params }: ActionCall): ToolResult {
-		const wanted = pathsOf(params);
+		const wanted = pathsOf(params).map((p) => (isResource(p) ? resourceKey(p) : p));
 		const releasing = wanted.length === 0 ? me.claims : me.claims.filter((c) => wanted.includes(c.pattern));
-		if (releasing.length === 0) {
-			return fail(
-				me.claims.length === 0
-					? "you hold no claims"
-					: `none of those match your claims: ${me.claims.map((c) => c.pattern).join(", ")}`,
-			);
+		// Releasing a lock this agent only waits for leaves the line.
+		const leaving = (me.queued ?? []).filter((q) => wanted.length === 0 || wanted.some((w) => sameResource(w, q.pattern)));
+		if (releasing.length === 0 && leaving.length === 0) {
+			// Nothing held is nothing to undo: a release "just in case" is harmless, not an error.
+			if (me.claims.length === 0) return ok("you hold no claims — nothing to release", { released: [] });
+			return fail(`none of those match your claims: ${me.claims.map((c) => c.pattern).join(", ")}`);
+		}
+		if (leaving.length > 0) {
+			me.queued = (me.queued ?? []).filter((q) => !leaving.includes(q));
+			if (me.queued.length === 0) delete me.queued;
 		}
 		const names = releasing.map((c) => c.pattern);
-		const told = rt.releaseClaims(me, names);
-		return ok(
-			`released ${names.join(", ")}${told.length ? ` — told ${told.join(", ")}, who had been waiting` : ""}`,
-			{ released: names },
-		);
+		let told: string[] = [];
+		if (names.length > 0) told = rt.releaseClaims(me, names);
+		else rt.publish();
+		const left = leaving.map((q) => q.pattern);
+		const parts = [
+			names.length > 0 ? `released ${names.join(", ")}${told.length ? ` — told ${told.join(", ")}, who had been waiting` : ""}` : "",
+			left.length > 0 ? `left the queue for ${left.join(", ")}` : "",
+		].filter(Boolean);
+		return ok(parts.join("; "), { released: names, ...(left.length > 0 ? { leftQueue: left } : {}) });
+	}
+
+	/** The team log: what was broadcast, set, claimed and released, and who came and went. */
+	function logAction({ me, params }: ActionCall): ToolResult {
+		const wanted = pathsOf(params);
+		const all = rt.teamLog();
+		const matching = wanted.length > 0 ? all.filter((e) => entryTouches(e, wanted, me.projectRoot)) : all;
+		const shown = matching.slice(-LOG_SHOWN);
+		const text = renderLog(shown, { self: me.id, total: matching.length, paths: wanted });
+		return ok(text, { entries: shown.length, total: matching.length });
 	}
 
 	const actions: Record<ToolAction, (call: ActionCall) => ToolResult | Promise<ToolResult>> = {
@@ -343,6 +599,7 @@ export function registerTool(rt: Runtime): void {
 		broadcast: broadcastAction,
 		claim: claimAction,
 		release: releaseAction,
+		log: logAction,
 	};
 
 	rt.pi.registerTool({
