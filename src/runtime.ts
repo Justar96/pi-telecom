@@ -55,6 +55,8 @@ const CONTACTS_CAP = 256;
 export const STEP_PUBLISH_AFTER_MS = 15_000;
 /** Tool calls tracked at once; bounded in case a call's end never comes. */
 const RUNNING_CAP = 64;
+/** Sessions whose latest callsign is remembered (`seenAs`); bounded, since records are peer input. */
+const SEEN_AS_CAP = 256;
 
 /**
  * How a message reaches the model (AGENTS.md, "Delivery to the model"). `wake` starts a turn when
@@ -89,6 +91,12 @@ export class Runtime {
 	 * leave and then, a second later, as a join.
 	 */
 	present: Presence[] = [];
+	/**
+	 * Each session's callsign as the latest read of any kind saw it. A peer can rename and leave
+	 * between two team refreshes (a board read sees the new name, no refresh does): the human is
+	 * told it left by the name they last saw, not the one it had at the refresh before.
+	 */
+	readonly seenAs = new Map<string, string>();
 	/** The sessions the last refresh found missing but still counts in `present`. */
 	private departing = new Set<string>();
 	briefState: BriefState | null = null;
@@ -191,6 +199,7 @@ export class Runtime {
 		if (!this.transport) return [];
 		try {
 			this.peers = this.transport.readPeers();
+			for (const p of this.peers) if (this.seenAs.get(p.id) !== p.callsign) setBounded(this.seenAs, p.id, p.callsign, SEEN_AS_CAP);
 		} catch (error) {
 			this.report("peers", error);
 		}

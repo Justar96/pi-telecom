@@ -177,7 +177,7 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard, w
 		// Subagents come and go with every delegation; their arrivals are not news for the human.
 		// Keyed by session, so a peer that renames itself has neither left nor joined.
 		const joined = mates.filter((p) => !teamIds.has(p.id) && p.role !== "child");
-		const left = [...teamIds].filter(([id, was]) => !ids.has(id) && was.role !== "child").map(([, was]) => was.callsign);
+		const left = [...teamIds].filter(([id, was]) => !ids.has(id) && was.role !== "child").map(([id, was]) => rt.seenAs.get(id) ?? was.callsign);
 		teamIds = ids;
 		if (joined.length > 0 || left.length > 0) {
 			// Only joins wait out the startup ticks: a session that started alongside this one is the

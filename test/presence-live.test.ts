@@ -253,6 +253,20 @@ test("team: a known peer leaving is news even in the first ticks, which a loaded
 	await eventually(() => assert.ok(a.notified.some((n) => /📡 alpha left/.test(n)), a.notified.join(" | ")), 3_000);
 });
 
+test("team: a peer that renames and leaves between two refreshes is named as the human last saw it", async (t) => {
+	const proj = makeProject("p-live-rename-leave");
+	const b = await session(proj);
+	// A refreshes every 800 ms: B renames, A's human sees the new name on the board, and B leaves,
+	// all before A's first refresh. What CI does to the RPC e2e, whose commands queue up that fast.
+	withEnv(t, "PI_TELECOM_TICK_MS", "400");
+	const a = await session(proj);
+	await b.command("name ops");
+	await a.command("");
+	assert.ok(a.notified.some((n) => /• ops/.test(n)), a.notified.join(" | "));
+	await b.stop();
+	await eventually(() => assert.ok(a.notified.some((n) => /📡 ops left/.test(n)), a.notified.join(" | ")), 3_000);
+});
+
 test("team: a peer record missing for less than a refresh is not a departure; one that stays missing is", async (t) => {
 	const proj = makeProject("p-live-flap");
 	// Slower ticks for the observer (a refresh every 200 ms), so the gaps below fit inside one.

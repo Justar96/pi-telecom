@@ -64,6 +64,8 @@ export function createWaiting(rt: Runtime): Waiting {
 	const seen = new Map<string, { callsign: string; state: Presence["state"]; task: string }>();
 	/** The wait cycle this agent was told it is on, told once while it lasts. */
 	let toldCycle: string | null = null;
+	/** Rivals as the last refresh saw them, to tell what freed a lock: one of them gone since. */
+	let lastSeen: readonly Presence[] = [];
 
 	/** Teammates whose locks bind this agent: its lineal family shares, like it shares claims. */
 	function rivals(me: Presence, peers: readonly Presence[]): Presence[] {
@@ -72,12 +74,20 @@ export function createWaiting(rt: Runtime): Waiting {
 	}
 
 	/**
-	 * How a lock freed, named only when it is known. `releasedBy` is the peer whose release event
-	 * prompted this take. Without one, the last holder this agent saw may not be the last holder:
-	 * a peer can take a lock from the line and release it between two of this agent's refreshes, and
-	 * the one seen before it, still present without the lock, did not free it this time.
+	 * How a lock freed, named only when it is known. A rival the last refresh saw holding it, or in
+	 * line ahead of this agent (`mySince`), that has gone since is what freed it, whatever event came
+	 * in: on a loaded machine a release event can be read after the next holder took the lock and
+	 * left. Then `releasedBy`, the peer whose release event prompted this take. Without either, the
+	 * last holder seen may not be the last holder (a peer can take a lock and release it between two
+	 * refreshes), so one still present without the lock is not named.
 	 */
-	function howFreed(name: string, peers: readonly Presence[], now: number, releasedBy?: string): string {
+	function howFreed(name: string, peers: readonly Presence[], now: number, mySince: number, releasedBy?: string): string {
+		const here = new Set(peers.map((p) => p.id));
+		const gone = lastSeen.filter((p) => !here.has(p.id));
+		const held = gone.find((p) => p.claims.some((c) => sameResource(c.pattern, name)));
+		if (held) return `${held.callsign} left`;
+		const ahead = lineFor(name, gone).find((w) => w.since < mySince);
+		if (ahead) return `${ahead.peer.callsign} left`;
 		const last = lastHolder.get(name);
 		if (releasedBy) return last && !peers.some((p) => p.id === last.id) ? `${releasedBy} left` : `${releasedBy} released it`;
 		if (!last) return FREE;
@@ -107,7 +117,7 @@ export function createWaiting(rt: Runtime): Waiting {
 			me.claims = me.claims.filter((c) => !sameResource(c.pattern, name));
 			me.claims.push({ pattern: name, since: now, expiresAt: now + rt.cfg.claimTtlMs });
 			setBounded(fromLine, name, entry.since, HOLDERS_CAP);
-			taken.push({ name, how: howFreed(name, peers, now, releasedBy) });
+			taken.push({ name, how: howFreed(name, peers, now, entry.since, releasedBy) });
 			lastHolder.delete(name);
 		}
 		if (taken.length === 0) return;
@@ -244,6 +254,7 @@ export function createWaiting(rt: Runtime): Waiting {
 			if (!me) return;
 			// Solo work pays nothing (AGENTS.md, rule 2): no lock held, none awaited, no one awaited.
 			if (!me.queued?.length && !me.blockedOn?.length && !me.claims.some((c) => isResource(c.pattern))) {
+				lastSeen = [];
 				toldCycle = null;
 				seen.clear();
 				fromLine.clear();
@@ -254,6 +265,7 @@ export function createWaiting(rt: Runtime): Waiting {
 			takeFreeLocks(me, present);
 			wakeDeclared(me, present);
 			flagCycle(me, present);
+			lastSeen = rivals(me, present);
 		},
 
 		released(fromId, fromCallsign, patterns) {
@@ -294,6 +306,7 @@ export function createWaiting(rt: Runtime): Waiting {
 		},
 
 		clear() {
+			lastSeen = [];
 			lastHolder.clear();
 			fromLine.clear();
 			seen.clear();

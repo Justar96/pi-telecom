@@ -224,10 +224,9 @@ test("queue: a release hands the lock to the first in line and wakes it; the res
 	await b.stop();
 	await eventually(() => assert.equal(lockMessages(c).length, 1));
 	// bravo releases its claims as it leaves: whichever charlie notices first, the release or the
-	// departure, names bravo. On a loaded machine bravo can take the lock and leave between two of
-	// charlie's refreshes, before its release event is read: then nobody is named. Never alpha, who
-	// held it before bravo and is still here.
-	assert.match(lockMessages(c)[0]?.content ?? "", /@cargo is yours now \((bravo left|bravo released it|it was free)\)/);
+	// departure, names bravo. Never alpha, who held it before bravo and is still here: on a loaded
+	// machine charlie may read alpha's old release event only after bravo took the lock and left.
+	assert.match(lockMessages(c)[0]?.content ?? "", /@cargo is yours now \(bravo (left|released it)\)/);
 });
 
 test("race: two sessions that take one free lock at once settle on the earlier claim; the loser, told it held it, is told it does not and waits first in line", async () => {

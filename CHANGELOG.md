@@ -51,6 +51,9 @@ All notable changes to `@justar_96/pi-telecom`. The format follows
 - A peer whose record went missing for a moment no longer shows as leaving and rejoining, in the
   human's notices or in briefs, and no longer fails asks open to it: a departure counts after a
   second missed refresh, or at once when its process has exited or it left on purpose.
+- A peer that leaves while this session is still starting up is now announced, and a lock it
+  hands over names who actually freed it. A peer that renames and then leaves before the next
+  team refresh is announced under its new name.
 
 ### Wire
 
