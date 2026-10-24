@@ -111,7 +111,19 @@ try {
 	const leftOffset = a.records.length;
 	await b.stop();
 	const leftNotice = await a.waitFor(isNotify(/📡 .*\bops left/), 10_000, leftOffset).catch(() => null);
-	check("the human is told by name which peer left", Boolean(leftNotice), a.notifies().slice(-3).join(" | "));
+	// On failure, everything needed to tell a missed notice from a missed departure: all of A's
+	// notices, its footer since B stopped, and what the switchboard holds now.
+	const leftDetail = () => {
+		let files = [];
+		try {
+			files = readdirSync(join(env.PI_TELECOM_DIR, "presence"));
+		} catch (error) {
+			files = [String(error.code)];
+		}
+		const footer = a.records.slice(leftOffset).filter(isStatus(/./)).map((r) => r.statusText);
+		return `notices: ${a.notifies().map((n) => n.split("\n")[0]).join(" | ")}\n    footer since stop: ${footer.join(" → ") || "(unchanged)"}\n    presence: ${files.join(", ")}`;
+	};
+	check("the human is told by name which peer left", Boolean(leftNotice), leftNotice ? "" : leftDetail());
 	await a.waitFor(isStatus(/solo/), 10_000).catch(() => {});
 	await a.command("/telecom");
 	const board3 = await a.waitFor(isNotify(/No other agent is live/), 10_000).catch(() => null);
