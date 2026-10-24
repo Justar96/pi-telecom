@@ -6,6 +6,59 @@ All notable changes to `@justar_96/pi-telecom`. The format follows
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-24
+
+### Added
+
+- Named locks: a claim on `@name` (`@cargo`, `@runtime`) locks a shared resource that is not a
+  file. It matches no path and binds in every worktree of the repository. A refused claim names
+  the holder, since when, its state, and the call to queue.
+- `claim` with `queue: true` waits in line for a held lock. When the holder releases it, leaves or
+  lets it expire, the first live waiter gets it and is woken. Simultaneous claims settle on the
+  earlier one; the other goes back to its place at the front of the line, and is told if it was
+  already told the lock was its own. A holder or a waiter whose record one read missed keeps its
+  lock or its place, but never wins a race with it. Edits don't renew a lock; claiming it again
+  before it expires does.
+- `status` with `waitingFor` publishes whom an agent is blocked on. It is woken when one of them
+  finishes a run, takes up a new task or leaves, and the wait ends when that teammate messages it.
+  The board and briefs show waits, lock queues and wait cycles; each agent on a cycle is told once.
+- `ask` with `wait: false` returns at once; the answer arrives later as a message that starts a
+  turn. It creates no wait-for edge and never interrupts the receiver's wait. Unanswered after
+  `timeoutSec` (default 30 min), the asker gets a notice that starts no turn, also when a
+  `/reload` came in between.
+- Team log: each session records its joins, leaves, task changes, broadcasts, claims and releases,
+  and who took a lock from the line, in `log/<session>.jsonl` under the telecom root. New `telecom({ action: "log" })` (optional
+  `paths` filter) and `/telecom log`. A full brief points to the log when teammates have logged.
+- Live state: the board, widget and `send` results say how long a peer has been idle, or which
+  long tool call it is in (`busy · bash 14m`). A message to a peer inside a long call says it
+  waits for the call to end and suggests an ask with `wait: false`.
+- A busy agent hears teammates join or leave mid-run as a team update that starts no turn, and its
+  next brief doesn't repeat it.
+- The human's notices name who joined and who left (`📡 bravo left; foxtrot joined`).
+
+### Changed
+
+- `release` with nothing held is a no-op instead of an error; releasing a lock you only queue for
+  leaves the line.
+
+### Fixed
+
+- A message a peer sent before answering your ask no longer arrives after the answer. Messages
+  from the peer an ask waits on are held and shown first in the ask's result; if the ask ends
+  without an answer, they are delivered as usual.
+- A live peer is no longer taken for dead when its `/proc/<pid>/stat` can't be read (out of file
+  descriptors, a restricted `/proc`). Every session's sweep used to delete that peer's record.
+- A peer whose record went missing for a moment no longer shows as leaving and rejoining, in the
+  human's notices or in briefs, and no longer fails asks open to it: a departure counts after a
+  second missed refresh, or at once when its process has exited or it left on purpose.
+
+### Wire
+
+New optional fields, ignored by older sessions: presence `stateSince`, `step`, `blockedOn` and
+`queued`, and `async` on `ask` envelopes. Older sessions read `@cargo` as the path
+`<checkout>/@cargo`, which matches no real file, and ignore the new `log/` directory and the
+`presence/<session>.left` file a session writes when it leaves on purpose.
+
 ## [0.4.2] - 2026-10-24
 
 ### Changed
@@ -265,7 +318,8 @@ First release.
   presence repairs itself.
 - Prompt cache unaffected: 84.4 % hit rate with and without telecom on Claude Sonnet 5.5.
 
-[Unreleased]: https://github.com/Justar96/pi-telecom/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/Justar96/pi-telecom/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/Justar96/pi-telecom/compare/v0.4.2...v0.5.0
 [0.4.2]: https://github.com/Justar96/pi-telecom/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/Justar96/pi-telecom/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/Justar96/pi-telecom/compare/v0.3.0...v0.4.0
