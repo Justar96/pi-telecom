@@ -71,16 +71,23 @@ export function createWaiting(rt: Runtime): Waiting {
 		return rt.team(peers).filter((p) => !family.has(p.id));
 	}
 
-	function howFreed(name: string, peers: readonly Presence[], now: number): string {
+	/**
+	 * How a lock freed, named only when it is known. `releasedBy` is the peer whose release event
+	 * prompted this take. Without one, the last holder this agent saw may not be the last holder:
+	 * a peer can take a lock from the line and release it between two of this agent's refreshes, and
+	 * the one seen before it, still present without the lock, did not free it this time.
+	 */
+	function howFreed(name: string, peers: readonly Presence[], now: number, releasedBy?: string): string {
 		const last = lastHolder.get(name);
+		if (releasedBy) return last && !peers.some((p) => p.id === last.id) ? `${releasedBy} left` : `${releasedBy} released it`;
 		if (!last) return FREE;
 		const holder = peers.find((p) => p.id === last.id);
 		if (!holder) return `${last.callsign} left`;
 		const claim = holder.claims.find((c) => sameResource(c.pattern, name));
-		return claim && claim.expiresAt <= now ? `${last.callsign}'s claim on it expired` : `${last.callsign} released it`;
+		return claim && claim.expiresAt <= now ? `${last.callsign}'s claim on it expired` : FREE;
 	}
 
-	function takeFreeLocks(me: Presence, peers: readonly Presence[]): void {
+	function takeFreeLocks(me: Presence, peers: readonly Presence[], releasedBy?: string): void {
 		if (!me.queued?.length) return;
 		const now = Date.now();
 		const others = rivals(me, peers);
@@ -100,7 +107,7 @@ export function createWaiting(rt: Runtime): Waiting {
 			me.claims = me.claims.filter((c) => !sameResource(c.pattern, name));
 			me.claims.push({ pattern: name, since: now, expiresAt: now + rt.cfg.claimTtlMs });
 			setBounded(fromLine, name, entry.since, HOLDERS_CAP);
-			taken.push({ name, how: howFreed(name, peers, now) });
+			taken.push({ name, how: howFreed(name, peers, now, releasedBy) });
 			lastHolder.delete(name);
 		}
 		if (taken.length === 0) return;
@@ -257,7 +264,7 @@ export function createWaiting(rt: Runtime): Waiting {
 			for (const p of mine) setBounded(lastHolder, resourceKey(p), { id: fromId, callsign: fromCallsign }, HOLDERS_CAP);
 			// The debounced team, read now: a waiter ahead of this agent whose record is missing from one
 			// read keeps its place, and a holder that is only departing still holds the lock.
-			takeFreeLocks(me, rt.presentNow());
+			takeFreeLocks(me, rt.presentNow(), fromCallsign);
 			return mine;
 		},
 

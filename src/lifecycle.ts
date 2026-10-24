@@ -34,7 +34,7 @@ import type { Waiting } from "./waiting.ts";
 const HEARTBEAT_MS = 15_000;
 /** The team is re-read every this many ticks; the inbox is drained on every tick. */
 const TEAM_REFRESH_TICKS = 2;
-/** Joins and leaves seen in the first ticks are the team as it was at startup, not news. */
+/** Joins seen in the first ticks are the team as it was at startup, not news (departures always are). */
 const STARTUP_TICKS = 2;
 /** A reload handoff older than this belongs to a runtime that did not come back. */
 const HANDOFF_MAX_AGE_MS = 5 * 60_000;
@@ -180,12 +180,14 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard, w
 		const left = [...teamIds].filter(([id, was]) => !ids.has(id) && was.role !== "child").map(([, was]) => was.callsign);
 		teamIds = ids;
 		if (joined.length > 0 || left.length > 0) {
-			if (tickCount > STARTUP_TICKS) {
-				const parts: string[] = [];
-				if (left.length) parts.push(`${left.join(", ")} left`);
-				if (joined.length) parts.push(`${joined.map((p) => p.callsign).join(", ")} joined`);
-				rt.notifyUser(`📡 ${parts.join("; ")}`);
-			}
+			// Only joins wait out the startup ticks: a session that started alongside this one is the
+			// team as it was, not news. A departure is always news, since connect already knew the
+			// peer. Ticks are not time: a loaded machine may tick only twice before a peer leaves.
+			const news = tickCount > STARTUP_TICKS ? joined : [];
+			const parts: string[] = [];
+			if (left.length) parts.push(`${left.join(", ")} left`);
+			if (news.length) parts.push(`${news.map((p) => p.callsign).join(", ")} joined`);
+			if (parts.length) rt.notifyUser(`📡 ${parts.join("; ")}`);
 			// Not held for the startup ticks: a model briefed already compares with its brief.
 			tellTeamNews(me, present);
 		}

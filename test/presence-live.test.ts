@@ -242,6 +242,17 @@ test("team: the human is told by name who joined and who left; a rename is neith
 	await eventually(() => assert.ok(a.notified.some((n) => /📡 ops left/.test(n)), "named by its callsign now"));
 });
 
+test("team: a known peer leaving is news even in the first ticks, which a loaded machine may still be in", async (t) => {
+	const proj = makeProject("p-live-early-leave");
+	const b = await session(proj);
+	// A ticks slowly, so its second tick (its first refresh) comes after B has gone. Ticks are not
+	// time: on a loaded CI runner a session ticked only twice in the seconds before a peer left.
+	withEnv(t, "PI_TELECOM_TICK_MS", "400");
+	const a = await session(proj);
+	await b.stop();
+	await eventually(() => assert.ok(a.notified.some((n) => /📡 alpha left/.test(n)), a.notified.join(" | ")), 3_000);
+});
+
 test("team: a peer record missing for less than a refresh is not a departure; one that stays missing is", async (t) => {
 	const proj = makeProject("p-live-flap");
 	// Slower ticks for the observer (a refresh every 200 ms), so the gaps below fit inside one.
