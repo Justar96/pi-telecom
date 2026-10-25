@@ -14,6 +14,15 @@ import { eventually, makeProject, type Session, session, sleep, stopSessions, wi
 
 const jobs: ChildProcess[] = [];
 
+/**
+ * The claim TTL of tests that check a claim is still held past it. Each heartbeat holds a claim
+ * for one more TTL, so a runner that stalls the event loop for longer (Windows CI starting a child
+ * Node process) lets it lapse: 300 ms was not enough there.
+ */
+const HOLD_TTL_MIN = "0.02"; // 1.2 s
+/** Well past one `HOLD_TTL_MIN`. */
+const PAST_TTL_MS = 1_800;
+
 afterEach(async () => {
 	for (const job of jobs.splice(0)) job.kill("SIGKILL");
 	await stopSessions();
@@ -109,7 +118,7 @@ test("a pid that is not running does not turn the claim away: it is a normal cla
 });
 
 test("a claim tied to a running process outlives its TTL while the owner is idle, and its release comes with the process's exit", async (t) => {
-	withEnv(t, "PI_TELECOM_CLAIM_TTL_MIN", "0.005"); // 300 ms
+	withEnv(t, "PI_TELECOM_CLAIM_TTL_MIN", HOLD_TTL_MIN);
 	withEnv(t, "PI_TELECOM_HEARTBEAT_MS", "40");
 	const proj = makeProject("p-pid-hold");
 	const a = await session(proj);
@@ -127,7 +136,7 @@ test("a claim tied to a running process outlives its TTL while the owner is idle
 	assert.ok(!(await b.tool({ action: "claim", paths: ["@cargo"], queue: true })).isError);
 	const board = (await b.tool({ action: "board" })).text;
 	assert.match(board, new RegExp(`@cargo — alpha, while pid ${pid} runs`));
-	await sleep(900); // three TTLs of idling, many heartbeats
+	await sleep(PAST_TTL_MS); // idling past the TTL, many heartbeats
 	assert.equal(published(a)?.claims.length, 2, "the batch still runs: both claims stay");
 	assert.equal(lockMessages(b).length, 0);
 	assert.equal(a.sentOf("telecom-claim").filter((m) => /expired/.test(m.content)).length, 0);
@@ -176,14 +185,14 @@ test("a claim made again without a pid keeps the one it had; with one, replaces 
 // ---------------------------------------------------------------- a freeze while waiting
 
 test("claims are kept past the TTL while the owner waits on a live teammate, and lapse once the wait is cleared", async (t) => {
-	withEnv(t, "PI_TELECOM_CLAIM_TTL_MIN", "0.005"); // 300 ms
+	withEnv(t, "PI_TELECOM_CLAIM_TTL_MIN", HOLD_TTL_MIN);
 	withEnv(t, "PI_TELECOM_HEARTBEAT_MS", "40");
 	const proj = makeProject("p-freeze");
 	const a = await session(proj);
 	await session(proj);
 	await a.tool({ action: "claim", paths: ["src/auth/**", "@cargo"], message: "frozen until delta commits" });
 	await a.tool({ action: "status", message: "claims held until delta commits", waitingFor: ["bravo"] });
-	await sleep(900); // three TTLs
+	await sleep(PAST_TTL_MS);
 	assert.equal(published(a)?.claims.length, 2, "the freeze has no edits to renew with, and holds");
 	assert.equal(a.sentOf("telecom-claim").filter((m) => /expired/.test(m.content)).length, 0);
 
@@ -197,7 +206,7 @@ test("claims are kept past the TTL while the owner waits on a live teammate, and
 });
 
 test("a forgotten wait does not hold claims: the freeze ends once the awaited teammate has done nothing for long", async (t) => {
-	withEnv(t, "PI_TELECOM_CLAIM_TTL_MIN", "0.005");
+	withEnv(t, "PI_TELECOM_CLAIM_TTL_MIN", HOLD_TTL_MIN);
 	withEnv(t, "PI_TELECOM_HEARTBEAT_MS", "40");
 	const proj = makeProject("p-freeze-forgotten");
 	const a = await session(proj);
@@ -220,21 +229,21 @@ test("a forgotten wait does not hold claims: the freeze ends once the awaited te
 	const job = await startJob();
 	transport.writePresence(away({ claims: [{ pattern: "@cargo", since: now, expiresAt: now + 3_600_000, pid: job.pid as number }] }));
 	await a.tool({ action: "claim", paths: ["src/ui/**"] });
-	await sleep(900);
+	await sleep(PAST_TTL_MS);
 	assert.equal(published(a)?.claims.length, 1, "its job runs, so the wait still holds");
 	transport.removePresence("idle-session-0001");
 });
 
 test("a wait on a teammate that has left does not freeze claims", async (t) => {
-	withEnv(t, "PI_TELECOM_CLAIM_TTL_MIN", "0.005");
+	withEnv(t, "PI_TELECOM_CLAIM_TTL_MIN", HOLD_TTL_MIN);
 	withEnv(t, "PI_TELECOM_HEARTBEAT_MS", "40");
 	const proj = makeProject("p-freeze-gone");
 	const a = await session(proj);
 	const b = await session(proj);
 	await a.tool({ action: "claim", paths: ["src/auth/**"] });
 	await a.tool({ action: "status", message: "waiting for bravo", waitingFor: ["bravo"] });
-	await sleep(500);
-	assert.equal(published(a)?.claims.length, 1);
+	await sleep(PAST_TTL_MS);
+	assert.equal(published(a)?.claims.length, 1, "bravo is still here, so the wait holds");
 	await b.stop();
 	await eventually(() => assert.equal(published(a)?.claims.length, 0), 8_000);
 });
