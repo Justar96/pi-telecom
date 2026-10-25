@@ -3,15 +3,15 @@
  * and answers, broadcasts, explicit team tasks, and peer events. A peer's file change becomes a
  * change notice, coalesced per peer and path and sent once the burst is over.
  */
-import { join } from "node:path";
+import { join, resolve, sep } from "node:path";
 import type { PeerChange } from "./awareness.ts";
-import { claimMatcher, claimsOverlap, laneRelativePattern, matchesClaim } from "./glob.ts";
+import { claimMatcher, claimsOverlap, isResource, laneRelativePattern, matchesClaim } from "./glob.ts";
 import { closesCycle, type HeldMessage, type InboundAsk } from "./ledger.ts";
 import { type PendingNotice, renderNotice } from "./notices.ts";
 import { displayPath, isWithin, laneName, sameRepo } from "./project.ts";
 import { MESSAGE_TYPES } from "./render.ts";
 import { type MessageDetails, type Runtime, taskLine } from "./runtime.ts";
-import { type Envelope, type FileChangedData, parseEvent } from "./transport.ts";
+import { type Envelope, type FileChangedData, parseEvent, type Presence } from "./transport.ts";
 import { clip, pairKey, setBounded } from "./util.ts";
 import type { Waiting } from "./waiting.ts";
 
@@ -19,6 +19,8 @@ import type { Waiting } from "./waiting.ts";
 const NOTICE_COALESCE_MS = 1_200;
 /** Envelope ids already handled, so an at-least-once redelivery is not handled twice. */
 const SEEN_CAP = 2_048;
+/** A broadcast from a teammate this agent messaged with this recently is about its work. */
+const CONTACT_NEAR_MS = 30 * 60_000;
 
 export interface Inbound {
 	/** Handle one drained envelope; a redelivery of one already handled is dropped. */
@@ -50,23 +52,45 @@ export function createInbound(rt: Runtime, waiting: Waiting): Inbound {
 	}
 
 	/**
-	 * Is anything at `patterns` (written in the sender's checkout) part of this agent's work: a file
-	 * it is working with or changed, or one of its claims?
+	 * Is a broadcast about `patterns` (written in the sender's checkout) part of this agent's work: a
+	 * file it is working with or changed, or one of its claims, or from a teammate it talked with in
+	 * the last while? Paths are compared as paths of the repository, in whatever checkout they lie:
+	 * agents often start in the main checkout and work in worktrees of their own, and the same file
+	 * in two worktrees is the same work (it meets at the merge).
 	 */
 	function concernsMe(patterns: readonly string[], senderId: string): boolean {
 		const me = rt.self;
 		if (!me) return false;
+		if (Date.now() - (rt.contacts.get(senderId) ?? 0) <= CONTACT_NEAR_MS) return true;
 		const sender = rt.peers.find((p) => p.id === senderId);
-		const lane = sender !== undefined && sender.projectRoot !== me.projectRoot;
-		const work = [...rt.awareness.focusPaths(), ...me.recent.map((r) => r.path)];
+		const base = sender?.projectRoot ?? me.projectRoot;
+		// One root to compare repository paths against; which one does not matter.
+		const root = me.projectRoot;
+		const work: string[] = [];
+		for (const path of [...rt.awareness.focusPaths(), ...me.recent.map((r) => r.path)]) {
+			const rel = repoPath(path, me);
+			if (rel !== null) work.push(join(root, rel));
+		}
+		const claims = me.claims
+			.filter((c) => !isResource(c.pattern))
+			.map((c) => laneRelativePattern(c.pattern, c.checkout ?? me.projectRoot))
+			.filter((c): c is string => c !== null);
 		for (const raw of patterns) {
-			const pattern = lane ? laneRelativePattern(raw, sender.projectRoot) : raw;
+			if (isResource(raw)) continue;
+			const pattern = repoPath(resolve(base, raw), me);
 			if (pattern === null) continue;
-			if (me.claims.some((c) => claimsOverlap(c.pattern, pattern, me.projectRoot))) return true;
-			const inside = claimMatcher(pattern, me.projectRoot);
+			if (claims.some((c) => claimsOverlap(c, pattern, root))) return true;
+			const inside = claimMatcher(pattern, root);
 			if (work.some(inside)) return true;
 		}
 		return false;
+	}
+
+	/** An absolute path (or glob) as a path of the repository, relative to the checkout it lies in. */
+	function repoPath(path: string, me: Presence): string | null {
+		const place = rt.awareness.placeOf(path, me);
+		if (!place) return null;
+		return place.rel === "" ? "." : place.rel.split(sep).join("/");
 	}
 
 	function handleEnvelope(env: Envelope): void {
@@ -195,7 +219,7 @@ export function createInbound(rt: Runtime, waiting: Waiting): Inbound {
 			}
 			case "claim.released": {
 				// A lock this agent queues for goes to the first in line: it hears only if that is it.
-				const queued = waiting.released(env.from, env.fromCallsign, event.data.patterns);
+				const queued = waiting.released(env.from, env.fromCallsign, event.data.patterns, env.ts);
 				const rest = event.data.patterns.filter((p) => !queued.includes(p));
 				if (queued.length > 0 && rest.length === 0) return;
 				const patterns = rest.join(", ");
@@ -252,7 +276,7 @@ export function createInbound(rt: Runtime, waiting: Waiting): Inbound {
 			return;
 		}
 		const { relation, firstNotice } = rt.awareness.notePeerChange(change);
-		const claim = me.claims.find((c) => matchesClaim(data.path, c.pattern, me.projectRoot));
+		const claim = me.claims.find((c) => matchesClaim(data.path, c.pattern, c.checkout ?? me.projectRoot));
 		// Suppress later interruptions, but keep a pending notice's count and excerpt current.
 		if (!claim && !notices.has(noticeKey(change)) && !(relation && firstNotice)) return;
 		enqueueNotice({

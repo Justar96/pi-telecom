@@ -31,13 +31,24 @@ import {
 import { clip, messageOf, plural } from "./util.ts";
 import type { Waiting } from "./waiting.ts";
 
-const HEARTBEAT_MS = 15_000;
 /** The team is re-read every this many ticks; the inbox is drained on every tick. */
 const TEAM_REFRESH_TICKS = 2;
 /** Joins seen in the first ticks are the team as it was at startup, not news (departures always are). */
 const STARTUP_TICKS = 2;
 /** A reload handoff older than this belongs to a runtime that did not come back. */
 const HANDOFF_MAX_AGE_MS = 5 * 60_000;
+/** The expired path claims a notice names, in characters. */
+const EXPIRED_SHOWN = 400;
+/**
+ * While this agent is busy, each lock it holds is kept at least this far from expiring. A lock
+ * guards a job (a build, a test run) that usually runs inside the agent's run, often in one long
+ * tool call the agent cannot interrupt to renew it: a lock that lapsed there was handed to the
+ * next in line while the job still ran. Once the agent is idle, the lock lapses as before.
+ */
+const LOCK_BUSY_HOLD_MS = 5 * 60_000;
+/** A run that never ends must not hold a lock forever: past this long since the lock was taken,
+ *  only claiming it again keeps it. */
+const LOCK_BUSY_MAX_MS = 12 * 60 * 60_000;
 
 /** What a runtime parks for its replacement on `/reload`. */
 interface Handoff {
@@ -84,6 +95,10 @@ export function adoptRepo(me: Presence): void {
 export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard, waiting: Waiting): Lifecycle {
 	let timer: ReturnType<typeof setInterval> | null = null;
 	let tickCount = 0;
+	/** When the heartbeat last ran. Its own clock: `rt.lastHeartbeat` moves with every write of the
+	 *  record, and an agent that writes often (edits, long steps) would otherwise never expire a
+	 *  claim, nor keep a busy agent's locks (`holdLocks`). */
+	let lastBeat = 0;
 	/** The team as of the last refresh, with each member's role (subagents come and go quietly)
 	 *  and callsign (the human is told who left by name). */
 	let teamIds = new Map<string, { role: Presence["role"]; callsign: string }>();
@@ -122,6 +137,7 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard, w
 			const drained = transport.drain(me.id, (env) => inbound.receive(env));
 			for (const failure of drained.failed) rt.report("inbound", failure);
 		});
+		rt.step("releases", () => waiting.afterDrain());
 		if (!rt.self) return; // handling may have backed this session off
 		// The last write of our record failed (on Windows, a reader held the file): peers still see
 		// the record before it, so write it again now.
@@ -135,7 +151,11 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard, w
 				tellUnanswered(ask, `No reply within ${Math.round(ask.timeoutMs / 1000)}s. If one comes later, it still arrives as a message. Decide without it, or ask again: telecom({ action: "ask", to: "${ask.toCallsign}", message: "…", wait: false }).`);
 			}
 		});
-		if (Date.now() - rt.lastHeartbeat >= HEARTBEAT_MS) rt.step("heartbeat", heartbeat);
+		rt.step("wakes", () => rt.checkWakes());
+		if (Date.now() - lastBeat >= rt.cfg.heartbeatMs) {
+			lastBeat = Date.now();
+			rt.step("heartbeat", heartbeat);
+		}
 	}
 
 	function refreshTeam(): void {
@@ -234,10 +254,19 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard, w
 		rt.publish();
 	}
 
+	/** Keep the locks a busy agent holds from lapsing under the job they guard (`LOCK_BUSY_HOLD_MS`). */
+	function holdLocks(me: Presence, now: number): void {
+		for (const claim of me.claims) {
+			if (!isResource(claim.pattern) || claim.expiresAt <= now || now - claim.since >= LOCK_BUSY_MAX_MS) continue;
+			claim.expiresAt = Math.max(claim.expiresAt, now + Math.min(LOCK_BUSY_HOLD_MS, rt.cfg.claimTtlMs));
+		}
+	}
+
 	function heartbeat(): void {
 		const me = rt.self;
 		if (!me || !rt.transport) return;
 		const now = Date.now();
+		if (me.state === "busy") holdLocks(me, now);
 		const before = me.claims.length;
 		const lapsed = me.claims.filter((c) => c.expiresAt <= now).map((c) => c.pattern);
 		const locks = me.claims.filter((c) => c.expiresAt <= now && isResource(c.pattern)).map((c) => c.pattern);
@@ -245,12 +274,16 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard, w
 		const expired = before - me.claims.length;
 		if (expired > 0) {
 			rt.logEntry("release", `claim expired unused: ${lapsed.join(", ")}`, lapsed);
-			// Edits renew a path claim but never a lock: a lock is renewed only by claiming it again.
+			// Edits renew a path claim but never a lock: a lock is kept by a run in progress, or by
+			// claiming it again.
 			const why =
 				locks.length === 0
 					? `No activity inside ${expired === 1 ? "it" : "them"} for ${rt.claimTtlMinutes()} minutes, so peers may work there now.`
-					: `${locks.join(", ")} ${locks.length === 1 ? "was" : "were"} not claimed again within ${rt.claimTtlMinutes()} minutes (edits do not renew a lock), so the next in line may take ${locks.length === 1 ? "it" : "them"} now.`;
-			rt.inject(MESSAGE_TYPES.claim, `**📡 ${plural(expired, "claim")} expired**\n\n${why} Claim again if you still need it.`, {}, "passive");
+					: `${locks.join(", ")} ${locks.length === 1 ? "was" : "were"} not claimed again within ${rt.claimTtlMinutes()} minutes while you were idle, so the next in line may take ${locks.length === 1 ? "it" : "them"} now.`;
+			// Named, so "claim again" can be acted on: the model may hold claims from hours ago.
+			const paths = lapsed.filter((p) => !isResource(p));
+			const named = paths.length > 0 ? ` Expired: ${clip(paths.join(", "), EXPIRED_SHOWN)}.` : "";
+			rt.inject(MESSAGE_TYPES.claim, `**📡 ${plural(expired, "claim")} expired**\n\n${why}${named} Claim again if you still need ${expired === 1 ? "it" : "them"}.`, {}, "passive");
 		}
 		adoptRepo(me);
 		const branch = readBranch(me.projectRoot);
@@ -293,6 +326,8 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard, w
 
 	function stop(keepLine = false): void {
 		halt();
+		rt.forgetWakes();
+		rt.flushLater();
 		const { transport, self: me } = rt;
 		// A reload is not a departure: the next runtime of this session continues the same log.
 		// Subagents come and go with every delegation; their arrivals and departures are not history.
@@ -457,6 +492,7 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard, w
 			rt.resetTeam(rt.peers);
 			teamIds = new Map(rt.team(rt.present).map((p) => [p.id, { role: p.role, callsign: p.callsign }]));
 			tickCount = 0;
+			lastBeat = Date.now();
 			timer ??= setInterval(tick, rt.cfg.tickMs);
 			timer.unref?.();
 			rt.updateStatus();
@@ -489,6 +525,7 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard, w
 
 	rt.on("session_compact", () => {
 		rt.awareness.markCompacted();
+		rt.noteCompaction();
 		// The summary may have dropped the team picture: the next prompt gets a full brief.
 		rt.requestFullBrief();
 	});

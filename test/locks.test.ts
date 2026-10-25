@@ -229,6 +229,27 @@ test("queue: a release hands the lock to the first in line and wakes it; the res
 	assert.match(lockMessages(c)[0]?.content ?? "", /@cargo is yours now \(bravo (left|released it)\)/);
 });
 
+test("queue: a slow waiter that reads an old release and the newest in one drain names who freed it last", async () => {
+	const proj = makeProject("p-lock-slow-reader");
+	const a = await session(proj);
+	const b = await session(proj);
+	// charlie ticks rarely, as on a loaded CI runner: alpha's release (before bravo took the lock)
+	// and bravo's (as it left) reach it in one drain.
+	const tick = process.env.PI_TELECOM_TICK_MS;
+	process.env.PI_TELECOM_TICK_MS = "1500";
+	const c = await session(proj).finally(() => {
+		process.env.PI_TELECOM_TICK_MS = tick;
+	});
+	await a.tool({ action: "claim", paths: ["@cargo"] });
+	await b.tool({ action: "claim", paths: ["@cargo"], queue: true });
+	await c.tool({ action: "claim", paths: ["@cargo"], queue: true });
+	await a.tool({ action: "release" });
+	await eventually(() => assert.equal(lockMessages(b).length, 1));
+	await b.stop();
+	await eventually(() => assert.equal(lockMessages(c).length, 1), 5000);
+	assert.match(lockMessages(c)[0]?.content ?? "", /@cargo is yours now \(bravo (left|released it)\)/);
+});
+
 test("race: two sessions that take one free lock at once settle on the earlier claim; the loser, told it held it, is told it does not and waits first in line", async () => {
 	const proj = makeProject("p-lock-race");
 	const b = await session(proj);
@@ -283,6 +304,56 @@ test("locks expire unless claimed again — edits never renew one — and then p
 	assert.ok(!(await b.tool({ action: "claim", paths: ["@cargo"], queue: true })).isError);
 	await eventually(() => assert.equal(lockMessages(b).length, 1), 5_000);
 	assert.match(lockMessages(b)[0]?.content ?? "", /@cargo is yours now \(alpha's claim on it expired\)/);
+});
+
+test("locks: a busy holder's lock does not lapse under the job it guards, and lapses once the holder is idle", async (t) => {
+	withEnv(t, "PI_TELECOM_CLAIM_TTL_MIN", "0.005"); // 300 ms
+	withEnv(t, "PI_TELECOM_HEARTBEAT_MS", "40");
+	const proj = makeProject("p-lock-busy");
+	const a = await session(proj);
+	const b = await session(proj);
+	await a.prompt("run the 4-hour runtime batch");
+	await a.tool({ action: "claim", paths: ["@cargo"] });
+	await b.tool({ action: "claim", paths: ["@cargo"], queue: true });
+	await sleep(900); // three TTLs, and many heartbeats
+	assert.equal(lockMessages(b).length, 0, "the batch still runs: the lock stays with alpha");
+	assert.ok((published(a)?.claims[0]?.expiresAt ?? 0) > Date.now(), "kept ahead of its expiry in the record peers read");
+	await a.settle();
+	await eventually(() => assert.equal(lockMessages(b).length, 1), 5_000);
+	// How it freed depends on whether alpha's fast heartbeat dropped the expired claim before
+	// bravo's refresh read it; what matters here is when.
+	assert.match(lockMessages(b)[0]?.content ?? "", /@cargo is yours now/);
+	await eventually(() => assert.ok(a.sentOf("telecom-claim").some((m) => /not claimed again within \d+ minutes while you were idle/.test(m.content))));
+});
+
+test("a lock handed over ends the taker's declared wait on the holder, so the holder queueing behind it is no wait cycle", async () => {
+	const proj = makeProject("p-lock-wait-ends");
+	const a = await session(proj);
+	const b = await session(proj);
+	await a.tool({ action: "claim", paths: ["@cargo"] });
+	await b.tool({ action: "claim", paths: ["@cargo"], queue: true });
+	await b.tool({ action: "status", message: "queued for @cargo behind alpha", waitingFor: ["alpha"] });
+	await a.tool({ action: "release", paths: ["@cargo"] });
+	await eventually(() => assert.equal(lockMessages(b).length, 1));
+	assert.match(lockMessages(b)[0]?.content ?? "", /Your wait on alpha ended with it\./);
+	await eventually(() => assert.equal(published(b)?.blockedOn, undefined));
+	await a.tool({ action: "claim", paths: ["@cargo"], queue: true });
+	const declared = await a.tool({ action: "status", message: "queued behind bravo", waitingFor: ["bravo"] });
+	assert.doesNotMatch(declared.text, /wait cycle/);
+	await sleep(150);
+	assert.equal(b.sentOf("telecom-message").filter((m) => /Wait cycle/.test(m.content)).length, 0);
+});
+
+test("an expiry notice names the claims that expired, so claiming them again can be done", async (t) => {
+	withEnv(t, "PI_TELECOM_CLAIM_TTL_MIN", "0.005");
+	withEnv(t, "PI_TELECOM_HEARTBEAT_MS", "40");
+	const proj = makeProject("p-claim-expiry-named");
+	const a = await session(proj);
+	await session(proj);
+	await a.tool({ action: "claim", paths: ["src/auth/**", "docs/auth.md"] });
+	await eventually(() => assert.ok(a.sentOf("telecom-claim").some((m) => /claims expired/.test(m.content))), 3_000);
+	const notice = a.sentOf("telecom-claim").find((m) => /claims expired/.test(m.content))?.content ?? "";
+	assert.match(notice, /Expired: src\/auth\/\*\*, docs\/auth\.md\. Claim again if you still need them\./);
 });
 
 test("release with nothing held is a harmless no-op; releasing a lock you only wait for leaves the line", async () => {
@@ -459,6 +530,127 @@ test("declared waits wake the waiter when the teammate finishes its run, and end
 	await b.stop();
 	await eventually(() => assert.ok(a.sentOf("telecom-message").some((m) => /📡 bravo left — you were waiting for them/.test(m.content))));
 	await eventually(() => assert.equal(published(a)?.blockedOn, undefined));
+});
+
+test("declared waits: a teammate's new task wakes no one; its status says who waits on it, and its message ends the wait", async () => {
+	const proj = makeProject("p-wait-task");
+	const a = await session(proj);
+	const b = await session(proj);
+	await b.prompt("build the schema");
+	await a.tool({ action: "status", message: "waiting for the schema", waitingFor: ["bravo"] });
+	const progress = await b.tool({ action: "status", message: "schema half done, now the indexes" });
+	assert.match(progress.text, /alpha waits for you\. If this is what it needs, tell it: telecom\(\{ action: "send", to: "alpha", message: "…" \}\)/);
+	await sleep(200); // several team refreshes
+	assert.equal(a.sentOf("telecom-message").length, 0, "progress is not a wake-up");
+	await b.tool({ action: "send", to: "alpha", message: "schema is ready" });
+	await eventually(() => assert.equal(published(a)?.blockedOn, undefined));
+	const quiet = await b.tool({ action: "status", message: "the indexes" });
+	assert.doesNotMatch(quiet.text, /waits for you/, "nobody waits any more");
+});
+
+const reminders = (s: Session) => s.sentOf("telecom-message").filter((m) => /started a run, but your run ended before you answered/.test(m.content));
+const answered = { message: { role: "assistant", stopReason: "stop", content: [] } };
+
+test("wakes: a message that started a run no model turn answered is re-sent, the record says since when, and a model turn ends it", async (t) => {
+	withEnv(t, "PI_TELECOM_HEARTBEAT_MS", "10");
+	const proj = makeProject("p-wake-retry");
+	const a = await session(proj);
+	const b = await session(proj);
+	await b.tool({ action: "send", to: "alpha", message: "please review the migration" });
+	await eventually(() => assert.equal(reminders(a).length, 1));
+	const first = reminders(a)[0];
+	assert.match(first?.content ?? "", /reminder 1 of 3/);
+	assert.match(first?.content ?? "", /please review the migration/);
+	assert.match(first?.content ?? "", /tell bravo why: telecom\(\{ action: "send", to: "bravo", message: "…" \}\)/);
+	assert.deepEqual(first?.options, { triggerTurn: true });
+	await eventually(() => assert.ok(published(a)?.unreadSince));
+	const hint = await b.tool({ action: "send", to: "alpha", message: "ping" });
+	assert.match(hint.text, /has not acted on a message it got .*its session may be stuck/);
+	await eventually(() => assert.ok(a.sentOf("telecom-message").some((m) => /Message from bravo\*\*\n\nping/.test(m.content))));
+	// A failed or aborted reply is no answer.
+	await a.fire("message_end", { message: { role: "assistant", stopReason: "aborted", content: [] } });
+	assert.ok(published(a)?.unreadSince);
+	await a.fire("message_end", answered);
+	await eventually(() => assert.equal(published(a)?.unreadSince, undefined));
+	const count = reminders(a).length;
+	await sleep(1000); // past every retry
+	assert.equal(reminders(a).length, count, "an answered wake-up is not re-sent");
+	assert.equal(a.notified.filter((n) => /started no model turn/.test(n)).length, 0);
+});
+
+test("wakes: past the last reminder the human is told, once", async (t) => {
+	withEnv(t, "PI_TELECOM_HEARTBEAT_MS", "10");
+	const proj = makeProject("p-wake-give-up");
+	const a = await session(proj);
+	const b = await session(proj);
+	await b.tool({ action: "send", to: "alpha", message: "please review the migration" });
+	await eventually(() => assert.equal(a.notified.filter((n) => /started no model turn after 3 reminders/.test(n)).length, 1), 5000);
+	assert.equal(reminders(a).length, 3);
+	await sleep(300);
+	assert.equal(a.notified.filter((n) => /started no model turn/.test(n)).length, 1);
+});
+
+test("declared waits: a teammate that does not move is pointed out to its waiter once, with a nudge", async (t) => {
+	withEnv(t, "PI_TELECOM_HEARTBEAT_MS", "10"); // 120 beats: 1.2 s of idling
+	const proj = makeProject("p-wait-stale");
+	const a = await session(proj);
+	const b = await session(proj);
+	await a.tool({ action: "status", message: "waiting for the schema", waitingFor: ["bravo"] });
+	// Its own reminders (the notice started a run no model turn answered) repeat the text.
+	const stalls = () => a.sentOf("telecom-message").filter((m) => /^\*\*📡 bravo has been idle/.test(m.content));
+	await eventually(() => assert.equal(stalls().length, 1), 5000);
+	const note = stalls()[0];
+	assert.match(note?.content ?? "", /bravo has been idle for .* while you wait for it/);
+	assert.match(note?.content ?? "", /Nudge it: telecom\(\{ action: "send", to: "bravo", message: "…" \}\)/);
+	assert.deepEqual(note?.options, { triggerTurn: true });
+	await sleep(500);
+	assert.equal(stalls().length, 1, "one idle spell is told once");
+	assert.equal(b.sentOf("telecom-message").length, 0);
+});
+
+test("declared waits: a teammate whose wake-up went unanswered is pointed out to its waiter at once", async (t) => {
+	withEnv(t, "PI_TELECOM_HEARTBEAT_MS", "10");
+	const proj = makeProject("p-wait-unread");
+	const a = await session(proj);
+	await session(proj);
+	const c = await session(proj);
+	await a.tool({ action: "status", message: "waiting for the schema", waitingFor: ["bravo"] });
+	await c.tool({ action: "send", to: "bravo", message: "the schema needs an index" });
+	await eventually(() => assert.ok(a.sentOf("telecom-message").some((m) => /bravo has not acted on a message it got .*its session may be stuck/.test(m.content))));
+	const board = await a.command("");
+	assert.match(board.join("\n"), /unread/);
+});
+
+test("board: a teammate many depend on shows as one: the asks it owes, and who waits on it", async (t) => {
+	withEnv(t, "PI_TELECOM_HEARTBEAT_MS", "20");
+	const proj = makeProject("p-hub");
+	const a = await session(proj);
+	const b = await session(proj);
+	const c = await session(proj);
+	await b.tool({ action: "ask", to: "alpha", message: "which schema version?", wait: false });
+	await c.tool({ action: "ask", to: "alpha", message: "is the api frozen?", wait: false });
+	await b.tool({ action: "status", message: "waiting on the schema", waitingFor: ["alpha"] });
+	await eventually(() => assert.equal(published(a)?.asksOwed, 2));
+	await eventually(async () => {
+		const board = (await c.tool({ action: "board" })).text;
+		assert.match(board, /• alpha \[idle[^\]]* · owes 2 asks\]/);
+		assert.match(board, /waited on by: bravo/);
+	});
+	const sent = await c.tool({ action: "send", to: "alpha", message: "also: the docs" });
+	assert.match(sent.text, /it already owes 2 other asks, so expect a wait/);
+	const askId = /askId: "([^"]+)"/.exec(a.sentOf("telecom-ask")[0]?.content ?? "")?.[1] ?? "";
+	await a.tool({ action: "reply", askId, message: "v3" });
+	await eventually(() => assert.equal(published(a)?.asksOwed, 1), 2000);
+});
+
+test("status: a task longer than one line's worth is cut, and the result says so and why", async () => {
+	const proj = makeProject("p-status-long");
+	const a = await session(proj);
+	await session(proj);
+	const res = await a.tool({ action: "status", message: `Phase1 PASS: SBF/IDL/client/CU/SDK ${"evidence ".repeat(30)}` });
+	assert.match(res.text, /cut to 160 characters: status is the one line peers see as your task/);
+	const short = await a.tool({ action: "status", message: "building the SDK" });
+	assert.doesNotMatch(short.text, /cut to/);
 });
 
 test("declared wait cycles are flagged on the board, and each agent on one is told once, passively", async () => {

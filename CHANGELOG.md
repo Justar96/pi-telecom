@@ -6,6 +6,59 @@ All notable changes to `@justar_96/pi-telecom`. The format follows
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-10-25
+
+### Added
+
+- Claims can name one worktree: an absolute path into a worktree claims that copy only, shown as
+  `src/** (in repo-lane)`. An agent that started in the main checkout and works in a worktree is
+  given the exact call when its relative claim would hold back a teammate in another checkout, or
+  when its own claim is refused because of one. The wire field `checkout` is optional; older peers
+  treat such a claim as before.
+- A message that started a run nobody answered (the run ended before any model reply) is sent
+  again after about 1, 5 and 15 minutes, then the human is told. The record carries `unreadSince`,
+  so the board shows `unread` and a `send` says the session may be stuck.
+- A declared wait on a teammate that stays idle for 30 minutes, or has a message it never acted on,
+  tells the waiter once, with the call to nudge it.
+- The board shows how many asks an agent owes (`owes 3 asks`) and who waits on it; a `send` to an
+  agent owing several says to expect a wait. The record carries an optional `asksOwed`.
+- `status` tells the agent who waits on it, and says when its text was cut to one line (160
+  characters).
+
+### Changed
+
+- A lock doesn't lapse while its holder is busy (up to 12 hours); once idle, it lapses the TTL
+  after it was claimed unless claimed again.
+- A teammate's new task no longer wakes agents waiting on it; finishing a run or leaving still
+  does.
+- A lock handed over ends the taker's declared wait on its previous holder, so the holder queueing
+  behind it is no wait cycle.
+- Broadcasts held for the next run are kept by telecom: ones held more than 30 minutes are cut to
+  a line with a pointer to the log. Paths are compared as repository paths, so a broadcast about a
+  file in one worktree reaches agents working on that file in another at once, as does one from a
+  teammate messaged in the last 30 minutes.
+- The worktree full-path claim is explained in full once per worktree (and again after a
+  compaction); later claims carry only the call, so every claim does not repeat it.
+- `e2e:cache` repeats each side 3 times (`TELECOM_CACHE_RUNS`), compares medians, and reports
+  cache misses apart from the new tokens per request, the part telecom adds.
+- README: tips for teams of three or more, and the claim, wait and delivery sections brought up
+  to date.
+
+### Fixed
+
+- Claim overlap is exact for globs: `crates/program-client/**` no longer overlaps
+  `crates/gateway-*/**`, and `app/lib/*.ts` no longer overlaps `app/lib/control-plane/x.ts`.
+- A claim refused again after the owner narrowed its claim is no longer called a blind retry.
+- An expiry notice names the claims that expired.
+- `reply` with an unknown ask id says how to answer anyway.
+- The heartbeat runs on its own clock: frequent record writes could postpone it indefinitely.
+- A waiter that read an old release and a newer one together (a slow tick) named the old releaser
+  as the one who freed the lock. Releases read in one drain are now judged together, by when each
+  was sent.
+- CI: the RPC check that two sessions started together get distinct callsigns waits for the
+  collision to be resolved. The dev-only `undici` (through pi's packages) is overridden to a
+  patched release.
+
 ## [0.5.0] - 2026-10-24
 
 ### Added
@@ -321,7 +374,8 @@ First release.
   presence repairs itself.
 - Prompt cache unaffected: 84.4 % hit rate with and without telecom on Claude Sonnet 5.5.
 
-[Unreleased]: https://github.com/Justar96/pi-telecom/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/Justar96/pi-telecom/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/Justar96/pi-telecom/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/Justar96/pi-telecom/compare/v0.4.2...v0.5.0
 [0.4.2]: https://github.com/Justar96/pi-telecom/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/Justar96/pi-telecom/compare/v0.4.0...v0.4.1

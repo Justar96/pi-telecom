@@ -19,6 +19,8 @@ const MIN_ID_PREFIX = 4;
  * so "before their next step" would mislead. Below it the call is likely to end soon.
  */
 export const LONG_STEP_MS = 60_000;
+/** Asks a teammate owes before a sender is told to expect a wait. */
+const OWED_HINT_FROM = 2;
 
 /** `via`: how a target found by path was picked ("claims …", "changed … ago"), for the result. */
 export type Target = { ok: true; peer: Presence; via?: string } | { ok: false; reason: string };
@@ -136,8 +138,18 @@ export function stateHint(peer: Presence, self: Presence, peers: readonly Presen
 		if (step && Date.now() - step.since >= LONG_STEP_MS) {
 			return `busy in ${step.tool} for ${elapsed(step.since)} — it reads this when that call ends. A blocking ask may time out before then; telecom({ action: "ask", to: "${peer.callsign}", message: "…", wait: false }) returns at once`;
 		}
-		return "busy — it reaches them before their next step";
+		return `busy — it reaches them before their next step${owedHint(peer)}`;
+	}
+	// A run started for a message ended without the model acting on it: telecom re-wakes it, but
+	// whoever waits on it should know the session may be stuck.
+	if (peer.unreadSince !== undefined) {
+		return `idle, and has not acted on a message it got ${ago(peer.unreadSince)}: its session may be stuck. This is re-sent to it, but if it is urgent, tell your human`;
 	}
 	const idle = idleFor(peer);
-	return idle ? `idle for ${idle} — this wakes them` : "idle — this wakes them";
+	return `${idle ? `idle for ${idle} — this wakes them` : "idle — this wakes them"}${owedHint(peer)}`;
+}
+
+/** A teammate with asks to answer before this one: the sender should expect a wait. */
+function owedHint(peer: Presence): string {
+	return peer.asksOwed && peer.asksOwed >= OWED_HINT_FROM ? `; it already owes ${peer.asksOwed} other asks, so expect a wait` : "";
 }

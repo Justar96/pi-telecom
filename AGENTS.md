@@ -20,7 +20,7 @@ node --experimental-strip-types --no-warnings --test --test-name-pattern="claims
 # with real models (spends a few short turns each):
 TELECOM_LIVE_PROVIDER=<provider> npm run e2e:matrix        # the live scenario on every model in lab-models.mjs
 TELECOM_LIVE_MODEL=<provider/model> npm run e2e:live       # one model; TELECOM_LIVE_ONLY=core|claims for one part
-TELECOM_LIVE_MODEL=<provider/model> npm run e2e:cache      # the prompt-cache proof
+TELECOM_LIVE_MODEL=<provider/model> npm run e2e:cache      # the prompt-cache proof (TELECOM_CACHE_RUNS per side, default 3)
 TELECOM_LIVE_PROVIDER=<provider> npm run screenshots       # docs/images/team.png from real pi sessions (needs tmux, Chrome)
 ```
 
@@ -56,14 +56,16 @@ Live checks judge outcomes, not one path: a model may re-read before writing *or
 the guard, and may ask a claim's owner first *or* be held back. Both are correct. Only an unsafe
 result fails a check, such as a stale write that landed or an uncoordinated edit inside a claim.
 For the cache, compare from the second request on. The first request is warm or cold depending on
-what ran before it.
+what ran before it. Providers cache best-effort, so `e2e:cache` repeats each side
+(`TELECOM_CACHE_RUNS`, default 3), compares medians, and reports misses apart from the new tokens
+per request that hit: that is the text telecom adds, the number its changes can move.
 
 ## Layout
 
 | file | owns |
 |---|---|
 | `src/index.ts` | The entry point. The factory creates the session's `Runtime` and registers the parts below it in this table, which act on it. It starts nothing (rule 4). |
-| `src/runtime.ts` | One session runtime's state (`Runtime`: the record, the transport, the ask ledger, awareness, brief state, the footer and widget) and the operations every part shares: `publish`, `readPeers`/`team`, the debounced team (`present`, `settleTeam`, `presentNow`), `envelope`/`deliverEach`/`sendEvent`, `inject` (the delivery modes), `injectMessage`, `setState` and the step (`noteStepStart`/`noteStepEnd`/`publishStep`), `nextBrief`, the team log handle (`logEntry`/`flushLog`/`teamLog`), `report`/`step`, the hook wrapper `on` (rule 3), and the settings kept in the session (`telecom-callsign`, `telecom-enabled`). |
+| `src/runtime.ts` | One session runtime's state (`Runtime`: the record, the transport, the ask ledger, awareness, brief state, the footer and widget) and the operations every part shares: `publish`, `readPeers`/`team`, the debounced team (`present`, `settleTeam`, `presentNow`), `envelope`/`deliverEach`/`sendEvent`, `inject` (the delivery modes; `later` held in `takeLater`/`flushLater`), wake-ups owed a model reply (`checkWakes`, `noteModelTurn`), `injectMessage`, `setState` and the step (`noteStepStart`/`noteStepEnd`/`publishStep`), `nextBrief`, the team log handle (`logEntry`/`flushLog`/`teamLog`), `report`/`step`, the hook wrapper `on` (rule 3), and the settings kept in the session (`telecom-callsign`, `telecom-enabled`). |
 | `src/lifecycle.ts` | `connect` and `stop`, the loop (`tick`), the team refresh, the heartbeat, backing off when the session is open twice, the reload handoff, and the `session_*` and `model_select` hooks. |
 | `src/inbound.ts` | The inbox: messages, asks, answers, broadcasts, team tasks (`runTask`), peer events, and the change-notice queue. |
 | `src/guard.ts` | The `tool_call`/`tool_result` hooks: acting on `awareness` verdicts, and announcing this agent's own changes. |
@@ -117,7 +119,11 @@ the module; use `import type` for those.
   A file's lane is the checkout it physically lies in (`placeOf`), not the session's starting
   checkout: agents often start in the main checkout and edit worktrees of their own. A claim
   binds in every checkout its owner works in (`Awareness.checkoutsOf`: where it started, plus
-  where its recent edits landed).
+  where its recent edits landed), unless it names one (`Claim.checkout`, optional on the wire: an
+  absolute path into a worktree, stored relative to it); then it binds there only. `claim`
+  conflicts where both claims bind in one checkout. Guessing the scope from recent edits could
+  guess wrong and stop guarding work, so a relative claim is never narrowed silently: the claim
+  result and a refusal give the exact absolute-path call instead (`everywhereHint`, `scopeHint`).
   `repo` is optional on the wire, so a peer without it is grouped by `projectRoot` alone
   (`sameRepo`). A pi-subagents child publishes `role: "child"` and `parent`; its lineal family
   (`lineOf`) is exempt from each other's claims, and briefs fold it into its parent.
@@ -137,7 +143,9 @@ the module; use `import type` for those.
   `log/<session>.jsonl` is the team log, also written only by its owner (temp file + rename, the
   whole file, the newest `LOG_CAP` entries). Older sessions ignore the directory.
 - **The loop** (`tick()` in `lifecycle.ts`, every 500 ms, `unref`'d, never throws: a throw from a
-  timer would crash the host process): leave if pi disposed the runtime → drain the inbox → write
+  timer would crash the host process): leave if pi disposed the runtime → drain the inbox → take
+  locks released in it (`waiting.afterDrain`: the latest release per lock, by send time, names who
+  freed it) → write
   our record again if its last write failed (peers still see the one before it) → publish the
   step if a tool call has run longer than `STEP_PUBLISH_AFTER_MS` → refresh the team every 2nd
   tick (repair our own record, detect the same session open twice, resolve callsign collisions,
@@ -148,9 +156,11 @@ the module; use `import type` for those.
   busy, already-briefed model of them as a passive brief update; then `waiting.refresh`: settle
   lock races against this refresh's read only, hand freed locks on and wake declared waits
   against the debounced team) → flush pending change notices → write our
-  log file if something was logged → expire asks → heartbeat every 15 s (expire claims, re-read
-  the branch, sweep dead records, and at most every 10 min departed sessions' log files older
-  than `LOG_RETENTION_MS`). The footer is set only when
+  log file if something was logged → expire asks → re-send wake-ups no model turn answered
+  (`checkWakes`) → heartbeat every 15 s (`PI_TELECOM_HEARTBEAT_MS`, on its own clock, since
+  `publish` runs often; keep a busy holder's locks from lapsing, expire claims, re-read the
+  branch, sweep dead records, and at most every 10 min departed sessions' log files older than
+  `LOG_RETENTION_MS`). The footer is set only when
   its text changes: every `setStatus` redraws the TUI.
 - **The guard's one-time parts** (a lane note, telling a lane claim's owner) are proposed by the
   verdict and committed in `tool_result` only when the call succeeded, so a call blocked by a
@@ -169,10 +179,16 @@ the module; use `import type` for those.
 
   | mode | used for | when busy | when idle |
   |---|---|---|---|
-  | `wake` | direct messages, late answers, answers to `wait: false` asks, a lock handed to a waiter, news of a teammate the agent declared it waits for | steered in | starts a turn (wake-limited) |
+  | `wake` | direct messages, late answers, answers to `wait: false` asks, a lock handed to a waiter, news of a teammate the agent declared it waits for (its run ended, it left, it stalled) | steered in | starts a turn (wake-limited) |
   | `wake-always` | asks and explicit human team tasks | steered in | starts a turn |
   | `passive` | notices, broadcasts, claim news, mid-run team updates (joins/departures), wait cycles, an expired `wait: false` ask | steered in | appended, no turn |
-  | `later` | broadcasts about paths away from this agent's work | held for the next run (`deliverAs: "nextTurn"`) | held for the next run |
+  | `later` | broadcasts about paths away from this agent's work | held by the runtime for the next run | held by the runtime for the next run |
+
+  `later` messages ride with the next run's brief (`takeLater`, from `before_agent_start`): ones
+  held longer than `LATER_FRESH_MS` are cut to a line. On leaving they go to pi's queue
+  (`deliverAs: "nextTurn"`). A `wake` or `wake-always` that starts a run is owed a model reply
+  (`message_end` from the assistant): unanswered, `checkWakes` re-sends it with `triggerTurn` at
+  `WAKE_RETRY_BEATS`, publishes `unreadSince`, then tells the human once.
 
 - **Human commands.** `/telecom run <prompt>` targets this session and its repository team.
   `/telecom off` stops the transport loop, releases claims and ends outbound waits; `/telecom on`
@@ -213,7 +229,11 @@ the module; use `import type` for those.
   place (its queue `since` when it took the lock from the line); if it already believed it held
   the lock (a wake-up or its claim's result said so), it is told, passively. Claiming again
   renews a live lock and keeps its `since`; after its expiry it is a new claim. Edits never renew
-  one. `blockedOn` (from `status` with
+  one, but the heartbeat of a busy holder keeps its locks from lapsing (`holdLocks`, up to
+  `LOCK_BUSY_MAX_MS` after the claim): a lock guards a job, and the job outlasts the TTL. Taking a
+  lock ends the taker's declared wait on whoever held it. A declared wait is woken when the
+  teammate finishes a run or leaves (not on a new task: progress reports woke waiters for nothing),
+  and once per stall when the teammate has `unreadSince` or stays idle `STALE_WAIT_BEATS`. `blockedOn` (from `status` with
   `waitingFor`) is separate from `waitingOn` and never feeds `closesCycle`. Older peers read
   `@cargo` as the path `<checkout>/@cargo`, which matches no real file.
 - **Live state.** A record carries `stateSince` (when it last went idle ↔ busy) and, while busy,
@@ -221,7 +241,9 @@ the module; use `import type` for those.
   `STEP_PUBLISH_AFTER_MS`, cleared at its end). Both are optional and display-only. The board and
   widget show `busy · bash 14m` and `idle 12m`; `stateHint` names a step older than
   `LONG_STEP_MS` and points to `wait: false`. Briefs show the bare state: times are never brief
-  news.
+  news. `unreadSince` (a wake-up no model turn answered) and `asksOwed` are optional too: the board
+  shows `unread 20m` and `owes 3 asks`, and `stateHint` says the session may be stuck, or to
+  expect a wait.
 - **The team log** (`log.ts`): each session logs what teammates need later: joins and leaves (not
   for subagents, and a reload is neither), task changes, broadcasts, claims, releases and
   expiries. Lock claims are logged once their races settle; a renewal is not logged; a lock

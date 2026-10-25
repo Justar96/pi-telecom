@@ -3,21 +3,21 @@
  * session state it acts on, already checked present. The static half (schema, model-facing text,
  * renderers) is `tool.ts`; it is fixed at registration (AGENTS.md, rule 1).
  */
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import type { AgentToolUpdateCallback } from "@earendil-works/pi-coding-agent";
 import { ownerOf, resolveTarget, stateHint, type Target, targetName } from "./address.ts";
 import { UNRESPONSIVE_MS } from "./awareness.ts";
 import { MAX_ASK_TIMEOUT_MS } from "./config.ts";
 import { blockedOnMe, isForegroundChild, lineOf, parentOf } from "./family.ts";
-import { absolutePattern, claimsOverlap, isResource, isResourceName, laneRelativePattern, resourceKey, sameResource } from "./glob.ts";
+import { absolutePattern, claimShown, claimsOverlap, isResource, isResourceName, laneRelativePattern, resourceKey, sameResource } from "./glob.ts";
 import { type AskOutcome, closesCycle, type InboundAsk, waitedOn } from "./ledger.ts";
 import { broadcastText, entryTouches, LOG_SHOWN, renderLog } from "./log.ts";
 import { callsignsOf, holdsOf, lineFor } from "./locks.ts";
-import { displayPath, isWithin, laneName } from "./project.ts";
-import { OFF_TEXT, type Runtime } from "./runtime.ts";
+import { displayPath, isWithin, laneIn, laneName, workingCheckout } from "./project.ts";
+import { OFF_TEXT, type Runtime, TASK_CAP } from "./runtime.ts";
 import { deliveryReport, fail, ok, TOOL_SPEC, type ToolAction, type ToolParams, type ToolResult } from "./tool.ts";
 import { BLOCKED_CAP, type Presence, QUEUED_CAP, type Transport } from "./transport.ts";
-import { ago, clip, plural } from "./util.ts";
+import { ago, clip, plural, setBounded } from "./util.ts";
 import type { Waiting } from "./waiting.ts";
 
 const CLAIM_NOTE_CAP = 120;
@@ -34,6 +34,8 @@ const HOLDER_TASK_CAP = 80;
 const ASYNC_ASK_TIMEOUT_MS = 30 * 60_000;
 /** A claim refused again for the same conflicts within this window is a blind retry. */
 const CLAIM_RETRY_WINDOW_MS = 10 * 60_000;
+/** Worktrees remembered as explained (`everywhereHint`): an agent works in a handful. */
+const SCOPES_EXPLAINED_CAP = 32;
 
 /** One `telecom` tool call, with the session state it acts on already checked present. */
 interface ActionCall {
@@ -44,6 +46,26 @@ interface ActionCall {
 	message: string;
 	signal: AbortSignal | undefined;
 	onUpdate: AgentToolUpdateCallback | undefined;
+}
+
+/** A claim pattern as stored, and the one checkout it binds in when the agent named one. */
+interface Scoped {
+	pattern: string;
+	checkout?: string;
+}
+
+/** A peer's claim that holds back one of this agent's. */
+interface Conflict {
+	mine: string;
+	/** This agent named the checkout its claim binds in. */
+	scoped: boolean;
+	/** `mine`, relative to the checkout it is written against. */
+	relative: string;
+	owner: Presence;
+	theirs: string;
+	/** The checkout the owner's claim names, if it names one. */
+	theirsIn?: string;
+	what: string;
 }
 
 /** `params.paths`, trimmed, without blanks. */
@@ -94,6 +116,8 @@ function holderState(peer: Presence, now: number): string {
 export function registerTool(rt: Runtime, waiting: Waiting): void {
 	/** The last claim refused for a conflict: an identical retry is told nothing has changed. */
 	let lastClaimRefusal: { key: string; at: number } | null = null;
+	/** Worktrees whose full-path claim was explained (`everywhereHint`), and at which compaction. */
+	const scopeExplained = new Map<string, number>();
 
 	function boardAction({ me, params }: ActionCall): ToolResult {
 		return ok(rt.boardText(params.scope ?? "project"), { callsign: me.callsign, peers: rt.team().map((p) => p.callsign) });
@@ -127,13 +151,24 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 		rt.publish();
 		const names = callsignsOf(ids, peers, me.id);
 		const task = message ? `peers now see ${me.callsign}: ${me.task}` : `your task stays: ${me.task ?? "(none)"}`;
+		// Models given room report results here; the line is what teammates see on the board.
+		const clipped =
+			message.length > TASK_CAP
+				? ` (cut to ${TASK_CAP} characters: status is the one line peers see as your task, so name what you are on, and send results to whoever needs them)`
+				: "";
 		const waits =
 			ids.length > 0
-				? ` · waiting for ${names.join(", ")}. You are woken when one of them finishes a run, takes up a new task or leaves; a message from one ends your wait on it. Setting status without waitingFor clears it.`
+				? ` · waiting for ${names.join(", ")}. You are woken when one of them finishes a run or leaves; a message from one ends your wait on it. Setting status without waitingFor clears it.`
 				: waited
 					? " · no longer waiting for anyone"
 					: "";
-		return ok(`status set — ${task}${waits}${cycle ? `\n${cycle}` : ""}`, ids.length > 0 ? { waitingFor: names } : {});
+		// A new task wakes no one: whoever waits on this agent hears it is done from a message.
+		const waiters = rt.team(peers).filter((p) => p.blockedOn?.includes(me.id));
+		const waitedOn =
+			message && waiters.length > 0
+				? `\n${waiters.map((p) => p.callsign).join(", ")} ${waiters.length === 1 ? "waits" : "wait"} for you. If this is what ${waiters.length === 1 ? "it needs" : "they need"}, tell ${waiters.length === 1 ? "it" : "them"}: telecom({ action: "send", to: "${waiters[0]?.callsign}", message: "…" }).`
+				: "";
+		return ok(`status set — ${task}${clipped}${waits}${waitedOn}${cycle ? `\n${cycle}` : ""}`, ids.length > 0 ? { waitingFor: names } : {});
 	}
 
 	/** The checks `send` and `ask` share: a target (`to`, or whoever owns `paths`) and a message. */
@@ -296,7 +331,9 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 		} else {
 			return fail(
 				`no inbound ask has the handle "${askId}". ${
-					outstanding.length ? `Waiting: ${listAsks(outstanding)}.` : "None is waiting."
+					outstanding.length
+						? `Waiting: ${listAsks(outstanding)}.`
+						: `None is waiting: it was answered, withdrawn, or asked of this session before it restarted. To answer anyway, name the asker: telecom({ action: "reply", askId: "${askId}", to: "…", message: "…" }).`
 				}`,
 			);
 		}
@@ -322,31 +359,37 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 	}
 
 	/**
-	 * Peers' claims that overlap `patterns`: in this checkout they conflict; in another lane they
-	 * are only worth a note (the files are separate until the merge). This agent's lineal family
-	 * never conflicts: a subagent may claim part of its parent's claim, and the other way round.
+	 * Peers' claims that overlap `patterns`. Claims conflict where both bind in one checkout: a claim
+	 * naming its checkout binds there, any other in every checkout its owner works in (where it
+	 * started, and where its edits landed). In separate checkouts they are only worth a note (the
+	 * files are separate until the merge). This agent's lineal family never conflicts: a subagent
+	 * may claim part of its parent's claim, and the other way round.
 	 */
 	function claimConflicts(
 		me: Presence,
-		patterns: readonly string[],
+		patterns: readonly Scoped[],
 		now: number,
-	): { conflicts: { mine: string; owner: string; what: string }[]; lanes: string[] } {
-		const conflicts: { mine: string; owner: string; what: string }[] = [];
+	): { conflicts: Conflict[]; lanes: string[] } {
+		const conflicts: Conflict[] = [];
 		const lanes: string[] = [];
 		const peers = rt.readPeers();
 		const family = lineOf(me, peers);
+		const mineIn = rt.awareness.checkoutsOf(me);
 		for (const peer of rt.team(peers)) {
 			if (family.has(peer.id)) continue;
-			const otherLane = peer.projectRoot !== me.projectRoot;
+			const theirsIn = rt.awareness.checkoutsOf(peer);
 			for (const theirs of peer.claims) {
 				if (theirs.expiresAt <= now) continue;
-				const pattern = otherLane ? laneRelativePattern(theirs.pattern, peer.projectRoot) : theirs.pattern;
+				const pattern = laneRelativePattern(theirs.pattern, theirs.checkout ?? peer.projectRoot);
 				if (pattern === null) continue;
+				const where = theirs.checkout ? [theirs.checkout] : [...theirsIn];
 				for (const mine of patterns) {
-					if (!claimsOverlap(mine, pattern, me.projectRoot)) continue;
-					const what = `"${mine}" overlaps ${peer.callsign}'s claim "${theirs.pattern}"${theirs.note ? ` (${theirs.note})` : ""}`;
-					if (otherLane) lanes.push(`${what} in ${laneName(peer)}`);
-					else conflicts.push({ mine, owner: peer.callsign, what });
+					const relative = laneRelativePattern(mine.pattern, mine.checkout ?? me.projectRoot);
+					if (relative === null || !claimsOverlap(relative, pattern, me.projectRoot)) continue;
+					const what = `"${claimShown(mine)}" overlaps ${peer.callsign}'s claim "${claimShown(theirs)}"${theirs.note ? ` (${theirs.note})` : ""}`;
+					const shared = where.some((c) => (mine.checkout ? c === mine.checkout : mineIn.has(c)));
+					if (!shared) lanes.push(`${what} in ${laneName(laneIn(theirs.checkout ?? workingCheckout(peer), peer))}`);
+					else conflicts.push({ mine: mine.pattern, scoped: mine.checkout !== undefined, relative, owner: peer, theirs: theirs.pattern, ...(theirs.checkout ? { theirsIn: theirs.checkout } : {}), what });
 				}
 			}
 		}
@@ -356,14 +399,48 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 	/**
 	 * A claim pattern as it is stored: as given when it lies in the checkout this agent started in.
 	 * An absolute path into another worktree of the repository (agents often start in the main
-	 * checkout and work in one of their own) names the same repository path, so it is stored
-	 * relative, and binds in every checkout this agent works in. `null` outside the repository.
+	 * checkout and work in one of their own) is stored relative to it, and binds in that checkout
+	 * only: the agent named the copy it works on. `null` outside the repository.
 	 */
-	function claimPattern(me: Presence, pattern: string): string | null {
-		if (isWithin(absolutePattern(pattern, me.projectRoot), me.projectRoot)) return pattern;
+	function claimPattern(me: Presence, pattern: string): Scoped | null {
+		if (isWithin(absolutePattern(pattern, me.projectRoot), me.projectRoot)) return { pattern };
 		const path = resolve(me.projectRoot, pattern);
 		const place = rt.awareness.placeOf(path, me);
-		return place ? displayPath(path, place.checkout) : null;
+		return place ? { pattern: displayPath(path, place.checkout), checkout: place.checkout } : null;
+	}
+
+	/**
+	 * A relative claim made by an agent that works in a worktree other than the checkout it started
+	 * in binds in both, and holds back teammates working in the one it left. Say how to name the
+	 * worktree: agents rarely type the full path unasked. Explained in full once per worktree (and
+	 * again after a compaction); after that, only the call, since every claim would repeat it.
+	 */
+	function everywhereHint(me: Presence, unscoped: readonly string[]): string {
+		if (unscoped.length === 0) return "";
+		const here = rt.awareness.ownCheckout(me);
+		if (here === me.projectRoot) return "";
+		// Only worth its tokens when the claim can hold back a teammate working in another checkout.
+		if (!rt.team().some((p) => workingCheckout(p) !== here)) return "";
+		const relative = unscoped.map((p) => laneRelativePattern(p, me.projectRoot)).filter((p): p is string => p !== null);
+		if (relative.length === 0) return "";
+		const paths = listCall(relative.map((p) => join(here, p)));
+		if (scopeExplained.get(here) === rt.compactions) return ` Only your worktree? Claim ${paths} instead.`;
+		setBounded(scopeExplained, here, rt.compactions, SCOPES_EXPLAINED_CAP);
+		return ` It binds in every checkout you work in, ${me.projectRoot} included. If your change is only in ${laneName(laneIn(here, me))}, claim it there instead: telecom({ action: "claim", paths: ${paths} }).`;
+	}
+
+	/**
+	 * How to narrow a refused claim to the checkout this agent works in, when its owner's claim binds
+	 * only because both agents started in the same checkout: they work in different worktrees.
+	 */
+	function scopeHint(me: Presence, conflicts: readonly Conflict[]): string {
+		const here = rt.awareness.ownCheckout(me);
+		if (here === me.projectRoot) return "";
+		const apart = conflicts.filter((c) => !c.scoped && (c.theirsIn ?? workingCheckout(c.owner)) !== here);
+		if (apart.length === 0) return "";
+		const paths = [...new Set(apart.map((c) => join(here, c.relative)))];
+		const owners = [...new Set(apart.map((c) => c.owner.callsign))];
+		return ` You work in ${laneName(laneIn(here, me))} and ${owners.join(", ")} in another checkout: the claims meet only because a claim made with a relative path binds in every checkout its owner has worked in. If your change is only in yours, claim it there: telecom({ action: "claim", paths: ${listCall(paths)} }).`;
 	}
 
 	/**
@@ -438,6 +515,8 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 		const asked = pathsOf(params);
 		if (asked.length === 0) return fail('"claim" needs `paths` — project-relative paths or globs, or a lock name such as "@cargo"');
 		const patterns: string[] = [];
+		/** Each path claim's checkout, when it names one. */
+		const scopes = new Map<string, string>();
 		const outside: string[] = [];
 		const badNames: string[] = [];
 		for (const raw of asked) {
@@ -447,10 +526,17 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 				else if (!patterns.includes(resourceKey(name))) patterns.push(resourceKey(name));
 				continue;
 			}
-			const pattern = claimPattern(me, raw);
-			if (pattern === null) outside.push(raw);
-			else if (!patterns.includes(pattern)) patterns.push(pattern);
+			const scoped = claimPattern(me, raw);
+			if (scoped === null) outside.push(raw);
+			else if (!patterns.includes(scoped.pattern)) {
+				patterns.push(scoped.pattern);
+				if (scoped.checkout) scopes.set(scoped.pattern, scoped.checkout);
+			}
 		}
+		const scopedOf = (pattern: string): Scoped => {
+			const checkout = scopes.get(pattern);
+			return checkout ? { pattern, checkout } : { pattern };
+		};
 		// Like a held path below, a path outside the repository does not cost the ones inside it.
 		const away = [outside.length > 0 ? outsideRefusal(me, outside) : "", badNames.length > 0 ? badNameRefusal(badNames) : ""]
 			.filter(Boolean)
@@ -459,7 +545,7 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 		const now = Date.now();
 		const paths = patterns.filter((p) => !isResource(p));
 		const locks = patterns.filter(isResource);
-		const { conflicts, lanes } = claimConflicts(me, paths, now);
+		const { conflicts, lanes } = claimConflicts(me, paths.map(scopedOf), now);
 		const lockHeld = lockConflicts(me, locks, now);
 		// A held path does not cost the free ones: models that got an all-or-nothing refusal
 		// tended to drop the whole claim and edit unclaimed.
@@ -471,13 +557,16 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 		const refused = [...held, ...(line ? line.full : busyLocks), ...outside, ...badNames];
 		let refusal = "";
 		if (conflicts.length > 0) {
-			const owners = [...new Set(conflicts.map((c) => c.owner))];
-			const key = `${[...held].sort().join("\u0000")}\u0001${owners.sort().join("\u0000")}`;
+			const owners = [...new Set(conflicts.map((c) => c.owner.callsign))];
+			// The owners' claims are part of the key: one that was narrowed since is news, and a retry
+			// after it is not blind.
+			const blocking = conflicts.map((c) => `${c.owner.callsign}\u0002${c.theirs}\u0002${c.theirsIn ?? ""}`);
+			const key = `${[...held].sort().join("\u0000")}\u0001${[...new Set(blocking)].sort().join("\u0000")}`;
 			const repeated = lastClaimRefusal?.key === key && now - lastClaimRefusal.at < CLAIM_RETRY_WINDOW_MS;
 			lastClaimRefusal = { key, at: now };
 			refusal = `${conflicts.map((c) => c.what).join("; ")}. ${
 				repeated ? `Nothing has changed since this was last refused: retrying will not help. ` : ""
-			}Ask ${owners.join(" or ")} to release or split it — telecom({ action: "ask", to: "${owners[0]}", message: "…" }) — or pick other work.`;
+			}Ask ${owners.join(" or ")} to release or split it — telecom({ action: "ask", to: "${owners[0]}", message: "…" }) — or pick other work.${scopeHint(me, conflicts)}`;
 		}
 		if (!line && busyLocks.length > 0) {
 			const one = busyLocks.length === 1;
@@ -492,8 +581,10 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 		// Stored without closing punctuation (a clip "…" stays): it is quoted mid-sentence elsewhere.
 		const note = message ? clip(message, CLAIM_NOTE_CAP).replace(/[\s.!?]+$/, "") : "";
 		for (const pattern of grantedPaths) {
+			// One claim per pattern: claiming it again, in one checkout or in all, replaces it.
+			const checkout = scopes.get(pattern);
 			me.claims = me.claims.filter((c) => c.pattern !== pattern);
-			me.claims.push({ pattern, since: now, expiresAt: now + rt.cfg.claimTtlMs, ...(note ? { note } : {}) });
+			me.claims.push({ pattern, since: now, expiresAt: now + rt.cfg.claimTtlMs, ...(note ? { note } : {}), ...(checkout ? { checkout } : {}) });
 		}
 		const renewed: string[] = [];
 		for (const name of grantedLocks) {
@@ -521,7 +612,8 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 		// release, an expiry, a handoff) says when it ended, so one per renewal would only bury
 		// what teammates need under a line every few minutes for as long as a build runs.
 		const claimed = [...grantedPaths, ...taken];
-		if (claimed.length > 0) rt.logEntry("claim", `claimed ${claimed.join(", ")}${note ? ` — ${note}` : ""}`, claimed);
+		const claimedShown = [...grantedPaths.map((p) => claimShown(scopedOf(p))), ...taken];
+		if (claimed.length > 0) rt.logEntry("claim", `claimed ${claimedShown.join(", ")}${note ? ` — ${note}` : ""}`, claimed);
 		const ttl = rt.claimTtlMinutes();
 		const overlap =
 			lanes.length > 0
@@ -530,12 +622,12 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 		const lines: string[] = [];
 		if (grantedPaths.length > 0) {
 			lines.push(
-				`claimed ${grantedPaths.join(", ")}${note ? ` — ${note}` : ""}. Peers editing there are held back and you are told. Release with telecom({ action: "release" }) when done; idle claims expire after ${ttl} min.${overlap}`,
+				`claimed ${grantedPaths.map((p) => claimShown(scopedOf(p))).join(", ")}${note ? ` — ${note}` : ""}. Peers editing there are held back and you are told. Release with telecom({ action: "release" }) when done; idle claims expire after ${ttl} min.${overlap}${everywhereHint(me, grantedPaths.filter((p) => !scopes.has(p)))}`,
 			);
 		}
 		if (taken.length > 0) {
 			lines.push(
-				`claimed ${taken.join(", ")}${note ? ` — ${note}` : ""}: yours until you release it — telecom({ action: "release", paths: ${listCall(taken)} }) — and others who claim it are refused and can queue. Edits do not renew a lock: claim it again within ${ttl} min to keep it.`,
+				`claimed ${taken.join(", ")}${note ? ` — ${note}` : ""}: yours until you release it — telecom({ action: "release", paths: ${listCall(taken)} }) — and others who claim it are refused and can queue. It stays yours while you are working; once you are idle, it lapses ${ttl} min after you claimed it unless you claim it again.`,
 			);
 		}
 		if (kept.length > 0) lines.push(`renewed ${kept.join(", ")}: yours for another ${ttl} min.`);
@@ -555,7 +647,9 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 	}
 
 	function releaseAction({ me, params }: ActionCall): ToolResult {
-		const wanted = pathsOf(params).map((p) => (isResource(p) ? resourceKey(p) : p));
+		// A path is released as it was claimed: an absolute one into a worktree names its relative
+		// pattern there.
+		const wanted = pathsOf(params).map((p) => (isResource(p) ? resourceKey(p) : (claimPattern(me, p)?.pattern ?? p)));
 		const releasing = wanted.length === 0 ? me.claims : me.claims.filter((c) => wanted.includes(c.pattern));
 		// Releasing a lock this agent only waits for leaves the line.
 		const leaving = (me.queued ?? []).filter((q) => wanted.length === 0 || wanted.some((w) => sameResource(w, q.pattern)));

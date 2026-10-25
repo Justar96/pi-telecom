@@ -195,6 +195,9 @@ test("presence: a tool call is published as the step only once it runs long, and
 	await b.fire("tool_call", { toolName: "subagent", toolCallId: "sub-1", input: {} });
 	shift(17 * MINUTE);
 	await eventually(() => assert.equal(recordOf(b.id)?.step?.tool, "subagent"));
+	// The model's turn: it read the messages sent above (the harness is always "idle", so they
+	// counted as wake-ups owed an answer, and an unanswered one shows on the board).
+	await b.fire("message_end", { message: { role: "assistant", stopReason: "toolUse", content: [] } });
 	await b.settle();
 	const idle = recordOf(b.id);
 	assert.equal(idle?.state, "idle");

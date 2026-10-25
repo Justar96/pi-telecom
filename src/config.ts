@@ -27,6 +27,8 @@ export interface TelecomConfig {
 	claimTtlMs: number;
 	/** How often the inbox loop runs, in milliseconds. Tests shorten it; users have no reason to. */
 	tickMs: number;
+	/** How often the heartbeat (claim expiry, the sweep) runs, in milliseconds. Tests shorten it too. */
+	heartbeatMs: number;
 }
 
 export const ENV = {
@@ -38,6 +40,7 @@ export const ENV = {
 	disable: "PI_TELECOM_DISABLE",
 	claimTtl: "PI_TELECOM_CLAIM_TTL_MIN",
 	tickMs: "PI_TELECOM_TICK_MS",
+	heartbeatMs: "PI_TELECOM_HEARTBEAT_MS",
 } as const;
 
 const DEFAULT_ASK_TIMEOUT_MS = 5 * 60_000;
@@ -45,6 +48,7 @@ export const MAX_ASK_TIMEOUT_MS = 60 * 60_000;
 const DEFAULT_MAX_WAKES = 6;
 const DEFAULT_CLAIM_TTL_MIN = 120;
 const DEFAULT_TICK_MS = 500;
+const DEFAULT_HEARTBEAT_MS = 15_000;
 
 function positive(raw: string | undefined, fallback: number): number {
 	if (raw === undefined || raw.trim() === "") return fallback;
@@ -76,5 +80,6 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): TelecomConfig 
 		disabled: truthy(env[ENV.disable]),
 		claimTtlMs: positive(env[ENV.claimTtl], DEFAULT_CLAIM_TTL_MIN) * 60_000,
 		tickMs: positive(env[ENV.tickMs], DEFAULT_TICK_MS),
+		heartbeatMs: positive(env[ENV.heartbeatMs], DEFAULT_HEARTBEAT_MS),
 	};
 }

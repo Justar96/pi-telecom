@@ -41,19 +41,19 @@ const TOOL_PARAMETERS = Type.Object({
 	// StringEnum, not a Union of Literals: Google models reject the anyOf form.
 	action: StringEnum(TOOL_ACTIONS, { description: "What to do." }),
 	to: Type.Optional(Type.String({ description: "send/ask: callsign, session name or id (as the board shows it)." })),
-	message: Type.Optional(Type.String({ description: "The text; for status your task; for claim the reason." })),
+	message: Type.Optional(Type.String({ description: "The text; for status your task in one line; for claim the reason." })),
 	askId: Type.Optional(Type.String({ description: "reply: the ask's handle (optional if only one is waiting)." })),
 	paths: Type.Optional(
 		Type.Array(Type.String(), {
 			description:
-				"Project-relative paths or globs. claim/release: what to reserve. send/ask without `to`: reach whoever claims or last changed them. broadcast: what it is about.",
+				"Project-relative paths or globs. claim/release: what to reserve (an absolute path into a worktree claims it there only). send/ask without `to`: reach whoever claims or last changed them. broadcast: what it is about.",
 		}),
 	),
 	timeoutSec: Type.Optional(Type.Number({ description: "ask: seconds to wait (default 300; with wait false, 1800)." })),
 	wait: Type.Optional(Type.Boolean({ description: "ask: false returns at once; the answer arrives later as a message." })),
 	queue: Type.Optional(Type.Boolean({ description: "claim: wait in line for a held @lock; you get it, and are woken, when it frees." })),
 	waitingFor: Type.Optional(
-		Type.Array(Type.String(), { description: "status: callsigns you are blocked on; you are woken when one finishes or leaves." }),
+		Type.Array(Type.String(), { description: "status: callsigns you are blocked on; you are woken when one finishes a run or leaves." }),
 	),
 	scope: Type.Optional(
 		StringEnum(["project", "machine"] as const, { description: 'board/broadcast: "project" (default) or "machine".' }),
@@ -106,7 +106,7 @@ export const TOOL_SPEC = {
 	promptGuidelines: [
 		"When 📡 telecom shows other agents in this project: claim an area before a large change and release it after; re-read a file a peer changed before editing it; reply to a peer's ask promptly (they are blocked).",
 		"Message peers only for real coordination (requests, handoffs, shared-interface changes) — no acknowledgements; each message costs the recipient a turn.",
-		"Broadcast only what every agent must act on, with `paths` when it is about files; report progress with `status`, or `send` it to whoever coordinates.",
+		"Broadcast only what every agent must act on, with `paths` when it is about files. Keep `status` to one line naming your task; `send` progress and results to whoever needs them.",
 		"To hear when a peer's long job ends, ask with `wait: false` (the answer arrives as a message and wakes you), not a long `timeoutSec` or a polling loop.",
 		'Take turns on a shared resource (build, test runner, port) with a lock claim such as "@cargo" (queue: true waits in line), and say whom you wait for with status waitingFor, instead of negotiating leases in messages.',
 	],

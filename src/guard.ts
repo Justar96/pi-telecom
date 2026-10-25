@@ -149,10 +149,14 @@ export function registerGuard(rt: Runtime): Guard {
 		me.recent = [{ path, op, at: now }, ...me.recent.filter((r) => r.path !== path)].slice(0, RECENT_CAP);
 		// Working inside a claim keeps it alive. Claims are written against the checkout this agent
 		// started in, but it may edit a worktree of its own: the same repository path there counts.
+		// A claim naming one checkout is kept alive only by edits there.
 		const place = rt.awareness.placeOf(path, me);
 		const asStarted = place ? join(me.projectRoot, place.rel) : path;
 		for (const claim of me.claims) {
-			if (matchesClaim(path, claim.pattern, me.projectRoot) || matchesClaim(asStarted, claim.pattern, me.projectRoot)) {
+			const inside = claim.checkout
+				? place?.checkout === claim.checkout && matchesClaim(path, claim.pattern, claim.checkout)
+				: matchesClaim(path, claim.pattern, me.projectRoot) || matchesClaim(asStarted, claim.pattern, me.projectRoot);
+			if (inside) {
 				claim.expiresAt = now + rt.cfg.claimTtlMs;
 			}
 		}

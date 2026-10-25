@@ -30,7 +30,7 @@ import {
 	settleDepartures,
 	WIRE_VERSION,
 } from "./transport.ts";
-import { clip, messageOf, newId, setBounded } from "./util.ts";
+import { ago, clip, messageOf, newId, plural, setBounded } from "./util.ts";
 import { type BoardPanel, offStatus, statusText, type TeamSnapshot, TeamWidget, widgetLines } from "./view.ts";
 
 /** What the human and the model hear while this session is turned off. */
@@ -44,7 +44,7 @@ const PRESENCE_FAILURES_REPORTED = 3;
 /** `PI_TELECOM_MAX_WAKES` counts wake-ups over this rolling window. */
 const WAKE_WINDOW_MS = 60_000;
 /** Own task and claim notes as peers see them. */
-const TASK_CAP = 160;
+export const TASK_CAP = 160;
 /** Sessions this agent has talked with directly; they stay relevant in its briefs. */
 const CONTACTS_CAP = 256;
 /**
@@ -57,6 +57,25 @@ export const STEP_PUBLISH_AFTER_MS = 15_000;
 const RUNNING_CAP = 64;
 /** Sessions whose latest callsign is remembered (`seenAs`); bounded, since records are peer input. */
 const SEEN_AS_CAP = 256;
+/**
+ * A wake-up (a message that started a run while this agent was idle) is re-sent when no model turn
+ * answered it this many heartbeats after it, then after the next, and so on: about 1, 5 and 15
+ * minutes. A run can end before the model sees what started it (a compaction at the start of the
+ * run did, once), and nothing else would ever start one: the sender waits, and whoever waits on the
+ * sender waits too. In one team that stalled every agent for twelve hours.
+ */
+const WAKE_RETRY_BEATS = [4, 20, 60];
+/** Wake-ups one reminder repeats, and characters of each. */
+const UNREAD_CAP = 4;
+const UNREAD_TEXT_CAP = 4_000;
+/**
+ * Broadcasts held for this agent's next run (`later`), and how old one may be to be shown in full.
+ * An agent can be idle for hours: an older one is cut to a line, as what was news when it was sent
+ * may have moved on since (one team's were read 14 hours late), and the log has the history.
+ */
+const LATER_CAP = 12;
+const LATER_FRESH_MS = 30 * 60_000;
+const LATER_LINE_CAP = 160;
 
 /**
  * How a message reaches the model (AGENTS.md, "Delivery to the model"). `wake` starts a turn when
@@ -106,8 +125,9 @@ export class Runtime {
 	readonly ledger = createAskLedger();
 	/** This session's part of the team log, and the reader of everyone's (`log.ts`). */
 	readonly log = new TeamLog();
-	/** Sessions this agent has talked with directly; they stay relevant in its briefs. */
-	readonly contacts = new Map<string, true>();
+	/** Sessions this agent has talked with directly, and when last: they stay relevant in its
+	 *  briefs, and a broadcast from one in the last while is about its work (`inbound.ts`). */
+	readonly contacts = new Map<string, number>();
 	/** Who was held back by each of our claims (pattern → peer id → callsign), so a release can tell them. */
 	readonly contesters = new Map<string, Map<string, string>>();
 	/** The open `/telecom` panel (TUI only), redrawn on every team refresh like the widget. */
@@ -125,6 +145,19 @@ export class Runtime {
 	private readonly running = new Map<string, Step>();
 	/** The call whose step our published record shows, if any. */
 	private stepCall: string | null = null;
+	/** `later` messages, held here (not in pi's queue) so they can be cut to a line when old. */
+	private later: { at: number; head: string; body: string; content: string }[] = [];
+	/** `later` messages dropped past `LATER_CAP`, oldest first. */
+	private laterDropped = 0;
+	/** Wake-ups no model turn has answered yet, and how often they were re-sent (`checkWakes`). */
+	private unread: {
+		items: Array<{ at: number; content: string; from?: string }>;
+		tries: number;
+		nextAt: number;
+		/** A compaction came after them: the context may no longer hold their text. */
+		compacted: boolean;
+		reported: boolean;
+	} | null = null;
 
 	/**
 	 * Every hook is registered through this. pi treats a throwing `tool_call` handler as a veto —
@@ -185,6 +218,9 @@ export class Runtime {
 		const name = this.pi.getSessionName();
 		if (name) this.self.name = name;
 		else delete this.self.name;
+		const owed = this.ledger.inbound().length;
+		if (owed > 0) this.self.asksOwed = owed;
+		else delete this.self.asksOwed;
 		const written = this.transport.writePresence(this.self);
 		// One failed write leaves the previous record in place, and the next tick writes again (a
 		// claim or a release must not wait for the heartbeat to reach peers), so only a write that
@@ -341,7 +377,9 @@ export class Runtime {
 
 	/** Remember a peer this agent talked with: its work stays relevant in this agent's briefs. */
 	noteContact(id: string): void {
-		setBounded(this.contacts, id, true, CONTACTS_CAP);
+		// Re-inserted, so the bound drops the longest silent first.
+		this.contacts.delete(id);
+		setBounded(this.contacts, id, Date.now(), CONTACTS_CAP);
 	}
 
 	/** The next brief describes the team in full: the context may no longer hold the last one. */
@@ -457,15 +495,28 @@ export class Runtime {
 
 	/** Put a telecom message in front of the model, as `mode` says (see `InjectMode`). */
 	inject(customType: string, content: string, details: MessageDetails, mode: InjectMode): boolean {
+		if (mode === "later") {
+			// Held for the next run (`takeLater`): never steered into the current one.
+			const split = content.indexOf("\n\n");
+			const head = (split < 0 ? content : content.slice(0, split)).replace(/^\*\*📡 |\*\*$/g, "");
+			this.later.push({ at: Date.now(), head, body: split < 0 ? "" : content.slice(split + 2), content });
+			if (this.later.length > LATER_CAP) {
+				this.later.shift();
+				this.laterDropped++;
+			}
+			return true;
+		}
 		try {
 			// Steering into a running turn does not spend an idle wake-up or need a limit note.
-			const needsWake = mode === "wake" && this.ctx?.isIdle() === true;
+			const idle = this.ctx?.isIdle() === true;
+			const needsWake = mode === "wake" && idle;
 			const wake = mode === "wake-always" || (needsWake && this.allowWake());
 			const note = needsWake && !wake ? `\n\n${this.wakeLimitNote()}` : "";
+			// Noted before sending: the run it starts must find it owed, however soon it answers.
+			if (wake && idle) this.noteWake(content, details);
 			this.pi.sendMessage(
 				{ customType, content: content + note, display: true, details },
-				// `later`: held until this agent's next run starts, never steered into the current one.
-				wake ? { triggerTurn: true } : mode === "later" ? { deliverAs: "nextTurn" } : undefined,
+				wake ? { triggerTurn: true } : undefined,
 			);
 			return true;
 		} catch (error) {
@@ -486,6 +537,116 @@ export class Runtime {
 			`**📡 Message from ${msg.fromCallsign}${human}**\n\n${msg.text}\n\n(Reply only if needed: action "send", to "${msg.fromCallsign}".)`,
 			{ from: msg.from, fromCallsign: msg.fromCallsign, id: msg.id, tone: "accent" },
 			"wake",
+		);
+	}
+
+	/**
+	 * What was held for this run (`later`), for the run-start message: recent ones in full, older
+	 * ones a line each. Null when nothing was held.
+	 */
+	takeLater(now = Date.now()): string | null {
+		const held = this.later;
+		const dropped = this.laterDropped;
+		this.later = [];
+		this.laterDropped = 0;
+		if (held.length === 0) return null;
+		const fresh = held.filter((h) => now - h.at <= LATER_FRESH_MS);
+		const stale = held.filter((h) => now - h.at > LATER_FRESH_MS);
+		const parts: string[] = [];
+		if (stale.length > 0 || dropped > 0) {
+			const lines = stale.map((h) => `- ${ago(h.at, now)}, ${h.head}: ${clip(h.body.replace(/\s+/g, " "), LATER_LINE_CAP)}`);
+			const more = dropped > 0 ? `\n- and ${plural(dropped, "older one")}` : "";
+			parts.push(`**📡 Older broadcasts, held while you were away** (as sent: they may have moved on since; telecom({ action: "log" }) has the team's history)\n${lines.join("\n")}${more}`);
+		}
+		parts.push(...fresh.map((h) => h.content));
+		return parts.join("\n\n");
+	}
+
+	/** Leaving: what is still held goes to pi's queue for the next run, as it is. */
+	flushLater(): void {
+		const held = this.later;
+		this.later = [];
+		this.laterDropped = 0;
+		for (const h of held) {
+			try {
+				this.pi.sendMessage({ customType: MESSAGE_TYPES.broadcast, content: h.content, display: true, details: {} }, { deliverAs: "nextTurn" });
+			} catch (error) {
+				this.report("deliver", error);
+				return;
+			}
+		}
+	}
+
+	/** A run was started for `content`: until a model turn answers, it is owed (`checkWakes`). */
+	private noteWake(content: string, details: MessageDetails): void {
+		const from = typeof details.fromCallsign === "string" ? details.fromCallsign : undefined;
+		const item = { at: Date.now(), content, ...(from ? { from } : {}) };
+		if (!this.unread) {
+			this.unread = { items: [item], tries: 0, nextAt: item.at + (WAKE_RETRY_BEATS[0] as number) * this.cfg.heartbeatMs, compacted: false, reported: false };
+			return;
+		}
+		this.unread.items = [...this.unread.items, item].slice(-UNREAD_CAP);
+	}
+
+	/** The model answered (an assistant message that did not fail): every wake-up is answered. */
+	noteModelTurn(): void {
+		if (!this.unread) return;
+		this.unread = null;
+		if (this.self?.unreadSince !== undefined) {
+			delete this.self.unreadSince;
+			this.publish();
+		}
+	}
+
+	/** This session left the switchboard: what was owed then is not re-sent after a reconnect. */
+	forgetWakes(): void {
+		this.unread = null;
+	}
+
+	/** Compactions of this session's context so far: advice told once is told in full again after
+	 *  one, since the earlier telling may be gone from the context. */
+	compactions = 0;
+
+	/** The context was compacted: a reminder of an unanswered wake-up repeats its text in full. */
+	noteCompaction(): void {
+		this.compactions++;
+		if (this.unread) this.unread.compacted = true;
+	}
+
+	/**
+	 * From the tick: re-send wake-ups no model turn answered once the next retry is due, while the
+	 * agent is idle (busy, it is reading them, or compacting before it does). The record says since
+	 * when, so teammates see it. Past the last retry the human is told, once.
+	 */
+	checkWakes(now = Date.now()): void {
+		const unread = this.unread;
+		const me = this.self;
+		if (!unread || !me || now < unread.nextAt || this.ctx?.isIdle() !== true) return;
+		const oldest = unread.items[0]?.at ?? now;
+		if (unread.tries >= WAKE_RETRY_BEATS.length) {
+			if (!unread.reported) {
+				unread.reported = true;
+				this.notifyUser(`telecom: ${plural(unread.items.length, "message")} to this session started no model turn after ${unread.tries} reminders. Teammates may be waiting on it: look at its last run.`, "warning");
+			}
+			return;
+		}
+		unread.tries++;
+		unread.nextAt = now + (WAKE_RETRY_BEATS[unread.tries] ?? 0) * this.cfg.heartbeatMs;
+		if (me.unreadSince === undefined) {
+			me.unreadSince = oldest;
+			this.publish();
+		}
+		const senders = [...new Set(unread.items.map((i) => i.from).filter((f): f is string => f !== undefined))];
+		const shown = unread.items.map((i) => `${ago(i.at, now)}:\n\n${clip(i.content, unread.compacted ? UNREAD_TEXT_CAP : UNREAD_TEXT_CAP / 4)}`).join("\n\n---\n\n");
+		const answer = senders.length > 0 ? ` If you cannot act on it, tell ${senders.join(" and ")} why: telecom({ action: "send", to: "${senders[0]}", message: "…" }).` : "";
+		this.pi.sendMessage(
+			{
+				customType: MESSAGE_TYPES.message,
+				content: `**📡 ${unread.items.length === 1 ? "This message" : `These ${unread.items.length} messages`} started a run, but your run ended before you answered** (reminder ${unread.tries} of ${WAKE_RETRY_BEATS.length})\n\nSent ${shown}\n\nAct on ${unread.items.length === 1 ? "it" : "them"} now.${answer}`,
+				display: true,
+				details: { tone: "warning" },
+			},
+			{ triggerTurn: true },
 		);
 	}
 

@@ -69,11 +69,20 @@ try {
 
 	// 2. each sees the other on the board (footer converges to "1 peer")
 	await a.waitFor(isStatus(/1 peer/), 10_000).catch(() => {});
-	await a.command("/telecom");
-	const board = await a.waitFor(isNotify(/You are /), 10_000).catch(() => null);
+	// Started together, both may pick the same callsign; a team refresh resolves it moments later,
+	// so the board is read again until it has (or the time is up).
+	let board = null;
+	let callsignB;
+	for (const deadline = Date.now() + 10_000; ; ) {
+		const since = a.records.length;
+		await a.command("/telecom");
+		board = await a.waitFor(isNotify(/You are /), 10_000, since).catch(() => null);
+		callsignB = board?.message.match(/• (\w+) "agent-b"/)?.[1];
+		if ((callsignB && !board.message.includes(`You are ${callsignB}.`)) || Date.now() > deadline) break;
+		await new Promise((resolve) => setTimeout(resolve, 250));
+	}
 	check("the board in process A lists the agent in process B", Boolean(board && /1 other agent live/.test(board.message) && /agent-b/.test(board.message)),
 		board?.message);
-	const callsignB = board?.message.match(/• (\w+) "agent-b"/)?.[1];
 	check("callsigns are distinct", Boolean(callsignB) && !board.message.includes(`You are ${callsignB}.`), board?.message);
 
 	// 3. a human broadcast from A reaches B as a passive message (no model turn)

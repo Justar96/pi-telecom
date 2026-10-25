@@ -15,7 +15,7 @@
  * (unless a folder by that name exists), overlaps the same name, and overlaps a claim on the whole
  * checkout (`.`, `**`), which only makes that older peer more careful.
  */
-import { isAbsolute, normalize, parse, resolve, sep } from "node:path";
+import { basename, isAbsolute, normalize, parse, resolve, sep } from "node:path";
 import { displayPath, isWithin } from "./project.ts";
 import { escapeRegExp } from "./util.ts";
 
@@ -130,6 +130,11 @@ export function laneRelativePattern(pattern: string, ownerRoot: string): string 
 	return isWithin(trimmed, ownerRoot) ? displayPath(trimmed, ownerRoot) : null;
 }
 
+/** A claim as it reads: its pattern, and the checkout it binds in when its owner named one. */
+export function claimShown(claim: { pattern: string; checkout?: string }): string {
+	return claim.checkout ? `${claim.pattern} (in ${basename(claim.checkout)})` : claim.pattern;
+}
+
 /** Does an absolute file path fall inside a claim pattern? */
 export function matchesClaim(path: string, pattern: string, root: string): boolean {
 	return claimMatcher(pattern, root)(path);
@@ -157,27 +162,169 @@ export function claimMatcher(pattern: string, root: string): (path: string) => b
 	};
 }
 
-/** Do two claim patterns overlap? Exact for plain paths; conservative for globs. */
+/**
+ * Do two claim patterns overlap: is there a path both claim? A claim covers what its pattern
+ * matches and everything under that (`claimMatcher`), so this asks whether `a/**` and `b/**` share
+ * a path, segment by segment. Exact, so a claim is refused only where the guard would hold an edit
+ * back: `V1_1_14.sql` is clear of `V1_1_13*`, and `lib/x/y.ts` of `lib/*.ts`. A pattern with more
+ * brace alternatives than `EXPANSIONS_CAP`, or `**` inside a segment, falls back to comparing the
+ * fixed prefixes, which can only over-refuse.
+ */
 export function claimsOverlap(a: string, b: string, root: string): boolean {
 	if (isResource(a) || isResource(b)) return sameResource(a, b);
 	const left = absolutePattern(a, root);
 	const right = absolutePattern(b, root);
-	const leftGlob = globIndex(left, root) !== -1;
-	const rightGlob = globIndex(right, root) !== -1;
-	if (!leftGlob && !rightGlob) return isWithin(left, right) || isWithin(right, left);
-	// A plain path overlaps a glob when the glob matches it, when the plain path is a directory the
-	// glob reaches into, or when the plain path sits under the glob's fixed prefix (conservative:
-	// something under it could match).
-	if (!leftGlob) return plainOverlapsGlob(left, right, root);
-	if (!rightGlob) return plainOverlapsGlob(right, left, root);
+	if (globIndex(left, root) === -1 && globIndex(right, root) === -1) return isWithin(left, right) || isWithin(right, left);
+	const lefts = segmentsOf(left, root);
+	const rights = segmentsOf(right, root);
+	if (!lefts || !rights) return prefixesOverlap(left, right, root);
+	return lefts.some((l) => rights.some((r) => segmentsOverlap(l, r)));
+}
+
+/** The conservative fallback: the fixed directory prefixes nest. */
+function prefixesOverlap(left: string, right: string, root: string): boolean {
 	const lp = staticPrefix(left, root);
 	const rp = staticPrefix(right, root);
 	return isWithin(lp, rp) || isWithin(rp, lp);
 }
 
-function plainOverlapsGlob(plain: string, glob: string, root: string): boolean {
-	const prefix = staticPrefix(glob, root);
-	return matchesClaim(plain, glob, root) || isWithin(prefix, plain) || isWithin(plain, prefix);
+/** Brace alternatives one pattern may expand to before `claimsOverlap` falls back. */
+const EXPANSIONS_CAP = 64;
+
+/** One character position of a segment pattern. */
+type Token = { kind: "char"; ch: string } | { kind: "any" } | { kind: "star" } | { kind: "class"; re: RegExp };
+/** A path segment pattern, or `**` (any number of segments). */
+type Segment = "**" | Token[];
+
+/**
+ * An anchored pattern as segment lists, one per brace alternative, each ending in `**` (a claim
+ * covers what is under what it names). `null` when it is beyond the exact check.
+ */
+function segmentsOf(anchored: string, root: string): Segment[][] | null {
+	const literal = literalRootLength(anchored, root);
+	const alternatives = expandBraces(anchored.slice(literal));
+	if (!alternatives) return null;
+	const out: Segment[][] = [];
+	for (const alternative of alternatives) {
+		const segments = toSegments(anchored.slice(0, literal), alternative);
+		if (!segments) return null;
+		out.push([...segments, "**"]);
+	}
+	return out;
+}
+
+/** `{a,b}` alternatives expanded, nested ones included; `null` past the cap or when unbalanced. */
+function expandBraces(glob: string): string[] | null {
+	const open = glob.indexOf("{");
+	if (open === -1) return [glob];
+	const options: string[] = [];
+	let depth = 0;
+	let start = open + 1;
+	let close = -1;
+	for (let i = open + 1; i < glob.length && close === -1; i++) {
+		const ch = glob[i];
+		if (ch === "{") depth++;
+		else if (ch === "}" && depth > 0) depth--;
+		else if (ch === "}") close = i;
+		else if (ch === "," && depth === 0) {
+			options.push(glob.slice(start, i));
+			start = i + 1;
+		}
+	}
+	if (close === -1) return null;
+	options.push(glob.slice(start, close));
+	const out: string[] = [];
+	for (const option of options) {
+		const rest = expandBraces(`${glob.slice(0, open)}${option}${glob.slice(close + 1)}`);
+		if (!rest) return null;
+		out.push(...rest);
+		if (out.length > EXPANSIONS_CAP) return null;
+	}
+	return out;
+}
+
+/** Split into segments: the literal root's characters stay literal, the rest is glob syntax. */
+function toSegments(literal: string, glob: string): Segment[] | null {
+	const segments: Segment[] = [];
+	let current: Token[] = [];
+	let raw = "";
+	const end = (): boolean => {
+		if (raw === "**") segments.push("**");
+		else if (raw.includes("**")) return false;
+		else segments.push(current);
+		current = [];
+		raw = "";
+		return true;
+	};
+	for (const ch of literal) {
+		if (ch === "/") {
+			if (!end()) return null;
+		} else {
+			current.push({ kind: "char", ch });
+			// Literal characters never form a `**`.
+			raw += ch === "*" ? "\u0000" : ch;
+		}
+	}
+	for (let i = 0; i < glob.length; i++) {
+		const ch = glob[i] as string;
+		if (ch === "/") {
+			if (!end()) return null;
+			continue;
+		}
+		raw += ch;
+		if (ch === "*") current.push({ kind: "star" });
+		else if (ch === "?") current.push({ kind: "any" });
+		else if (ch === "[" && glob.indexOf("]", i + 1) !== -1) {
+			const close = glob.indexOf("]", i + 1);
+			const body = glob.slice(i + 1, close);
+			current.push({ kind: "class", re: new RegExp(`^[${body.replace(/^!/, "^").replace(/\\/g, "\\\\")}]$`) });
+			raw += body;
+			i = close;
+		} else current.push({ kind: "char", ch });
+	}
+	return end() ? segments : null;
+}
+
+/** Is there one list of path segments both match? `**` matches any number of segments. */
+function segmentsOverlap(a: readonly Segment[], b: readonly Segment[]): boolean {
+	return sequencesOverlap(a, b, (x) => x === "**", (x, y) => tokensOverlap(x as Token[], y as Token[]));
+}
+
+/** Is there one segment both match? `*` matches any run of characters. */
+function tokensOverlap(a: readonly Token[], b: readonly Token[]): boolean {
+	return sequencesOverlap(a, b, (x) => x.kind === "star", charsOverlap);
+}
+
+function charsOverlap(a: Token, b: Token): boolean {
+	if (a.kind === "any" || b.kind === "any") return true;
+	if (a.kind === "char" && b.kind === "char") return a.ch === b.ch;
+	if (a.kind === "char" && b.kind === "class") return b.re.test(a.ch);
+	if (a.kind === "class" && b.kind === "char") return a.re.test(b.ch);
+	// Two classes: rare enough to assume they share a character.
+	return true;
+}
+
+/**
+ * Do two patterns (sequences of single items and `rest` wildcards that match any run of items)
+ * match a common sequence? `rest` items are assumed to match anything, and single items to be
+ * satisfiable. Memoised over positions, so it is quadratic at worst.
+ */
+function sequencesOverlap<T>(a: readonly T[], b: readonly T[], rest: (x: T) => boolean, single: (x: T, y: T) => boolean): boolean {
+	const memo = new Map<number, boolean>();
+	const go = (i: number, j: number): boolean => {
+		const key = i * (b.length + 1) + j;
+		const known = memo.get(key);
+		if (known !== undefined) return known;
+		let result: boolean;
+		if (i === a.length && j === b.length) result = true;
+		else if (i < a.length && rest(a[i] as T)) result = go(i + 1, j) || (j < b.length && go(i, j + 1));
+		else if (j < b.length && rest(b[j] as T)) result = go(i, j + 1) || (i < a.length && go(i + 1, j));
+		else if (i === a.length || j === b.length) result = false;
+		else result = single(a[i] as T, b[j] as T) && go(i + 1, j + 1);
+		memo.set(key, result);
+		return result;
+	};
+	return go(0, 0);
 }
 
 /** The directory part of a glob before its first wildcard. */

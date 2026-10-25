@@ -34,7 +34,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir, userInfo } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { CALLSIGN_PATTERN } from "./callsign.ts";
 import { ENV } from "./config.ts";
 import { isResourceName } from "./glob.ts";
@@ -82,6 +82,8 @@ const TOOL_PATTERN = /^[A-Za-z0-9_.:-]{1,128}$/;
 export const BLOCKED_CAP = 8;
 /** Most resource locks one agent may wait in line for (`queued`). */
 export const QUEUED_CAP = 8;
+/** A larger count of asks owed is not believed: no session owes that many. */
+const ASKS_OWED_MAX = 999;
 
 export type Result<T> = ({ ok: true } & T) | { ok: false; reason: string };
 
@@ -95,6 +97,12 @@ export interface Claim {
 	since: number;
 	/** Refreshed whenever the owner edits inside the claim. */
 	expiresAt: number;
+	/**
+	 * The one checkout the claim binds in (`pattern` is then relative to it): the owner named a path
+	 * inside it. Without it, the claim binds in every checkout its owner works in. Optional: older
+	 * peers ignore it, and read the claim as binding wherever its owner works, as it always did.
+	 */
+	checkout?: string;
 }
 
 /** The tool call a busy agent is inside: it reads nothing it is sent until the call ends. */
@@ -160,6 +168,18 @@ export interface Presence {
 	step?: Step;
 	task?: string;
 	taskAt?: number;
+	/**
+	 * Since when a message that should have started a run here has gone unanswered by the model
+	 * (runtime.ts, `checkWakes`): set once a re-wake was needed, cleared by the next model turn. A
+	 * stuck session cannot say so itself, so this is what tells teammates waiting on it. Optional,
+	 * display and wake-ups only.
+	 */
+	unreadSince?: number;
+	/**
+	 * Asks to this agent it has not answered yet, when there are any: a teammate many depend on
+	 * shows as one, and whoever asks next knows to expect a wait. Optional, display only.
+	 */
+	asksOwed?: number;
 	claims: Claim[];
 	recent: RecentFile[];
 	startedAt: number;
@@ -431,7 +451,8 @@ function parseClaims(value: unknown): Claim[] {
 		const pattern = line(c?.pattern, LIMITS.path);
 		if (!c || !pattern || !num(c.since) || !num(c.expiresAt)) continue;
 		const note = line(c.note, LIMITS.note);
-		out.push({ pattern, since: c.since, expiresAt: c.expiresAt, ...(note ? { note } : {}) });
+		const checkout = isPath(c.checkout) && isAbsolute(c.checkout) ? c.checkout : undefined;
+		out.push({ pattern, since: c.since, expiresAt: c.expiresAt, ...(note ? { note } : {}), ...(checkout ? { checkout } : {}) });
 	}
 	return out;
 }
@@ -520,6 +541,8 @@ export function parsePresence(value: unknown): Presence | null {
 		...(model ? { model } : {}),
 		...(task ? { task } : {}),
 		...(num(r.taskAt) ? { taskAt: r.taskAt } : {}),
+		...(past(r.unreadSince, now) ? { unreadSince: r.unreadSince } : {}),
+		...(Number.isInteger(r.asksOwed) && (r.asksOwed as number) > 0 && (r.asksOwed as number) <= ASKS_OWED_MAX ? { asksOwed: r.asksOwed as number } : {}),
 	};
 }
 

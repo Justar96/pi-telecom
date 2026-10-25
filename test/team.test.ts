@@ -254,6 +254,30 @@ test("guard stays out of the way for solo work and own changes", async () => {
 	assert.equal(res.note, undefined);
 });
 
+test("claims: a retry after the owner narrowed its claim is not called blind; a retry with nothing changed is", async () => {
+	const proj = makeProject("p-claim-narrowed");
+	const a = await session(proj);
+	const b = await session(proj);
+	await a.tool({ action: "claim", paths: ["src/**"] });
+	assert.ok((await b.tool({ action: "claim", paths: ["src/a.ts"] })).isError);
+	await a.tool({ action: "release", paths: ["src/**"] });
+	await a.tool({ action: "claim", paths: ["src/*.ts"] });
+	const after = await b.tool({ action: "claim", paths: ["src/a.ts"] });
+	assert.match(after.text, /overlaps alpha's claim "src\/\*\.ts"/);
+	assert.doesNotMatch(after.text, /Nothing has changed/, "alpha's claim changed: the retry was not blind");
+	assert.match((await b.tool({ action: "claim", paths: ["src/a.ts"] })).text, /Nothing has changed since this was last refused/);
+});
+
+test("reply: an unknown handle with no ask waiting says how to answer anyway", async () => {
+	const proj = makeProject("p-reply-unknown");
+	const a = await session(proj);
+	await session(proj);
+	const res = await a.tool({ action: "reply", askId: "ask-gone", message: "yes" });
+	assert.ok(res.isError);
+	assert.match(res.text, /None is waiting: it was answered, withdrawn, or asked of this session before it restarted/);
+	assert.match(res.text, /telecom\(\{ action: "reply", askId: "ask-gone", to: "…", message: "…" \}\)/);
+});
+
 test("claims: overlap refused, path held back once with owner told, release tells the contester", async () => {
 	const proj = makeProject("p-claim");
 	writeFileSync(join(proj, "auth.ts"), "export {}\n");
@@ -831,6 +855,57 @@ test("lanes: agents started in the main checkout but working in worktrees of the
 	assert.match(held.blocked ?? "", /inside alpha's claim "src\/x\.ts"/);
 });
 
+test("lanes: a claim naming a worktree binds there only, and a relative claim made from a worktree says how to name it", async () => {
+	const proj = makeProject("p-lane-scoped");
+	const wtA = makeWorktree(proj, "wa", "lane-a");
+	const wtB = makeWorktree(proj, "wb", "lane-b");
+	for (const dir of [proj, wtA, wtB]) {
+		mkdirSync(join(dir, "src"), { recursive: true });
+		writeFileSync(join(dir, "src", "x.ts"), "x\n");
+	}
+	// All three start in the main checkout; alpha and bravo work in worktrees of their own.
+	const a = await session(proj);
+	const b = await session(proj);
+	const c = await session(proj);
+	await a.read(join(wtA, "src", "x.ts"));
+	await b.read(join(wtB, "src", "x.ts"));
+	await b.edit(join(wtB, "src", "x.ts"), "x", "B");
+	const wide = await a.tool({ action: "claim", paths: ["src/**"], message: "parser" });
+	assert.match(wide.text, new RegExp(`claim it there instead: telecom\\(\\{ action: "claim", paths: \\["${escapeRegExp(join(wtA, "src", "**"))}"\\] \\}\\)`));
+	// Explained once: the next relative claim from that worktree carries only the call.
+	const again = await a.tool({ action: "claim", paths: ["src/x.ts"], message: "parser" });
+	assert.match(again.text, new RegExp(`Only your worktree\\? Claim \\["${escapeRegExp(join(wtA, "src", "x.ts"))}"\\] instead\\.`));
+	assert.doesNotMatch(again.text, /It binds in every checkout/);
+	// A compaction may have dropped the explanation: it is given in full again.
+	await a.fire("session_compact", {});
+	assert.match((await a.tool({ action: "claim", paths: ["src/x.ts"], message: "parser" })).text, /It binds in every checkout you work in/);
+	await a.tool({ action: "release", paths: ["src/x.ts"] });
+	// A relative claim binds in every checkout its owner works in, the main one included: bravo
+	// is refused, and told how to claim its own copy.
+	const refused = await b.tool({ action: "claim", paths: ["src/x.ts"] });
+	assert.equal(refused.isError, true);
+	assert.match(refused.text, new RegExp(`claim it there: telecom\\(\\{ action: "claim", paths: \\["${escapeRegExp(join(wtB, "src", "x.ts"))}"\\] \\}\\)`));
+	const own = await b.tool({ action: "claim", paths: [join(wtB, "src", "x.ts")] });
+	assert.ok(!own.isError, own.text);
+	assert.match(own.text, /claimed src\/x\.ts \(in p-lane-scoped-wb\)/);
+	assert.match(own.text, /overlaps alpha's claim "src\/\*\*" \(parser\) in/, "separate copies: a note");
+	// alpha narrows its claim to its worktree: the main checkout is free, its worktree is not.
+	const narrow = await a.tool({ action: "claim", paths: [join(wtA, "src", "**")], message: "parser" });
+	assert.match(narrow.text, /claimed src\/\*\* \(in p-lane-scoped-wa\)/);
+	assert.doesNotMatch(narrow.text, /claim it there instead/);
+	await eventually(async () => assert.match((await c.tool({ action: "board" })).text, /claims: src\/\*\* \(in p-lane-scoped-wa\) — parser/));
+	await c.read(join(proj, "src", "x.ts"));
+	const main = await c.edit(join(proj, "src", "x.ts"), "x", "C");
+	assert.equal(main.blocked, undefined, "a claim naming a worktree does not bind in the main checkout");
+	assert.match(main.note ?? "", /inside alpha's claim "src\/\*\* \(in p-lane-scoped-wa\)".* in worktree .*wa\b/);
+	await c.read(join(wtA, "src", "x.ts"));
+	const there = await c.edit(join(wtA, "src", "x.ts"), "x", "C");
+	assert.match(there.blocked ?? "", /inside alpha's claim "src\/\*\* \(in p-lane-scoped-wa\)"/);
+	// Released as claimed.
+	const released = await a.tool({ action: "release", paths: [join(wtA, "src", "**")] });
+	assert.match(released.text, /released src\/\*\*/);
+});
+
 test("lanes: a claim in another worktree never hides a binding claim in this checkout", async () => {
 	const proj = makeProject("p-lane-mask");
 	const wt = makeWorktree(proj, "wt", "lane-b");
@@ -1185,14 +1260,52 @@ test("broadcast with paths: agents working there get it now, the rest at their n
 	const res = await a.tool({ action: "broadcast", paths: ["src/db/**"], message: "the users table gains a tenant_id column" });
 	assert.match(res.text, /about src\/db\/\*\*: agents working there get it now, the rest at their next prompt/);
 	await eventually(() => {
-		for (const s of [reader, owner, far]) assert.equal(s.sentOf("telecom-broadcast").length, 1);
+		for (const s of [reader, owner]) assert.equal(s.sentOf("telecom-broadcast").length, 1);
 	});
 	for (const s of [reader, owner]) assert.equal(s.sentOf("telecom-broadcast")[0]?.options, undefined, "near: delivered now");
-	assert.deepEqual(far.sentOf("telecom-broadcast")[0]?.options, { deliverAs: "nextTurn" }, "far: held for its next run");
-	assert.match(far.sentOf("telecom-broadcast")[0]?.content ?? "", /Broadcast from alpha — about src\/db\/\*\*\*\*\n\nthe users table/);
 	await a.tool({ action: "broadcast", message: "everyone: main is green again" });
-	await eventually(() => assert.equal(far.sentOf("telecom-broadcast").length, 2));
-	assert.equal(far.sentOf("telecom-broadcast")[1]?.options, undefined, "a broadcast without paths concerns everyone");
+	await eventually(() => assert.equal(far.sentOf("telecom-broadcast").length, 1));
+	assert.equal(far.sentOf("telecom-broadcast")[0]?.options, undefined, "a broadcast without paths concerns everyone");
+	assert.match(far.sentOf("telecom-broadcast")[0]?.content ?? "", /main is green again/, "far: the one about src/db is held for its next run");
+	const run = await far.prompt("carry on with the docs");
+	assert.match(run?.message?.content ?? "", /Broadcast from alpha — about src\/db\/\*\*\*\*\n\nthe users table/);
+	assert.equal((await far.prompt("and the changelog"))?.message?.content?.includes("users table") ?? false, false, "delivered once");
+});
+
+test("broadcast with paths: a path in a worktree concerns whoever works on the same file in another; one held for hours is cut to a line", async (t) => {
+	const proj = makeProject("p-broadcast-lanes");
+	const wtA = makeWorktree(proj, "wa", "lane-a");
+	const wtB = makeWorktree(proj, "wb", "lane-b");
+	for (const dir of [wtA, wtB]) {
+		mkdirSync(join(dir, "src", "db"), { recursive: true });
+		writeFileSync(join(dir, "src", "db", "schema.ts"), "s\n");
+	}
+	// Everyone started in the main checkout; alpha and bravo work in worktrees of their own.
+	const a = await session(proj);
+	const b = await session(proj);
+	const far = await session(proj);
+	await b.read(join(wtB, "src", "db", "schema.ts"));
+	await a.tool({ action: "broadcast", paths: [join(wtA, "src", "db", "schema.ts")], message: "schema.ts gains tenant_id" });
+	await eventually(() => assert.equal(b.sentOf("telecom-broadcast").length, 1));
+	assert.equal(b.sentOf("telecom-broadcast")[0]?.options, undefined, "the same file in another worktree: delivered now");
+	await sleep(100);
+	assert.equal(far.sentOf("telecom-broadcast").length, 0, "held for its next run");
+	const realNow = Date.now.bind(Date);
+	t.mock.method(Date, "now", () => realNow() + 5 * 60 * 60_000);
+	const run = await far.prompt("carry on with the docs");
+	const text = run?.message?.content ?? "";
+	assert.match(text, /Older broadcasts, held while you were away.*telecom\(\{ action: "log" \}\)/);
+	assert.match(text, /- 5h ago, Broadcast from alpha — about .*schema\.ts: schema\.ts gains tenant_id/);
+});
+
+test("broadcast with paths: one from a teammate this agent just talked with is delivered now", async () => {
+	const proj = makeProject("p-broadcast-contact");
+	const a = await session(proj);
+	const b = await session(proj);
+	await a.tool({ action: "send", to: "bravo", message: "I'll take the db layer" });
+	await eventually(() => assert.equal(b.sentOf("telecom-message").length, 1));
+	await a.tool({ action: "broadcast", paths: ["src/db/**"], message: "db layer is in" });
+	await eventually(() => assert.equal(b.sentOf("telecom-broadcast").length, 1));
 });
 
 test("send/ask with paths reach whoever claims them, else whoever changed them last", async () => {
@@ -1268,7 +1381,7 @@ test(
 	},
 );
 
-test("claims: a path in your own worktree is claimed as the repository path; one outside the repository is refused with what to do", async () => {
+test("claims: a path in your own worktree is claimed as the repository path there; one outside the repository is refused with what to do", async () => {
 	const proj = makeProject("p-claim-paths");
 	const wt = makeWorktree(proj, "wa", "lane-a");
 	mkdirSync(join(wt, "src"), { recursive: true });
@@ -1281,14 +1394,14 @@ test("claims: a path in your own worktree is claimed as the repository path; one
 	const b = await session(proj);
 	const res = await a.tool({ action: "claim", paths: [join(wt, "src", "x.ts"), team], message: "parser" });
 	assert.ok(!res.isError, res.text);
-	assert.match(res.text, /^claimed src\/x\.ts — parser\./, "stored as the repository path");
+	assert.match(res.text, /^claimed src\/x\.ts \(in p-claim-paths-wa\) — parser\./, "stored as the repository path, in that worktree");
 	assert.match(res.text, /\nNot claimed: .*TEAM\.md is outside this repository .*telecom\(\{ action: "broadcast"/);
 	assert.deepEqual(res.details.refused, [team]);
 	// The claim binds in the worktree alpha works in.
 	await a.read(join(wt, "src", "x.ts"));
 	await a.edit(join(wt, "src", "x.ts"), "x", "A");
 	await b.read(join(wt, "src", "x.ts"));
-	assert.match((await b.edit(join(wt, "src", "x.ts"), "A", "B")).blocked ?? "", /inside alpha's claim "src\/x\.ts"/);
+	assert.match((await b.edit(join(wt, "src", "x.ts"), "A", "B")).blocked ?? "", /inside alpha's claim "src\/x\.ts \(in p-claim-paths-wa\)"/);
 
 	const only = await a.tool({ action: "claim", paths: [team] });
 	assert.ok(only.isError);

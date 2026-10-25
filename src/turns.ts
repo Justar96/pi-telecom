@@ -42,7 +42,11 @@ export function registerTurns(rt: Runtime, inbound: Inbound): void {
 		rt.publish();
 		const fullBefore = rt.briefState?.fullAt;
 		const brief = rt.nextBrief(me);
-		if (!brief.text) return;
+		// Broadcasts held for this run ride along: one message per run start is all a hook gets.
+		const held = rt.takeLater();
+		if (!brief.text) {
+			return held ? { message: { customType: MESSAGE_TYPES.broadcast, content: held, display: true, details: {} } } : undefined;
+		}
 		// A full brief (the first, or after a compaction) shows the team as it is now, not what was
 		// decided before: point to the log when teammates have written to it.
 		const full = rt.briefState?.fullAt !== fullBefore;
@@ -50,7 +54,7 @@ export function registerTurns(rt: Runtime, inbound: Inbound): void {
 		return {
 			message: {
 				customType: MESSAGE_TYPES.brief,
-				content,
+				content: held ? `${content}\n\n${held}` : content,
 				display: true,
 				details: brief.details,
 			},
@@ -69,6 +73,12 @@ export function registerTurns(rt: Runtime, inbound: Inbound): void {
 	});
 	rt.on("tool_execution_end", (event) => {
 		rt.noteStepEnd(event.toolCallId);
+	});
+
+	// The model answered: a run started by a peer's message did reach it (`Runtime.checkWakes`).
+	rt.on("message_end", (event) => {
+		const message = event.message;
+		if (message.role === "assistant" && message.stopReason !== "error" && message.stopReason !== "aborted") rt.noteModelTurn();
 	});
 
 	rt.on("agent_before_settle", (event) => {

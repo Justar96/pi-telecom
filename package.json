@@ -1,6 +1,6 @@
 {
 	"name": "@justar_96/pi-telecom",
-	"version": "0.5.0",
+	"version": "0.5.1",
 	"description": "Telecom for pi: parallel pi agents in the same project see each other, talk, claim work, and get told when a peer changes a file they depend on.",
 	"license": "MIT",
 	"author": "Justar96",
@@ -60,5 +60,8 @@
 	},
 	"publishConfig": {
 		"access": "public"
+	},
+	"overrides": {
+		"undici": "8.12.3"
 	}
 }

@@ -14,7 +14,7 @@
  */
 import { UNRESPONSIVE_MS } from "./awareness.ts";
 import { lineOf } from "./family.ts";
-import { claimMatcher, claimsOverlap, isResource, laneRelativePattern, sameResource } from "./glob.ts";
+import { claimMatcher, claimShown, claimsOverlap, isResource, laneRelativePattern, sameResource } from "./glob.ts";
 import { callsignsOf, declaredCycles, lineFor, lockLines } from "./locks.ts";
 import { displayPath, inCheckout, type Lane, laneIn, laneName, type PlaceCache, placeOf, readBranch, sameRepo, workingCheckout } from "./project.ts";
 import type { Presence } from "./transport.ts";
@@ -85,9 +85,16 @@ function workplace(peer: Presence, cache?: PlaceCache): { checkout: string; lane
  * the next turn, and would make every brief differ from the last.
  */
 export function liveState(peer: Presence, now = Date.now()): string {
-	if (peer.state === "busy") return peer.step ? `busy · ${peer.step.tool} ${elapsed(peer.step.since, now)}` : "busy";
+	if (peer.state === "busy") return `${peer.step ? `busy · ${peer.step.tool} ${elapsed(peer.step.since, now)}` : "busy"}${owes(peer)}`;
 	const idle = idleFor(peer, now);
-	return idle ? `idle ${idle}` : "idle";
+	// It got a message that started a run and never acted on it: its session may be stuck.
+	const unread = peer.unreadSince !== undefined ? ` · unread ${elapsed(peer.unreadSince, now)}` : "";
+	return `${idle ? `idle ${idle}` : "idle"}${unread}${owes(peer)}`;
+}
+
+/** ` · owes 3 asks`: answers a peer still owes its teammates (board only). */
+function owes(peer: Presence): string {
+	return peer.asksOwed ? ` · owes ${plural(peer.asksOwed, "ask")}` : "";
 }
 
 /** How long an idle peer has been idle ("12m"), once that is long enough to say; else null. */
@@ -130,6 +137,12 @@ function describePeer(
 	if (peer.task) lines.push(`    task: ${clip(peer.task, 140)}${peer.taskAt ? ` (${ago(peer.taskAt, now)})` : ""}`);
 	// Declared waits and places in line for a lock: what holds this agent up.
 	if (peer.blockedOn?.length) lines.push(`    waiting for: ${callsignsOf(peer.blockedOn, opts.peers ?? [], viewer.id).join(", ")}`);
+	// Who waits on it, on the board: a teammate many wait on is where the team stalls.
+	if (opts.live) {
+		const waiters = [viewer, ...(opts.peers ?? [])].filter((p) => p.id !== peer.id && (p.blockedOn?.includes(peer.id) || p.waitingOn?.includes(peer.id)));
+		const names = [...new Set(waiters.map((p) => (p.id === viewer.id ? "you" : p.callsign)))];
+		if (names.length > 0) lines.push(`    waited on by: ${names.join(", ")}`);
+	}
 	if (peer.queued?.length) lines.push(`    queued for: ${peer.queued.map((q) => q.pattern).join(", ")}`);
 	const claims = liveClaims(peer, now);
 	if (claims.length > 0) {
@@ -137,7 +150,7 @@ function describePeer(
 		const byNote = new Map<string, string[]>();
 		for (const c of claims) {
 			const note = c.note ? clip(c.note, 60) : "";
-			byNote.set(note, [...(byNote.get(note) ?? []), c.pattern]);
+			byNote.set(note, [...(byNote.get(note) ?? []), claimShown(c)]);
 		}
 		lines.push(
 			`    claims: ${[...byNote].map(([note, patterns]) => `${patterns.join(", ")}${note ? ` — ${note}` : ""}`).join("; ")}`,
@@ -310,8 +323,8 @@ function unitClaims(unit: Unit, now: number): string[] {
 /** Each of a unit's claims, as the brief shows it, with the session that holds it. */
 function claimHolders(unit: Unit, now: number): Map<string, string> {
 	const holders = new Map<string, string>();
-	for (const c of liveClaims(unit.peer, now)) holders.set(c.pattern, unit.peer.id);
-	for (const s of unit.subagents) for (const c of liveClaims(s, now)) holders.set(`${c.pattern} (by ${s.callsign})`, s.id);
+	for (const c of liveClaims(unit.peer, now)) holders.set(claimShown(c), unit.peer.id);
+	for (const s of unit.subagents) for (const c of liveClaims(s, now)) holders.set(`${claimShown(c)} (by ${s.callsign})`, s.id);
 	return holders;
 }
 
@@ -385,7 +398,7 @@ function describeUnit(unit: Unit, self: Presence, peers: readonly Presence[], no
 	const subagents = unit.subagents.map((s) => `${s.callsign} [${s.state}]${s.task ? ` ${clip(s.task, 50)}` : ""}`);
 	lines.push(`    subagents: ${subagents.join("; ")}`);
 	const claims = unit.subagents.flatMap((s) =>
-		liveClaims(s, now).map((c) => `${c.pattern}${c.note ? ` — ${clip(c.note, 60)}` : ""} (${s.callsign})`),
+		liveClaims(s, now).map((c) => `${claimShown(c)}${c.note ? ` — ${clip(c.note, 60)}` : ""} (${s.callsign})`),
 	);
 	if (claims.length > 0) lines.push(`    subagent claims: ${claims.join("; ")}`);
 	return lines;

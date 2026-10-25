@@ -22,7 +22,7 @@
  */
 import { join } from "node:path";
 import type { GuardMode } from "./config.ts";
-import { matchesClaim } from "./glob.ts";
+import { claimShown, matchesClaim } from "./glob.ts";
 import { displayPath, laneIn, laneName, type Place, type PlaceCache, placeOf, sameRepo, workingCheckout } from "./project.ts";
 import type { Claim, Presence } from "./transport.ts";
 import { ago, fileFingerprint, pairKey, setBounded } from "./util.ts";
@@ -105,6 +105,23 @@ export class Awareness {
 			if (place) out.add(place.checkout);
 		}
 		return out;
+	}
+
+	/**
+	 * Where this agent works now: the checkout of the newest file it changed or looked at in the
+	 * repository, else where it started. Reads count here (unlike `workingCheckout`, which peers see
+	 * through edits alone): an agent claims before its first edit, after reading where it will work.
+	 */
+	ownCheckout(self: Presence): string {
+		let newest: { at: number; checkout: string } | null = null;
+		const consider = (path: string, at: number) => {
+			if (newest && at <= newest.at) return;
+			const place = this.placeOf(path, self);
+			if (place) newest = { at, checkout: place.checkout };
+		};
+		for (const r of self.recent) consider(r.path, r.at);
+		for (const [path, view] of this.views) consider(path, view.at);
+		return (newest as { checkout: string } | null)?.checkout ?? self.projectRoot;
 	}
 
 	noteRead(path: string): void {
@@ -346,19 +363,20 @@ export class Awareness {
 		let unenforced: string | null = null;
 		for (const peer of peers) {
 			if (peer.id === self.id || exempt.has(peer.id) || !sameRepo(peer, self)) continue;
-			// A claim is written against its owner's checkout (where it started). `theirs` is the
-			// file there that this edit stands for. The claim binds when it names this very file, or
-			// when its owner works in the checkout this file lies in (its recent edits landed there):
-			// then both agents change one copy. Otherwise the copies are separate: advisory.
-			const theirs = join(peer.projectRoot, mine.rel);
+			// A claim is written against its owner's checkout (where it started), or against the one
+			// checkout it names. `theirs` is the file there that this edit stands for. A claim naming a
+			// checkout binds only there. Any other binds when it names this very file, or when its owner
+			// works in the checkout this file lies in (its recent edits landed there): then both agents
+			// change one copy. Otherwise the copies are separate: advisory.
 			const sharedCheckout = this.checkoutsOf(peer).has(mine.checkout);
 			for (const claim of peer.claims) {
 				if (claim.expiresAt <= now) continue;
-				const exact = matchesClaim(path, claim.pattern, peer.projectRoot);
-				if (!exact && !matchesClaim(theirs, claim.pattern, peer.projectRoot)) continue;
-				const otherLane = !exact && !sharedCheckout;
+				const root = claim.checkout ?? peer.projectRoot;
+				const exact = matchesClaim(path, claim.pattern, root);
+				if (!exact && !matchesClaim(join(root, mine.rel), claim.pattern, root)) continue;
+				const otherLane = claim.checkout ? claim.checkout !== mine.checkout : !exact && !sharedCheckout;
 				const shown = displayPath(path, mine.checkout);
-				const what = `${shown} is inside ${peer.callsign}'s claim "${claim.pattern}"${
+				const what = `${shown} is inside ${peer.callsign}'s claim "${claimShown(claim)}"${
 					claim.note ? ` (${claim.note})` : ""
 				}, held since ${ago(claim.since)}`;
 				if (otherLane) {
@@ -404,7 +422,7 @@ export class Awareness {
 		const tell = warnedAt === undefined || now - warnedAt >= CONTEST_WINDOW_MS;
 		return {
 			action: "warn",
-			note: `⚠ telecom: ${what}, in ${laneName(laneIn(workingCheckout(peer, this.places), peer))}. Your checkout is separate, so this went through, but the two changes meet when the branches merge${
+			note: `⚠ telecom: ${what}, in ${laneName(laneIn(claim.checkout ?? workingCheckout(peer, this.places), peer))}. Your checkout is separate, so this went through, but the two changes meet when the branches merge${
 				tell ? ` — ${peer.callsign} has been told` : ""
 			}. If they may conflict, agree on one owner: telecom({ action: "send", to: "${peer.callsign}", message: "…" }).`,
 			...(tell ? { contested: { owner: peer, claim, lane: true } } : {}),
