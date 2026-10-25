@@ -214,7 +214,7 @@ test("transport: peer records are sanitised before they can reach a model", () =
 		recent: Array.from({ length: 100 }, (_, i) => ({ path: `/x/${i}`, op: "edit", at: i })),
 	});
 	assert.ok(p);
-	assert.ok(!p.task?.includes("\n") && (p.task?.length ?? 0) <= 200);
+	assert.ok(!p.task?.includes("\n") && (p.task?.length ?? 0) <= 400);
 	assert.ok((p.name?.length ?? 0) <= 60);
 	assert.equal(p.claims.length, 32);
 	assert.equal(p.claims[0]?.pattern, "p0 X");

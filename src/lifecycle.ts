@@ -10,6 +10,7 @@
  */
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { childCallsign, mustYield, pickCallsign } from "./callsign.ts";
+import { UNRESPONSIVE_MS } from "./awareness.ts";
 import { readConfig } from "./config.ts";
 import { detectLineage, parentOf } from "./family.ts";
 import { isResource } from "./glob.ts";
@@ -21,6 +22,7 @@ import { MESSAGE_TYPES } from "./render.ts";
 import { rememberedCallsign, rememberedEnabled, type Runtime } from "./runtime.ts";
 import {
 	type Claim,
+	jobRuns,
 	openTransport,
 	type Presence,
 	processStartTicks,
@@ -47,8 +49,18 @@ const EXPIRED_SHOWN = 400;
  */
 const LOCK_BUSY_HOLD_MS = 5 * 60_000;
 /** A run that never ends must not hold a lock forever: past this long since the lock was taken,
- *  only claiming it again keeps it. */
+ *  only claiming it again keeps it. The same bound applies to a claim kept for a process or for a
+ *  wait on a teammate: a job or a wait that outlasts it needs a fresh claim. */
 const LOCK_BUSY_MAX_MS = 12 * 60 * 60_000;
+
+/**
+ * A declared wait holds its owner's claims only while the awaited teammate is at work: busy, idle
+ * for less than this, or idle behind a background job (a claim tied to a process). Waits last as
+ * long as nobody clears them, so one that is forgotten must not hold files: once the teammate has
+ * done nothing for this long, the claims lapse by their time again and the wait notices
+ * (`waiting.ts`) have already pointed it out.
+ */
+const WAIT_HOLD_IDLE_MS = 30 * 60_000;
 
 /** What a runtime parks for its replacement on `/reload`. */
 interface Handoff {
@@ -70,6 +82,7 @@ interface Handoff {
 	/** Places in line for locks, and declared waits: a reload must not lose them. */
 	queued?: QueueEntry[];
 	blockedOn?: string[];
+	blockedSince?: number;
 }
 
 export interface Lifecycle {
@@ -254,11 +267,42 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard, w
 		rt.publish();
 	}
 
-	/** Keep the locks a busy agent holds from lapsing under the job they guard (`LOCK_BUSY_HOLD_MS`). */
-	function holdLocks(me: Presence, now: number): void {
+	/** Is a teammate responsive and doing something? Unknown activity (an older peer) counts as at work. */
+	function atWork(peer: Presence, now: number): boolean {
+		if (now - peer.heartbeatAt > UNRESPONSIVE_MS) return false;
+		if (peer.state === "busy" || peer.stateSince === undefined || now - peer.stateSince <= WAIT_HOLD_IDLE_MS) return true;
+		return peer.claims.some((c) => c.expiresAt > now && c.pid !== undefined);
+	}
+
+	/**
+	 * Keep claims from lapsing while something still stands behind them: a busy agent's locks (they
+	 * guard a job that runs inside its run, `LOCK_BUSY_HOLD_MS`), every claim tied to a process that
+	 * still runs (`Claim.pid`: a background build outlives the run that started it, and an idle agent
+	 * has nothing else to renew with), and every claim of an agent that declared a wait on a
+	 * teammate that is at work (`atWork`; a freeze while it waits has no edits to renew a path claim). An unknown
+	 * liveness counts as alive. Never past `LOCK_BUSY_MAX_MS` since the claim.
+	 */
+	function holdClaims(me: Presence, now: number): void {
+		const frozen = (me.blockedOn ?? []).some((id) => rt.present.some((p) => p.id === id && atWork(p, now)));
 		for (const claim of me.claims) {
-			if (!isResource(claim.pattern) || claim.expiresAt <= now || now - claim.since >= LOCK_BUSY_MAX_MS) continue;
-			claim.expiresAt = Math.max(claim.expiresAt, now + Math.min(LOCK_BUSY_HOLD_MS, rt.cfg.claimTtlMs));
+			if (claim.expiresAt <= now || now - claim.since >= LOCK_BUSY_MAX_MS) continue;
+			const held = frozen || (me.state === "busy" && isResource(claim.pattern)) || (claim.pid !== undefined && jobRuns(claim.pid, claim.pidStart ?? null));
+			if (held) claim.expiresAt = Math.max(claim.expiresAt, now + Math.min(LOCK_BUSY_HOLD_MS, rt.cfg.claimTtlMs));
+		}
+	}
+
+	/**
+	 * Release the claims whose process has exited, as `release` would (peers held back, and those in
+	 * line for a lock, are told at once), and tell the model in one line. Expired or not: the exit
+	 * is the better reason.
+	 */
+	function releaseExited(me: Presence): void {
+		const gone = me.claims.filter((c) => c.pid !== undefined && !jobRuns(c.pid, c.pidStart ?? null));
+		for (const pid of new Set(gone.map((c) => c.pid))) {
+			const patterns = gone.filter((c) => c.pid === pid).map((c) => c.pattern);
+			rt.releaseClaims(me, patterns, `process ${pid} exited`);
+			const shown = clip(patterns.join(", "), EXPIRED_SHOWN);
+			rt.inject(MESSAGE_TYPES.claim, `**📡 ${plural(patterns.length, "claim")} released**\n\nProcess ${pid} exited, so ${shown} ${patterns.length === 1 ? "is" : "are"} released. Claim again if you still need ${patterns.length === 1 ? "it" : "them"}.`, {}, "passive");
 		}
 	}
 
@@ -266,22 +310,29 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard, w
 		const me = rt.self;
 		if (!me || !rt.transport) return;
 		const now = Date.now();
-		if (me.state === "busy") holdLocks(me, now);
+		releaseExited(me);
+		holdClaims(me, now);
 		const before = me.claims.length;
 		const lapsed = me.claims.filter((c) => c.expiresAt <= now).map((c) => c.pattern);
 		const locks = me.claims.filter((c) => c.expiresAt <= now && isResource(c.pattern)).map((c) => c.pattern);
+		const paths = lapsed.filter((p) => !isResource(p));
 		me.claims = me.claims.filter((c) => c.expiresAt > now);
 		const expired = before - me.claims.length;
 		if (expired > 0) {
-			rt.logEntry("release", `claim expired unused: ${lapsed.join(", ")}`, lapsed);
-			// Edits renew a path claim but never a lock: a lock is kept by a run in progress, or by
-			// claiming it again.
-			const why =
-				locks.length === 0
-					? `No activity inside ${expired === 1 ? "it" : "them"} for ${rt.claimTtlMinutes()} minutes, so peers may work there now.`
-					: `${locks.join(", ")} ${locks.length === 1 ? "was" : "were"} not claimed again within ${rt.claimTtlMinutes()} minutes while you were idle, so the next in line may take ${locks.length === 1 ? "it" : "them"} now.`;
+			// Two kinds, told apart: a path claim is kept by edits inside it, a lock only by a run in
+			// progress or by claiming it again, and a lock matches no path, so it is never "unused".
+			const minutes = rt.claimTtlMinutes();
+			if (paths.length > 0) rt.logEntry("release", `claim expired (no edits inside for ${minutes} min): ${paths.join(", ")}`, paths);
+			if (locks.length > 0) rt.logEntry("release", `lock lapsed (not claimed again within ${minutes} min): ${locks.join(", ")}`, locks);
+			const why = [
+				paths.length > 0 ? `No activity inside ${paths.length === 1 ? "it" : "them"} for ${minutes} minutes, so peers may work there now.` : "",
+				locks.length > 0
+					? `${locks.join(", ")} ${locks.length === 1 ? "was" : "were"} not claimed again within ${minutes} minutes while you were idle, so the next in line may take ${locks.length === 1 ? "it" : "them"} now.`
+					: "",
+			]
+				.filter(Boolean)
+				.join(" ");
 			// Named, so "claim again" can be acted on: the model may hold claims from hours ago.
-			const paths = lapsed.filter((p) => !isResource(p));
 			const named = paths.length > 0 ? ` Expired: ${clip(paths.join(", "), EXPIRED_SHOWN)}.` : "";
 			rt.inject(MESSAGE_TYPES.claim, `**📡 ${plural(expired, "claim")} expired**\n\n${why}${named} Claim again if you still need ${expired === 1 ? "it" : "them"}.`, {}, "passive");
 		}
@@ -319,6 +370,8 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard, w
 		// The log file is the other process's now, like the record: nothing pending is written.
 		rt.log.abandon();
 		rt.ledger.abandonAll(`telecom disconnected: ${reason}. Run /telecom on to reconnect before asking again.`);
+		// Held messages would wait for a run end that no longer reaches them (`rt.self` is gone).
+		rt.flushLater();
 		rt.unavailable = reason;
 		rt.showOff("session open elsewhere");
 		rt.notifyUser(`📡 telecom: ${reason}`, "warning");
@@ -385,7 +438,7 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard, w
 			abandonedAsks: rt.ledger.lateCandidates(),
 			asyncAsks: rt.ledger.asyncOpen(),
 			...(me.queued?.length ? { queued: me.queued } : {}),
-			...(me.blockedOn?.length ? { blockedOn: me.blockedOn } : {}),
+			...(me.blockedOn?.length ? { blockedOn: me.blockedOn, ...(me.blockedSince ? { blockedSince: me.blockedSince } : {}) } : {}),
 		};
 		rt.transport.writeHandoff(me.id, state);
 	}
@@ -469,7 +522,9 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard, w
 				...(handoff?.task ? { task: handoff.task } : {}),
 				...(handoff?.taskAt ? { taskAt: handoff.taskAt } : {}),
 				...(Array.isArray(handoff?.queued) && handoff.queued.length > 0 ? { queued: handoff.queued } : {}),
-				...(Array.isArray(handoff?.blockedOn) && handoff.blockedOn.length > 0 ? { blockedOn: handoff.blockedOn } : {}),
+				...(Array.isArray(handoff?.blockedOn) && handoff.blockedOn.length > 0
+					? { blockedOn: handoff.blockedOn, ...(typeof handoff.blockedSince === "number" ? { blockedSince: handoff.blockedSince } : {}) }
+					: {}),
 			};
 			rt.self = me;
 			// The log continues what this session's file holds (a resume, a reload); a reload is no join.

@@ -65,22 +65,22 @@ per request that hit: that is the text telecom adds, the number its changes can 
 | file | owns |
 |---|---|
 | `src/index.ts` | The entry point. The factory creates the session's `Runtime` and registers the parts below it in this table, which act on it. It starts nothing (rule 4). |
-| `src/runtime.ts` | One session runtime's state (`Runtime`: the record, the transport, the ask ledger, awareness, brief state, the footer and widget) and the operations every part shares: `publish`, `readPeers`/`team`, the debounced team (`present`, `settleTeam`, `presentNow`), `envelope`/`deliverEach`/`sendEvent`, `inject` (the delivery modes; `later` held in `takeLater`/`flushLater`), wake-ups owed a model reply (`checkWakes`, `noteModelTurn`), `injectMessage`, `setState` and the step (`noteStepStart`/`noteStepEnd`/`publishStep`), `nextBrief`, the team log handle (`logEntry`/`flushLog`/`teamLog`), `report`/`step`, the hook wrapper `on` (rule 3), and the settings kept in the session (`telecom-callsign`, `telecom-enabled`). |
+| `src/runtime.ts` | One session runtime's state (`Runtime`: the record, the transport, the ask ledger, awareness, brief state, the footer and widget) and the operations every part shares: `publish`, `readPeers`/`team`, the debounced team (`present`, `settleTeam`, `presentNow`), `envelope`/`deliverEach`/`sendEvent`, `inject` (the delivery modes; `later` held in `takeLater`/`flushLater`; messages sent with `interrupt: false` held for the end of the run in `holdDeferred`/`deferredEntries`/`deliverDeferred`), `stillWaitingNote`, `CONTACT_NEAR_MS`, `TASK_CAP`, wake-ups owed a model reply (`checkWakes`, `noteModelTurn`), `injectMessage`, `setState` and the step (`noteStepStart`/`noteStepEnd`/`publishStep`), `nextBrief`, the team log handle (`logEntry`/`flushLog`/`teamLog`), `report`/`step`, the hook wrapper `on` (rule 3), and the settings kept in the session (`telecom-callsign`, `telecom-enabled`). |
 | `src/lifecycle.ts` | `connect` and `stop`, the loop (`tick`), the team refresh, the heartbeat, backing off when the session is open twice, the reload handoff, and the `session_*` and `model_select` hooks. |
 | `src/inbound.ts` | The inbox: messages, asks, answers, broadcasts, team tasks (`runTask`), peer events, and the change-notice queue. |
 | `src/guard.ts` | The `tool_call`/`tool_result` hooks: acting on `awareness` verdicts, and announcing this agent's own changes. |
-| `src/turns.ts` | Around each run: `before_agent_start` (the task from the prompt, the brief, `LOG_HINT` on a full brief), the step (the tool call a run is inside: `tool_call`/`tool_result`/`tool_execution_end`, published from the tick once it runs `STEP_PUBLISH_AFTER_MS`), `agent_before_settle` (asks still owed an answer), `agent_settled`. |
+| `src/turns.ts` | Around each run: `before_agent_start` (the task from the prompt, the brief, `LOG_HINT` on a full brief), the step (the tool call a run is inside: `tool_call`/`tool_result`/`tool_execution_end`, published from the tick once it runs `STEP_PUBLISH_AFTER_MS`), `agent_before_settle` (held `interrupt: false` messages and asks still owed an answer, with `continue: true`), `agent_settled` (held messages a run could not continue with). |
 | `src/actions.ts` | The `execute` half of the `telecom` tool: one function per action. |
 | `src/command.ts` | `/telecom`: its subcommands, the board panel, the command list and completions. |
 | `src/address.ts` | Whom a message is for (`resolveTarget`, `ownerOf`) and what its sender is told about them (`stateHint`). Pure. |
 | `src/tool.ts` | The static half of the `telecom` tool: schema, description, guidelines, renderers (its own panels: `renderShell: "self"`), `ok`/`fail`. Fixed at registration (rule 1). |
 | `src/notices.ts` | Change-notice text: the summary sent about an own edit, and the notice shown about a peer's. Pure. |
-| `src/transport.ts` | The wire: root directory, liveness (`readStartTicks`: unreadable `/proc` is unknown, not dead), debounced departures (`settleDepartures`) and leave marks (`markLeft`), presence records, envelopes, typed event payloads (`parseEvent`), `deliver`/`drain`, reload handoff, and **all validation of peer data**. |
+| `src/transport.ts` | The wire: root directory, liveness (`readStartTicks`: unreadable `/proc` is unknown, not dead; `jobRuns` for a claim's process, a zombie counting as exited), debounced departures (`settleDepartures`) and leave marks (`markLeft`), presence records, envelopes, typed event payloads (`parseEvent`), `deliver`/`drain`, reload handoff, and **all validation of peer data**. |
 | `src/awareness.ts` | What this agent has seen (views), what peers changed, and the guard's verdicts (stale files, claims, lane overlaps). Pure decisions; the caller acts on them. |
 | `src/family.ts` | pi-subagents children: detecting a session's parent (`detectLineage`), its lineal family (`lineOf`), and foreground children (`isForegroundChild`). |
 | `src/ledger.ts` | Asks this agent is waiting on (blocking, with the messages held for them, and `wait: false` asks tracked apart), asks it owes an answer, and the wait-for graph (`closesCycle`). |
 | `src/locks.ts` | Resource locks (`@name`) and declared waits as pure decisions: holders, the line (`queued`: earliest `since`, then lower id), races (`lostRaces`), declared-wait cycles, the board's lock lines. |
-| `src/waiting.ts` | Acting on locks and declared waits: a freed lock goes to the first live waiter (woken), a lost race sends the loser back to its place in line (told, passively, once it believed it held the lock), declared waits wake on a finished run, a new task or a departure and end on a message or answer, cycles are told once, passively. |
+| `src/waiting.ts` | Acting on locks and declared waits: a freed lock goes to the first live waiter (woken), a lost race sends the loser back to its place in line (told, passively, once it believed it held the lock), declared waits wake on a finished run or a departure, and end on `unblocks` or when the waiter gets to work after hearing from the teammate (`endHeardWaits`); a cycle is told once all its members stall, as a wake-up. |
 | `src/log.ts` | The team log: this session's own `log/<session>.jsonl` (kept in memory, rewritten whole on the tick, bounded to `LOG_CAP`), reading and validating every entry in this repository (`parseLogEntry`; departed sessions for `LOG_RETENTION_MS`), the sweep, and the log's text (`renderLog`, `LOG_HINT`). |
 | `src/board.ts` | Board text and team briefs (full, then only the changes; with many agents, only the relevant peers in full). |
 | `src/glob.ts` | Claim patterns: matching and overlap, and `@name` resource names (`isResource`, `resourceKey`), which match no path. |
@@ -158,7 +158,7 @@ the module; use `import type` for those.
   against the debounced team) → flush pending change notices → write our
   log file if something was logged → expire asks → re-send wake-ups no model turn answered
   (`checkWakes`) → heartbeat every 15 s (`PI_TELECOM_HEARTBEAT_MS`, on its own clock, since
-  `publish` runs often; keep a busy holder's locks from lapsing, expire claims, re-read the
+  `publish` runs often; release claims whose process exited (`releaseExited`), keep claims from lapsing while something stands behind them (`holdClaims`: a busy holder's locks, a claim's live process, a declared wait on a teammate at work), expire claims, re-read the
   branch, sweep dead records, and at most every 10 min departed sessions' log files older than
   `LOG_RETENTION_MS`). The footer is set only when
   its text changes: every `setStatus` redraws the TUI.
@@ -173,16 +173,20 @@ the module; use `import type` for those.
   `ask.withdrawn`. An `ask` may carry optional `async: true` (sent with `wait: false`: the asker
   is not waiting); older peers treat it as a blocking ask.
   A human `message` may carry optional `triggerTurn: true` for an explicit `/telecom run` task.
-  Older peers ignore this field and apply their usual wake limit. Draining checks the recipient;
+  Older peers ignore this field and apply their usual wake limit. A `message` may carry optional
+  `defer: true` (sent with `interrupt: false`), and a `message` or `answer` optional
+  `unblocks: true` (it ends the recipient's declared wait on the sender); older peers deliver
+  such a message as a plain one. Draining checks the recipient;
   answers and withdrawals are matched to the session involved in the ask.
 - **Delivery to the model** (`inject` modes):
 
   | mode | used for | when busy | when idle |
   |---|---|---|---|
-  | `wake` | direct messages, late answers, answers to `wait: false` asks, a lock handed to a waiter, news of a teammate the agent declared it waits for (its run ended, it left, it stalled) | steered in | starts a turn (wake-limited) |
+  | `wake` | direct messages, late answers, answers to `wait: false` asks, a lock handed to a waiter, news of a teammate the agent declared it waits for (its run ended, it left, it stalled), a wait cycle whose members all stalled | steered in | starts a turn (wake-limited) |
   | `wake-always` | asks and explicit human team tasks | steered in | starts a turn |
-  | `passive` | notices, broadcasts, claim news, mid-run team updates (joins/departures), wait cycles, an expired `wait: false` ask | steered in | appended, no turn |
+  | `passive` | notices, broadcasts, claim news, claims released because their process exited, mid-run team updates (joins/departures), an expired `wait: false` ask | steered in | appended, no turn |
   | `later` | broadcasts about paths away from this agent's work | held by the runtime for the next run | held by the runtime for the next run |
+  | deferred | a direct message sent with `interrupt: false` | held to the end of the run (`agent_before_settle` entries, `continue: true`), or `wake` at `agent_settled` | delivered as `wake` |
 
   `later` messages ride with the next run's brief (`takeLater`, from `before_agent_start`): ones
   held longer than `LATER_FRESH_MS` are cut to a line. On leaving they go to pi's queue
@@ -229,11 +233,21 @@ the module; use `import type` for those.
   place (its queue `since` when it took the lock from the line); if it already believed it held
   the lock (a wake-up or its claim's result said so), it is told, passively. Claiming again
   renews a live lock and keeps its `since`; after its expiry it is a new claim. Edits never renew
-  one, but the heartbeat of a busy holder keeps its locks from lapsing (`holdLocks`, up to
-  `LOCK_BUSY_MAX_MS` after the claim): a lock guards a job, and the job outlasts the TTL. Taking a
+  one, but the heartbeat of a busy holder keeps its locks from lapsing (`holdClaims`, up to
+  `LOCK_BUSY_MAX_MS` after the claim): a lock guards a job, and the job outlasts the TTL. The same
+  heartbeat holds any claim made with `pid` (`Claim.pid`/`pidStart`, optional) while that
+  process runs, releasing it when it exits, and every claim of an agent whose declared wait is on a
+  teammate at work (`atWork`): waiting makes no edits to renew them. Taking a
   lock ends the taker's declared wait on whoever held it. A declared wait is woken when the
   teammate finishes a run or leaves (not on a new task: progress reports woke waiters for nothing),
-  and once per stall when the teammate has `unreadSince` or stays idle `STALE_WAIT_BEATS`. `blockedOn` (from `status` with
+  and once per stall when the teammate has `unreadSince` or stays idle `STALE_WAIT_BEATS`. It is
+  declared once (`status` without `waitingFor` keeps it, `[]` clears it) and ends by itself: on
+  a message or answer with `unblocks`, or once the waiter has heard from the teammate and gets to
+  work (an edit, a new path claim, or a step other than `telecom` since then). A message that
+  leaves it in place carries `stillWaitingNote`. A cycle of declared waits is told only when
+  every member has been idle `CYCLE_STALL_MS`, once per stall, as a `wake`: working agents
+  resolve one by themselves. `blockedSince` (optional) dates the wait for the board's "Waiting
+  on you". `blockedOn` (from `status` with
   `waitingFor`) is separate from `waitingOn` and never feeds `closesCycle`. Older peers read
   `@cargo` as the path `<checkout>/@cargo`, which matches no real file.
 - **Live state.** A record carries `stateSince` (when it last went idle ↔ busy) and, while busy,
@@ -258,7 +272,9 @@ the module; use `import type` for those.
 - **Briefs with many agents.** Up to `DESCRIBE_ALL_UP_TO` other units (a top-level agent with its
   subagents folded in), a brief describes everyone. Beyond that it describes only units that
   touch this agent's focus (`Focus`: `awareness.focusPaths()` and the sessions it messaged
-  with), and the rest share a roster line. Deltas hold back a far unit's task, lane and new
+  with in the last `CONTACT_NEAR_MS`), and the rest share a roster line. A brief shows at most
+  `BRIEF_CLAIMS_SHOWN` claims and `BRIEF_TASK_SHOWN` characters of a task, pointing to the board,
+  which shows both whole. Deltas hold back a far unit's task, lane and new
   claims, but always report joins, departures, callsign changes and releases of told claims.
   `BriefState` stores what the model was TOLD, so held-back news is reported once the unit is
   near again; `holders` (current, per claim) decides which claims a departure frees.
@@ -305,7 +321,8 @@ Each rule has a test or an e2e check. Read the reason before bending a rule.
    turns, and `wake` respects `PI_TELECOM_MAX_WAKES`, counting only idle wake-ups. Explicit human
    tasks use `wake-always`. A new passive kind must use `passive`. A lock handed to a waiter, the
    answer to a `wait: false` ask, and news about a teammate an agent declared it waits for use
-   `wake`: the agent asked for exactly that signal, like an ask's answer.
+   `wake`: the agent asked for exactly that signal, like an ask's answer. So does a wait cycle
+   whose members have all stalled: nobody on it moves otherwise.
 9. **Every refusal says what happened and what to do next,** including the exact
    `telecom({ ... })` call when one helps. Models follow these literally; the live tests show it.
 10. **Tool schema conventions:** string enums use `StringEnum` from `@earendil-works/pi-ai`

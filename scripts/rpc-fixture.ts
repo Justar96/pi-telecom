@@ -4,6 +4,8 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 export default function rpcFixture(pi: ExtensionAPI): void {
 	let holdNext = false;
+	// The next request asks for a three-second tool call, so a run has a step to be steered into.
+	let toolNext = false;
 	let release: (() => void) | undefined;
 	pi.registerProvider("telecom-rpc-test", {
 		api: "openai-completions",
@@ -36,6 +38,16 @@ export default function rpcFixture(pi: ExtensionAPI): void {
 				stream.end();
 			};
 			stream.push({ type: "start", partial: response });
+			if (toolNext) {
+				toolNext = false;
+				response.stopReason = "toolUse";
+				response.content = [{ type: "toolCall", id: "fixture-tool", name: "bash", arguments: { command: 'node -e "setTimeout(function(){},3000)"' } }];
+				queueMicrotask(() => {
+					stream.push({ type: "done", reason: "toolUse", message: response });
+					stream.end();
+				});
+				return stream;
+			}
 			if (holdNext && !options?.signal?.aborted) {
 				holdNext = false;
 				release = finish;
@@ -50,6 +62,7 @@ export default function rpcFixture(pi: ExtensionAPI): void {
 		description: "Control the local RPC fixture",
 		handler: async (args) => {
 			if (args.trim() === "hold") holdNext = true;
+			if (args.trim() === "tool") toolNext = true;
 			if (args.trim() === "release") release?.();
 		},
 	});

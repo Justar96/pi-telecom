@@ -49,12 +49,19 @@ const TOOL_PARAMETERS = Type.Object({
 				"Project-relative paths or globs. claim/release: what to reserve (an absolute path into a worktree claims it there only). send/ask without `to`: reach whoever claims or last changed them. broadcast: what it is about.",
 		}),
 	),
+	interrupt: Type.Optional(Type.Boolean({ description: "send: false holds it until the recipient's current run ends (progress updates, FYIs); default true." })),
 	timeoutSec: Type.Optional(Type.Number({ description: "ask: seconds to wait (default 300; with wait false, 1800)." })),
 	wait: Type.Optional(Type.Boolean({ description: "ask: false returns at once; the answer arrives later as a message." })),
 	queue: Type.Optional(Type.Boolean({ description: "claim: wait in line for a held @lock; you get it, and are woken, when it frees." })),
-	waitingFor: Type.Optional(
-		Type.Array(Type.String(), { description: "status: callsigns you are blocked on; you are woken when one finishes a run or leaves." }),
+	pid: Type.Optional(
+		Type.Integer({ description: "claim: keep these claims while this process runs (a background build or test); released when it exits." }),
 	),
+	waitingFor: Type.Optional(
+		Type.Array(Type.String(), {
+			description: "status: callsigns you are blocked on; you are woken when one finishes a run or leaves. Declare once: it ends by itself when you get to work after hearing from them; [] clears it.",
+		}),
+	),
+	unblocks: Type.Optional(Type.Boolean({ description: "send/reply: true when this is what the recipient waits for; it ends their wait on you at once." })),
 	scope: Type.Optional(
 		StringEnum(["project", "machine"] as const, { description: 'board/broadcast: "project" (default) or "machine".' }),
 	),
@@ -106,7 +113,7 @@ export const TOOL_SPEC = {
 	promptGuidelines: [
 		"When 📡 telecom shows other agents in this project: claim an area before a large change and release it after; re-read a file a peer changed before editing it; reply to a peer's ask promptly (they are blocked).",
 		"Message peers only for real coordination (requests, handoffs, shared-interface changes) — no acknowledgements; each message costs the recipient a turn.",
-		"Broadcast only what every agent must act on, with `paths` when it is about files. Keep `status` to one line naming your task; `send` progress and results to whoever needs them.",
+		"Broadcast only what every agent must act on, with `paths` when it is about files. Keep `status` to one line naming your task; `send` results and requests to whoever needs them, and progress updates and FYIs with `interrupt: false`.",
 		"To hear when a peer's long job ends, ask with `wait: false` (the answer arrives as a message and wakes you), not a long `timeoutSec` or a polling loop.",
 		'Take turns on a shared resource (build, test runner, port) with a lock claim such as "@cargo" (queue: true waits in line), and say whom you wait for with status waitingFor, instead of negotiating leases in messages.',
 	],

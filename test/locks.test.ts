@@ -490,7 +490,7 @@ test("locks: claiming again after the claim expired is a new claim, not a renewa
 	assert.ok((published(a)?.claims[0]?.since ?? 0) > first.since, "a new since");
 });
 
-test("declared waits: status waitingFor shows on the board, refuses unknown names with the choices, and a status without it clears it", async () => {
+test("declared waits: status waitingFor shows on the board, refuses unknown names with the choices, and a status without it keeps it, until waitingFor: [] clears it", async () => {
 	const proj = makeProject("p-wait-status");
 	const a = await session(proj);
 	const b = await session(proj);
@@ -502,12 +502,16 @@ test("declared waits: status waitingFor shows on the board, refuses unknown name
 	const set = await a.tool({ action: "status", message: "wiring the cache", waitingFor: ["bravo", "@charlie", "bravo"] });
 	assert.ok(!set.isError, set.text);
 	assert.match(set.text, /waiting for bravo, charlie\. You are woken when one of them finishes a run/);
+	assert.match(set.text, /The wait ends by itself when one sends you a message that unblocks you, or you get to work after hearing from them; status keeps it/);
 	assert.deepEqual(set.details.waitingFor, ["bravo", "charlie"]);
 	assert.deepEqual(published(a)?.blockedOn, [b.id, c.id]);
 	assert.deepEqual(published(a)?.waitingOn, [], "declared waits are not asks: the ask graph is untouched");
 	assert.match((await b.tool({ action: "board" })).text, /• alpha [^\n]*\n\s+task: wiring the cache[^\n]*\n\s+waiting for: you, charlie/);
 	assert.match((await a.tool({ action: "status" })).text, /waiting for bravo, charlie/);
-	const cleared = await a.tool({ action: "status", message: "now the docs" });
+	const kept = await a.tool({ action: "status", message: "now the docs" });
+	assert.match(kept.text, /still waiting for bravo, charlie/);
+	assert.deepEqual(published(a)?.blockedOn, [b.id, c.id]);
+	const cleared = await a.tool({ action: "status", message: "now the docs", waitingFor: [] });
 	assert.match(cleared.text, /no longer waiting for anyone/);
 	assert.equal(published(a)?.blockedOn, undefined);
 });
@@ -525,24 +529,24 @@ test("declared waits wake the waiter when the teammate finishes its run, and end
 	assert.match(woke?.content ?? "", /📡 bravo finished its run \(task: run the full test suite\) — you were waiting for them/);
 	assert.deepEqual(woke?.options, { triggerTurn: true });
 	assert.deepEqual(published(a)?.blockedOn, [b.id, c.id], "a finished run is news, not the end of the wait");
-	await c.tool({ action: "send", to: "alpha", message: "the schema is done" });
+	await c.tool({ action: "send", to: "alpha", message: "the schema is done", unblocks: true });
 	await eventually(() => assert.deepEqual(published(a)?.blockedOn, [b.id]));
 	await b.stop();
 	await eventually(() => assert.ok(a.sentOf("telecom-message").some((m) => /📡 bravo left — you were waiting for them/.test(m.content))));
 	await eventually(() => assert.equal(published(a)?.blockedOn, undefined));
 });
 
-test("declared waits: a teammate's new task wakes no one; its status says who waits on it, and its message ends the wait", async () => {
+test("declared waits: a teammate's new task wakes no one; its status says who waits on it, and a message that says so ends the wait", async () => {
 	const proj = makeProject("p-wait-task");
 	const a = await session(proj);
 	const b = await session(proj);
 	await b.prompt("build the schema");
 	await a.tool({ action: "status", message: "waiting for the schema", waitingFor: ["bravo"] });
 	const progress = await b.tool({ action: "status", message: "schema half done, now the indexes" });
-	assert.match(progress.text, /alpha waits for you\. If this is what it needs, tell it: telecom\(\{ action: "send", to: "alpha", message: "…" \}\)/);
+	assert.match(progress.text, /alpha waits for you\. If this is what it needs, tell it: telecom\(\{ action: "send", to: "alpha", message: "…", unblocks: true \}\)/);
 	await sleep(200); // several team refreshes
 	assert.equal(a.sentOf("telecom-message").length, 0, "progress is not a wake-up");
-	await b.tool({ action: "send", to: "alpha", message: "schema is ready" });
+	await b.tool({ action: "send", to: "alpha", message: "schema is ready", unblocks: true });
 	await eventually(() => assert.equal(published(a)?.blockedOn, undefined));
 	const quiet = await b.tool({ action: "status", message: "the indexes" });
 	assert.doesNotMatch(quiet.text, /waits for you/, "nobody waits any more");
@@ -643,17 +647,17 @@ test("board: a teammate many depend on shows as one: the asks it owes, and who w
 	await eventually(() => assert.equal(published(a)?.asksOwed, 1), 2000);
 });
 
-test("status: a task longer than one line's worth is cut, and the result says so and why", async () => {
+test("status: a long task is kept whole for peers and is not reported back as a mistake", async () => {
 	const proj = makeProject("p-status-long");
 	const a = await session(proj);
 	await session(proj);
-	const res = await a.tool({ action: "status", message: `Phase1 PASS: SBF/IDL/client/CU/SDK ${"evidence ".repeat(30)}` });
-	assert.match(res.text, /cut to 160 characters: status is the one line peers see as your task/);
-	const short = await a.tool({ action: "status", message: "building the SDK" });
-	assert.doesNotMatch(short.text, /cut to/);
+	const task = `Phase1 PASS: SBF/IDL/client/CU/SDK ${"evidence ".repeat(20)}`.trim();
+	const res = await a.tool({ action: "status", message: task });
+	assert.ok(res.text.includes(task), "peers see the whole task");
+	assert.doesNotMatch(res.text, /cut to/);
 });
 
-test("declared wait cycles are flagged on the board, and each agent on one is told once, passively", async () => {
+test("declared wait cycles are flagged on the board, and the declaring agent is told at once, as a fact", async () => {
 	const proj = makeProject("p-wait-cycle");
 	const a = await session(proj);
 	const b = await session(proj);
@@ -662,13 +666,10 @@ test("declared wait cycles are flagged on the board, and each agent on one is to
 	await a.tool({ action: "status", message: "need bravo's schema", waitingFor: ["bravo"] });
 	const closing = await b.tool({ action: "status", message: "need alpha's API", waitingFor: ["alpha"] });
 	assert.match(closing.text, /closes a wait cycle: bravo → alpha → bravo/);
-	assert.match(closing.text, /telecom\(\{ action: "send", to: "alpha", message: "…" \}\)/);
-	await eventually(() => assert.equal(cycleNotes(a).length, 1));
-	assert.match(cycleNotes(a)[0]?.content ?? "", /Wait cycle: alpha → bravo → alpha/);
-	assert.equal(cycleNotes(a)[0]?.options, undefined, "a cycle is information: it never wakes an idle agent");
+	assert.match(closing.text, /telecom\(\{ action: "send", to: "alpha", message: "…", unblocks: true \}\)/);
 	assert.match((await c.tool({ action: "board" })).text, /⚠ Wait cycle: alpha → bravo → alpha/);
-	await sleep(150); // several team refreshes
-	assert.equal(cycleNotes(a).length, 1, "told once");
+	await sleep(150); // several team refreshes: both were busy-or-just-idle, so this is no stall yet
+	assert.equal(cycleNotes(a).length, 0, "a cycle is told only once everyone on it has sat idle (test/waits.test.ts)");
 	assert.equal(cycleNotes(b).length, 0, "bravo heard it in its own status result");
 });
 

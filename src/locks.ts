@@ -133,7 +133,8 @@ export function lockLines(records: readonly Presence[], viewerId: string, now: n
 		for (const q of r.queued ?? []) names.add(resourceKey(q.pattern));
 	}
 	return [...names].sort().map((name) => {
-		const holders = holdsOf(name, records, now).map((h) => (h.peer.id === viewerId ? "you" : h.peer.callsign));
+		// A lock kept for a process says so: the board's reader learns when it frees without asking.
+		const holders = holdsOf(name, records, now).map((h) => `${h.peer.id === viewerId ? "you" : h.peer.callsign}${h.claim.pid ? `, while pid ${h.claim.pid} runs` : ""}`);
 		const line = lineFor(name, records).map((w) => (w.peer.id === viewerId ? "you" : w.peer.callsign));
 		return `${name} — ${holders.length > 0 ? [...new Set(holders)].join(", ") : "free"}${line.length > 0 ? ` (queue: ${line.join(", ")})` : ""}`;
 	});

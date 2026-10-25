@@ -2,9 +2,10 @@
  * turns — what telecom does around each run of the agent: at the start, mark it busy, take the
  * task from the prompt and hand the model a team brief; while it runs, note the tool call it is
  * inside (the `step` peers see once a call runs long); before it settles, remind it of asks it
- * still owes an answer; once settled, mark it idle and deliver the change notices it was spared
- * mid-run.
+ * still owes an answer, and read the messages that could wait for the end of the run; once settled,
+ * mark it idle and deliver the change notices it was spared mid-run.
  */
+import type { SessionBoundaryDraft } from "@earendil-works/pi-coding-agent";
 import type { Inbound } from "./inbound.ts";
 import { adoptRepo } from "./lifecycle.ts";
 import { LOG_HINT } from "./log.ts";
@@ -83,31 +84,34 @@ export function registerTurns(rt: Runtime, inbound: Inbound): void {
 
 	rt.on("agent_before_settle", (event) => {
 		if (!rt.self || event.outcome === "aborted" || !event.context.canContinue) return;
+		// Messages that could wait for the end of the run (`interrupt: false`) are read now, in the
+		// order they came, and the run goes on with them. Without a continuation they wait for
+		// `agent_settled`.
+		const entries: SessionBoundaryDraft[] = rt.deferredEntries();
 		const due = rt.ledger.inbound().filter((a) => !a.reminded);
-		if (due.length === 0) return;
-		for (const ask of due) ask.reminded = true;
-		const list = due.map((a) => `  ${a.id} from ${a.fromCallsign}${a.async ? " (not blocked)" : ""}: ${clip(a.text, 120)}`).join("\n");
-		// An ask made with `wait: false` blocks nobody, but its asker still counts on the reply.
-		const blocked = due.some((a) => !a.async);
-		const heading = blocked ? `${plural(due.length, "peer")} still blocked on your reply` : `${plural(due.length, "ask")} still waiting for your reply`;
-		const why = blocked ? `even "I can't help with that" unblocks them` : `even "I can't help with that" tells them where they stand`;
-		return {
-			entries: [
-				{
-					type: "custom_message",
-					customType: MESSAGE_TYPES.reminder,
-					content: `**📡 ${heading}**\n${list}\nAnswer each with telecom({ action: "reply", askId: "…", message: "…" }) before you stop — ${why}.`,
-					display: true,
-					details: { tone: "warning" } satisfies TelecomMessageDetails,
-				},
-			],
-			continue: true,
-		};
+		if (due.length > 0) {
+			for (const ask of due) ask.reminded = true;
+			const list = due.map((a) => `  ${a.id} from ${a.fromCallsign}${a.async ? " (not blocked)" : ""}: ${clip(a.text, 120)}`).join("\n");
+			// An ask made with `wait: false` blocks nobody, but its asker still counts on the reply.
+			const blocked = due.some((a) => !a.async);
+			const heading = blocked ? `${plural(due.length, "peer")} still blocked on your reply` : `${plural(due.length, "ask")} still waiting for your reply`;
+			const why = blocked ? `even "I can't help with that" unblocks them` : `even "I can't help with that" tells them where they stand`;
+			entries.push({
+				type: "custom_message",
+				customType: MESSAGE_TYPES.reminder,
+				content: `**📡 ${heading}**\n${list}\nAnswer each with telecom({ action: "reply", askId: "…", message: "…" }) before you stop — ${why}.`,
+				display: true,
+				details: { tone: "warning" } satisfies TelecomMessageDetails,
+			});
+		}
+		return entries.length > 0 ? { entries, continue: true } : undefined;
 	});
 
 	rt.on("agent_settled", () => {
 		if (!rt.self) return;
 		rt.setState(rt.self, "idle");
+		// Held messages the run could not continue with (it was aborted, or could not go on).
+		rt.deliverDeferred();
 		inbound.flushNotices(true);
 		rt.publish();
 		rt.updateStatus();

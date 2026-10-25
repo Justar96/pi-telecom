@@ -17,6 +17,7 @@ import { readConfig, type TelecomConfig } from "./config.ts";
 import { isResource, sameResource } from "./glob.ts";
 import { createAskLedger, type HeldMessage, WAITS_CAP } from "./ledger.ts";
 import { type LogEntry, type LogKind, TeamLog } from "./log.ts";
+import { callsignsOf } from "./locks.ts";
 import { type PlaceCache, sameRepo } from "./project.ts";
 import { MESSAGE_TYPES, type Paint, PLAIN, type TelecomMessageDetails } from "./render.ts";
 import {
@@ -43,10 +44,20 @@ const PLAIN_WIDGET_COLUMNS = 100;
 const PRESENCE_FAILURES_REPORTED = 3;
 /** `PI_TELECOM_MAX_WAKES` counts wake-ups over this rolling window. */
 const WAKE_WINDOW_MS = 60_000;
-/** Own task and claim notes as peers see them. */
-export const TASK_CAP = 160;
-/** Sessions this agent has talked with directly; they stay relevant in its briefs. */
+/**
+ * A task as peers read it (the wire parse cap is the same, `LIMITS.task`). Generous on purpose:
+ * agents write what they are doing in as many words as it takes, and telecom shortens it where
+ * space is short (briefs, widget); an older peer clips it to its own, smaller cap when it parses.
+ */
+export const TASK_CAP = 400;
+/** Sessions remembered as direct contacts, each with when it was last talked with. */
 const CONTACTS_CAP = 256;
+/**
+ * A teammate this agent messaged with (either way) this recently is about its work: its
+ * broadcasts concern it, and a brief describes the peer in full. Older contacts do not count: in a
+ * team where everyone has talked to everyone, "ever" made every peer near.
+ */
+export const CONTACT_NEAR_MS = 30 * 60_000;
 /**
  * A tool call that has run this long is published as this agent's `step`, so a sender learns that
  * a message waits for the call to end. Shorter calls are not: publishing each would rewrite the
@@ -76,6 +87,11 @@ const UNREAD_TEXT_CAP = 4_000;
 const LATER_CAP = 12;
 const LATER_FRESH_MS = 30 * 60_000;
 const LATER_LINE_CAP = 160;
+/**
+ * Direct messages held until this agent's run ends (`interrupt: false`). Past it the oldest is
+ * steered in at once rather than dropped: the sender said it could wait, not that it could vanish.
+ */
+const DEFERRED_CAP = 12;
 
 /**
  * How a message reaches the model (AGENTS.md, "Delivery to the model"). `wake` starts a turn when
@@ -85,6 +101,16 @@ const LATER_LINE_CAP = 160;
  */
 export type InjectMode = "wake" | "passive" | "wake-always" | "later";
 export type MessageDetails = TelecomMessageDetails & Record<string, unknown>;
+
+/** A peer's direct message as the model reads it (on arrival, or held until a run ends). `note`:
+ *  the line on a wait the sender did not end (`Runtime.stillWaitingNote`), judged at delivery. */
+function messageText(msg: HeldMessage, note = ""): { content: string; details: MessageDetails } {
+	const human = msg.human ? " (from their human)" : "";
+	return {
+		content: `**📡 Message from ${msg.fromCallsign}${human}**\n\n${msg.text}\n\n(Reply only if needed: action "send", to "${msg.fromCallsign}".)${note}`,
+		details: { from: msg.from, fromCallsign: msg.fromCallsign, id: msg.id, tone: "accent" },
+	};
+}
 
 export class Runtime {
 	readonly pi: ExtensionAPI;
@@ -149,6 +175,8 @@ export class Runtime {
 	private later: { at: number; head: string; body: string; content: string }[] = [];
 	/** `later` messages dropped past `LATER_CAP`, oldest first. */
 	private laterDropped = 0;
+	/** Direct messages sent with `interrupt: false`, held until the current run ends (`takeDeferred`). */
+	private deferred: HeldMessage[] = [];
 	/** Wake-ups no model turn has answered yet, and how often they were re-sent (`checkWakes`). */
 	private unread: {
 		items: Array<{ at: number; content: string; from?: string }>;
@@ -362,7 +390,7 @@ export class Runtime {
 	nextBrief(me: Presence, peers: readonly Presence[] = this.presentNow()): { text: string | null; details: MessageDetails } {
 		const brief = renderBrief(me, peers, this.briefState, {
 			paths: this.awareness.focusPaths(),
-			contacts: new Set(this.contacts.keys()),
+			contacts: new Set([...this.contacts].filter(([, at]) => Date.now() - at <= CONTACT_NEAR_MS).map(([id]) => id)),
 		});
 		this.briefState = brief.state;
 		return {
@@ -398,11 +426,12 @@ export class Runtime {
 
 	// ------------------------------------------------------------------ claims
 
-	/** Drop `patterns` from this agent's claims and tell every peer that was held back by them. */
-	releaseClaims(me: Presence, patterns: readonly string[]): string[] {
+	/** Drop `patterns` from this agent's claims and tell every peer that was held back by them.
+	 *  `why`, when the agent did not ask for it, goes in the log line. */
+	releaseClaims(me: Presence, patterns: readonly string[], why?: string): string[] {
 		me.claims = me.claims.filter((c) => !patterns.includes(c.pattern));
 		this.publish();
-		this.logEntry("release", `released ${patterns.join(", ")}`, patterns);
+		this.logEntry("release", `released ${patterns.join(", ")}${why ? `: ${why}` : ""}`, patterns);
 		const told = this.tellReleased(me, patterns);
 		this.updateStatus();
 		return told;
@@ -531,13 +560,70 @@ export class Runtime {
 	 * then exactly as they would have been on arrival.
 	 */
 	injectMessage(msg: HeldMessage): boolean {
-		const human = msg.human ? " (from their human)" : "";
-		return this.inject(
-			MESSAGE_TYPES.message,
-			`**📡 Message from ${msg.fromCallsign}${human}**\n\n${msg.text}\n\n(Reply only if needed: action "send", to "${msg.fromCallsign}".)`,
-			{ from: msg.from, fromCallsign: msg.fromCallsign, id: msg.id, tone: "accent" },
-			"wake",
+		const { content, details } = messageText(msg, this.stillWaitingNote(msg.from));
+		return this.inject(MESSAGE_TYPES.message, content, details, "wake");
+	}
+
+	/** Is a run going on? Unknown (no context yet) counts as not busy: deliver rather than hold. */
+	isBusy(): boolean {
+		return this.ctx?.isIdle() === false;
+	}
+
+	/**
+	 * Hold a message its sender said could wait (`interrupt: false`) until the run ends, in the
+	 * order it came. Over the cap the oldest is steered in now: a message is never dropped.
+	 */
+	holdDeferred(msg: HeldMessage): void {
+		this.deferred.push(msg);
+		const oldest = this.deferred.length > DEFERRED_CAP ? this.deferred.shift() : undefined;
+		if (oldest) this.injectMessage(oldest);
+	}
+
+	/** What is held for the end of this run, in arrival order; nothing is held after this. */
+	takeDeferred(): HeldMessage[] {
+		const held = this.deferred;
+		this.deferred = [];
+		return held;
+	}
+
+	/**
+	 * Held messages as `agent_before_settle` entries: the run goes on with them instead of ending.
+	 * The same text as a message delivered on arrival.
+	 */
+	deferredEntries(): Array<{ type: "custom_message"; customType: string; content: string; display: true; details: MessageDetails }> {
+		return this.takeDeferred().map((msg) => ({ type: "custom_message", customType: MESSAGE_TYPES.message, display: true, ...messageText(msg, this.stillWaitingNote(msg.from)) }));
+	}
+
+	/**
+	 * The run ended without continuing (aborted, or it could not): deliver what was held as an
+	 * idle agent gets a message. All but the last are appended; the last starts the one turn that
+	 * reads them (wake-limited, and owed a reply like any wake-up).
+	 */
+	deliverDeferred(): void {
+		const held = this.takeDeferred();
+		held.forEach((msg, i) => {
+			const { content, details } = messageText(msg, this.stillWaitingNote(msg.from));
+			this.inject(MESSAGE_TYPES.message, content, details, i === held.length - 1 ? "wake" : "passive");
+		});
+	}
+
+	/**
+	 * A line for the end of a message or answer from `fromId`, when this agent still declares it
+	 * waits for that teammate: the message did not say it ends the wait (`unblocks`), so the wait
+	 * stays until the agent gets to work (`waiting.ts`), and it is told so, with the call to drop it now. Empty
+	 * otherwise.
+	 */
+	stillWaitingNote(fromId: string): string {
+		const me = this.self;
+		if (!me?.blockedOn?.includes(fromId)) return "";
+		const names = callsignsOf(me.blockedOn, this.peers, me.id);
+		const rest = callsignsOf(
+			me.blockedOn.filter((id) => id !== fromId),
+			this.peers,
+			me.id,
 		);
+		const sender = callsignsOf([fromId], this.peers, me.id)[0];
+		return `\n\n(Still waiting for ${names.join(", ")}: the wait on ${sender} ends when you get to work, or now with telecom({ action: "status", waitingFor: ${JSON.stringify(rest)} }).)`;
 	}
 
 	/**
@@ -562,8 +648,20 @@ export class Runtime {
 		return parts.join("\n\n");
 	}
 
-	/** Leaving: what is still held goes to pi's queue for the next run, as it is. */
+	/**
+	 * Leaving (also a reload, which keeps pi's queue): what is still held goes to pi's queue for
+	 * the next run, as it is. Deferred messages go the same way, since no run is left to end.
+	 */
 	flushLater(): void {
+		for (const msg of this.takeDeferred()) {
+			try {
+				const { content, details } = messageText(msg, this.stillWaitingNote(msg.from));
+				this.pi.sendMessage({ customType: MESSAGE_TYPES.message, content, display: true, details }, { deliverAs: "nextTurn" });
+			} catch (error) {
+				this.report("deliver", error);
+				return;
+			}
+		}
 		const held = this.later;
 		this.later = [];
 		this.laterDropped = 0;

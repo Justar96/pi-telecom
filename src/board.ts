@@ -21,6 +21,13 @@ import type { Presence } from "./transport.ts";
 import { ago, clip, elapsed, plural, shortId } from "./util.ts";
 
 const RECENT_SHOWN = 4;
+/**
+ * A brief shows at most this many of a peer's claim patterns (the board shows all): one agent
+ * claiming every crate of a workspace made its line, repeated in each brief, the longest of all.
+ */
+const BRIEF_CLAIMS_SHOWN = 6;
+/** A task is told in a brief up to this long; statuses may run longer, and the board shows them whole. */
+const BRIEF_TASK_SHOWN = 140;
 /** The board lists at most this many agents; a result the model reads must stay bounded. */
 const MAX_LISTED = 25;
 /** Family chains are short; this bounds a walk over hostile records. */
@@ -31,6 +38,8 @@ const DESCRIBE_ALL_UP_TO = 3;
 const MAX_DESCRIBED = 6;
 /** An idle peer is shown with how long it has been idle from this long on; "idle 3s" says nothing. */
 const IDLE_SHOWN_AFTER_MS = 60_000;
+/** A teammate's task, as the board's "Waiting on you" line quotes it. */
+const WAITER_TASK_SHOWN = 60;
 
 function label(peer: Presence, viewer: Presence, peers: readonly Presence[]): string {
 	const name = peer.name && peer.name !== peer.callsign ? ` "${clip(peer.name, 30)}"` : "";
@@ -103,19 +112,40 @@ export function idleFor(peer: Presence, now = Date.now()): string | null {
 	return elapsed(peer.stateSince, now);
 }
 
+/** A task as a brief tells it: the board has it whole, so a long one points there. */
+function briefTask(task: string): string {
+	return task.length > BRIEF_TASK_SHOWN ? `${clip(task, BRIEF_TASK_SHOWN)} (full: telecom board)` : task;
+}
+
+/**
+ * Claim patterns as a brief lists them: the first `BRIEF_CLAIMS_SHOWN`, then how many more there
+ * are and where to see them. Only the display is cut; `BriefState` keeps every claim, since updates
+ * diff them.
+ */
+function claimsText(patterns: readonly string[], separator = ", "): string {
+	if (patterns.length <= BRIEF_CLAIMS_SHOWN) return patterns.join(separator);
+	return `${patterns.slice(0, BRIEF_CLAIMS_SHOWN).join(separator)}${separator}+${patterns.length - BRIEF_CLAIMS_SHOWN} more (telecom board)`;
+}
+
 /** One peer, as a block of lines, as `viewer` sees it. `peers` name a subagent's parent. `live`
- *  (the board) adds how long it has been busy in a step or idle (`liveState`). */
+ *  (the board) adds how long it has been busy in a step or idle (`liveState`). `brief` caps the
+ *  claims line (`BRIEF_CLAIMS_SHOWN`); the board lists them all. */
 function describePeer(
 	peer: Presence,
 	viewer: Presence,
-	opts: { self?: boolean; now?: number; peers?: readonly Presence[]; waits?: boolean; live?: boolean } = {},
+	opts: { self?: boolean; now?: number; peers?: readonly Presence[]; waits?: boolean; live?: boolean; brief?: boolean } = {},
 ): string[] {
 	const now = opts.now ?? Date.now();
 	const lines: string[] = [];
-	const recent = [...peer.recent].sort((a, b) => b.at - a.at).slice(0, RECENT_SHOWN);
 	// Both walk up from the same files: one call's worth of caching, so no state outlives it.
 	const cache: PlaceCache = new Map();
-	const places = recent.map((r) => ({ r, place: placeOf(r.path, peer, cache) }));
+	// A path in no checkout of the repository (a scratch script, shared notes) says nothing about
+	// this agent's work here, and would take a slot from a file that does.
+	const places = [...peer.recent]
+		.sort((a, b) => b.at - a.at)
+		.map((r) => ({ r, place: placeOf(r.path, peer, cache) }))
+		.filter((p) => p.place !== null)
+		.slice(0, RECENT_SHOWN);
 	const { checkout: working, lane, branch: branchName } = workplace(peer, cache);
 	const where =
 		working === viewer.projectRoot ? "" : sameRepo(lane, viewer) ? `  in ${laneName(lane)}` : `  in ${working}`;
@@ -134,7 +164,7 @@ function describePeer(
 		state += `, waiting on ${on.join(", ")}${peer.waitingSince ? ` (asked ${ago(peer.waitingSince, now)})` : ""}`;
 	}
 	lines.push(`• ${label(peer, viewer, opts.peers ?? [])} [${state}]${branch}${where}${you}  id ${shortId(peer.id)}`);
-	if (peer.task) lines.push(`    task: ${clip(peer.task, 140)}${peer.taskAt ? ` (${ago(peer.taskAt, now)})` : ""}`);
+	if (peer.task) lines.push(`    task: ${opts.brief ? briefTask(peer.task) : peer.task}${peer.taskAt ? ` (${ago(peer.taskAt, now)})` : ""}`);
 	// Declared waits and places in line for a lock: what holds this agent up.
 	if (peer.blockedOn?.length) lines.push(`    waiting for: ${callsignsOf(peer.blockedOn, opts.peers ?? [], viewer.id).join(", ")}`);
 	// Who waits on it, on the board: a teammate many wait on is where the team stalls.
@@ -148,15 +178,22 @@ function describePeer(
 	if (claims.length > 0) {
 		// Claims made together share their note: say it once per group, not once per path.
 		const byNote = new Map<string, string[]>();
+		let room = opts.brief ? BRIEF_CLAIMS_SHOWN : claims.length;
 		for (const c of claims) {
 			const note = c.note ? clip(c.note, 60) : "";
-			byNote.set(note, [...(byNote.get(note) ?? []), claimShown(c)]);
+			const group = byNote.get(note) ?? [];
+			byNote.set(note, group);
+			if (room-- > 0) group.push(claimShown(c));
 		}
+		const groups = [...byNote].filter(([, patterns]) => patterns.length > 0);
+		const hidden = claims.length - groups.reduce((n, [, patterns]) => n + patterns.length, 0);
 		lines.push(
-			`    claims: ${[...byNote].map(([note, patterns]) => `${patterns.join(", ")}${note ? ` — ${note}` : ""}`).join("; ")}`,
+			`    claims: ${groups.map(([note, patterns]) => `${patterns.join(", ")}${note ? ` — ${note}` : ""}`).join("; ")}${
+				hidden > 0 ? `; +${hidden} more (telecom board)` : ""
+			}`,
 		);
 	}
-	if (recent.length > 0) {
+	if (places.length > 0) {
 		// Paths relative to the checkout they lie in, named once where it is not the one shown above.
 		const shown = places.map(({ r, place }) => {
 			const path = place ? displayPath(r.path, place.checkout) : r.path;
@@ -205,6 +242,16 @@ export function renderBoard(input: BoardInput): string {
 		const names = callsignsOf(cycle, team, "");
 		lines.push("", `⚠ Wait cycle: ${names.join(" → ")} — each declared it waits for the next, so none of them moves until one goes ahead.`);
 	}
+	// Who declared it waits for this agent, longest first: where the team is held up on it.
+	const waiters = others
+		.filter((p) => sameRepo(p, self) && p.blockedOn?.includes(self.id))
+		.sort((a, b) => (a.blockedSince ?? Infinity) - (b.blockedSince ?? Infinity))
+		.slice(0, MAX_LISTED);
+	if (waiters.length > 0) {
+		const now = Date.now();
+		const entries = waiters.map((p) => `${p.callsign}${p.blockedSince ? ` ${elapsed(p.blockedSince, now)}` : ""}${p.task ? ` — ${clip(p.task, WAITER_TASK_SHOWN)}` : ""}`);
+		lines.push("", `Waiting on you: ${entries.join("; ")}`);
+	}
 	if (input.inboundAsks.length > 0) {
 		lines.push("", `Unanswered asks (a peer is blocked waiting — answer with action "reply"):`);
 		for (const ask of input.inboundAsks) {
@@ -252,7 +299,7 @@ export interface BriefState {
 export interface Focus {
 	/** The files this agent works with (canonical paths in its own checkout). */
 	paths: ReadonlySet<string>;
-	/** Sessions this agent has messaged or heard from directly. */
+	/** Sessions this agent messaged or heard from directly lately (`CONTACT_NEAR_MS`). */
 	contacts: ReadonlySet<string>;
 }
 
@@ -281,6 +328,14 @@ function yourLocks(self: Presence, all: readonly Presence[], now: number): strin
 		.filter((l) => l.line.length > 0)
 		.map((l) => `${l.name} (queue: ${l.line.map((w) => w.peer.callsign).join(", ")})`);
 	return lines.length > 0 ? `Your locks others wait for: ${lines.join("; ")}. Release each as soon as you are done.` : null;
+}
+
+/** Teammates that declared they wait for this agent: worth knowing, to give them what they need. */
+function waitingOnYou(self: Presence, team: readonly Presence[]): string | null {
+	const line = lineOf(self, team);
+	const names = team.filter((p) => !line.has(p.id) && p.blockedOn?.includes(self.id)).map((p) => p.callsign);
+	if (names.length === 0) return null;
+	return `Waiting on you: ${names.join(", ")}. Give each what it needs: telecom({ action: "send", to: "${names[0]}", message: "…", unblocks: true }).`;
 }
 
 /** One entry of a brief: a peer, and the subagents folded into it. */
@@ -362,7 +417,7 @@ function rosterEntry(unit: Unit, now: number, waits: readonly string[] = []): st
 	const claims = unitClaims(unit, now);
 	const folded = unit.subagents.length > 0 ? ` +${plural(unit.subagents.length, "subagent")}` : "";
 	return `${unit.peer.callsign} [${unit.peer.state}]${unit.peer.task ? ` ${clip(unit.peer.task, 40)}` : ""}${folded}${
-		claims.length > 0 ? ` (claims ${claims.join(", ")})` : ""
+		claims.length > 0 ? ` (claims ${claimsText(claims)})` : ""
 	}${waits.length > 0 ? ` — waiting for ${waits.join(", ")}` : ""}`;
 }
 
@@ -393,14 +448,14 @@ function stateOf(units: readonly Unit[], now: number, described: ReadonlySet<str
 }
 
 function describeUnit(unit: Unit, self: Presence, peers: readonly Presence[], now: number): string[] {
-	const lines = describePeer(unit.peer, self, { now, peers });
+	const lines = describePeer(unit.peer, self, { now, peers, brief: true });
 	if (unit.subagents.length === 0) return lines;
 	const subagents = unit.subagents.map((s) => `${s.callsign} [${s.state}]${s.task ? ` ${clip(s.task, 50)}` : ""}`);
 	lines.push(`    subagents: ${subagents.join("; ")}`);
 	const claims = unit.subagents.flatMap((s) =>
 		liveClaims(s, now).map((c) => `${claimShown(c)}${c.note ? ` — ${clip(c.note, 60)}` : ""} (${s.callsign})`),
 	);
-	if (claims.length > 0) lines.push(`    subagent claims: ${claims.join("; ")}`);
+	if (claims.length > 0) lines.push(`    subagent claims: ${claimsText(claims, "; ")}`);
 	return lines;
 }
 
@@ -456,6 +511,8 @@ export function renderBrief(
 		);
 		const waitedFor = yourLocks(self, all, now);
 		if (waitedFor) lines.push(waitedFor);
+		const waiters = waitingOnYou(self, team);
+		if (waiters) lines.push(waiters);
 		// An agent put to work by a peer's message (no prompt of its own) has no task to show, and
 		// its teammates' briefs then say nothing about what it does.
 		if (!self.task) {
@@ -509,7 +566,7 @@ export function renderBrief(
 			// stops an edit inside its claims, and a claim over this agent's files makes it near.
 			// A release of a claim this agent was told about is news: it may be keeping out of it.
 			const dropped = before.claims.filter((c) => !after.claims.includes(c));
-			if (dropped.length) changes.push(`• ${name} released ${dropped.join(", ")}`);
+			if (dropped.length) changes.push(`• ${name} released ${claimsText(dropped)}`);
 			held.set(peer.id, {
 				task: before.task,
 				claims: before.claims.filter((c) => after.claims.includes(c)),
@@ -520,7 +577,7 @@ export function renderBrief(
 			continue;
 		}
 		const newTask = before.task !== after.task && after.task !== "";
-		if (newTask) changes.push(`• ${name} is now on: ${clip(after.task, 140)}`);
+		if (newTask) changes.push(`• ${name} is now on: ${briefTask(after.task)}`);
 		// Where its claims bind and its copies of files lie: the full brief said, so a move is news.
 		const newLane = before.lane !== after.lane;
 		if (newLane) changes.push(`• ${name} now works ${after.lane}`);
@@ -530,8 +587,8 @@ export function renderBrief(
 		}
 		const added = after.claims.filter((c) => !before.claims.includes(c));
 		const dropped = before.claims.filter((c) => !after.claims.includes(c));
-		if (added.length) changes.push(`• ${name} claimed ${added.join(", ")}`);
-		if (dropped.length) changes.push(`• ${name} released ${dropped.join(", ")}`);
+		if (added.length) changes.push(`• ${name} claimed ${claimsText(added)}`);
+		if (dropped.length) changes.push(`• ${name} released ${claimsText(dropped)}`);
 		const inLine = after.queued.filter((q) => !(before.queued ?? []).includes(q));
 		if (inLine.length) changes.push(`• ${name} queued for ${inLine.map((q) => lockHolderText(q, self, all, now)).join(", ")}`);
 		// A new declared wait is news; one cleared is not (the agent is simply back at work).
@@ -544,7 +601,7 @@ export function renderBrief(
 	for (const [id, before] of previous.peers) {
 		if (current.has(id)) continue;
 		const free = [...before.holders.keys()].filter((c) => !present.has(before.holders.get(c) ?? id)).sort();
-		changes.push(`• ${before.callsign} left${free.length ? ` (its claims ${free.join(", ")} are free)` : ""}`);
+		changes.push(`• ${before.callsign} left${free.length ? ` (its claims ${claimsText(free)} are free)` : ""}`);
 	}
 	// The comparison is done, so `current` becomes the new state as is: building it again would walk
 	// every unit's checkouts and read its branch a second time.

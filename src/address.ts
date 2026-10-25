@@ -116,12 +116,14 @@ export function targetName(target: Target & { ok: true }): string {
 	return target.via ? `${target.peer.callsign}, which ${target.via}` : target.peer.callsign;
 }
 
-/** When a message to `peer` reaches its model, as its sender is told. */
-export function stateHint(peer: Presence, self: Presence, peers: readonly Presence[]): string {
+/** When a message to `peer` reaches its model, as its sender is told (`deferred`: sent with `interrupt: false`). */
+export function stateHint(peer: Presence, self: Presence, peers: readonly Presence[], deferred = false): string {
 	if (Date.now() - peer.heartbeatAt > UNRESPONSIVE_MS) {
 		return `unresponsive since ${ago(peer.heartbeatAt)} — it waits in their inbox until they are back`;
 	}
 	if (peer.state === "busy") {
+		// `interrupt: false`: held by the recipient's runtime, whatever it is inside of.
+		if (deferred) return `busy — it reaches them when their current run ends${owedHint(peer)}`;
 		if (peer.waitingOn?.length) {
 			const on = peer.waitingOn.map((id) => (id === self.id ? "you" : (peers.find((p) => p.id === id)?.callsign ?? shortId(id))));
 			if (on.includes("you")) return `busy waiting on your answer — an ask from you reaches it now (a wait cycle), anything else after you answer`;

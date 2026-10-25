@@ -14,9 +14,9 @@ import { type AskOutcome, closesCycle, type InboundAsk, waitedOn } from "./ledge
 import { broadcastText, entryTouches, LOG_SHOWN, renderLog } from "./log.ts";
 import { callsignsOf, holdsOf, lineFor } from "./locks.ts";
 import { displayPath, isWithin, laneIn, laneName, workingCheckout } from "./project.ts";
-import { OFF_TEXT, type Runtime, TASK_CAP } from "./runtime.ts";
+import { OFF_TEXT, type Runtime } from "./runtime.ts";
 import { deliveryReport, fail, ok, TOOL_SPEC, type ToolAction, type ToolParams, type ToolResult } from "./tool.ts";
-import { BLOCKED_CAP, type Presence, QUEUED_CAP, type Transport } from "./transport.ts";
+import { BLOCKED_CAP, type Claim, type Envelope, jobRuns, type Presence, QUEUED_CAP, readStartTicks, type Transport } from "./transport.ts";
 import { ago, clip, plural, setBounded } from "./util.ts";
 import type { Waiting } from "./waiting.ts";
 
@@ -125,7 +125,8 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 
 	/**
 	 * Set the task peers see, and whom this agent waits for (`waitingFor`, published as `blockedOn`).
-	 * Setting status without `waitingFor` clears the wait: a new status is a new situation.
+	 * Waits outlive a new status (progress reports were dropping waits their agents still had), and
+	 * end by themselves (`waiting.ts`): `waitingFor` replaces them, `[]` clears them.
 	 */
 	function statusAction({ me, params, message }: ActionCall): ToolResult {
 		const declaring = params.waitingFor !== undefined;
@@ -145,30 +146,39 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 		}
 		const waited = (me.blockedOn?.length ?? 0) > 0;
 		if (message) rt.setTask(me, message, true);
-		if (ids.length > 0) me.blockedOn = ids;
-		else delete me.blockedOn;
-		const cycle = waiting.declare(peers);
+		if (declaring) {
+			// The age of a wait is of the set, so the same set declared again keeps it.
+			const same = ids.length === (me.blockedOn?.length ?? 0) && ids.every((id) => me.blockedOn?.includes(id));
+			if (ids.length > 0) {
+				me.blockedOn = ids;
+				if (!same || me.blockedSince === undefined) me.blockedSince = Date.now();
+			} else {
+				delete me.blockedOn;
+				delete me.blockedSince;
+			}
+		}
+		// Declaring resets the stall timers: only when the agent says something about its waits.
+		const cycle = declaring ? waiting.declare(peers) : null;
 		rt.publish();
-		const names = callsignsOf(ids, peers, me.id);
+		const kept = me.blockedOn ?? [];
+		const names = callsignsOf(kept, peers, me.id);
 		const task = message ? `peers now see ${me.callsign}: ${me.task}` : `your task stays: ${me.task ?? "(none)"}`;
-		// Models given room report results here; the line is what teammates see on the board.
-		const clipped =
-			message.length > TASK_CAP
-				? ` (cut to ${TASK_CAP} characters: status is the one line peers see as your task, so name what you are on, and send results to whoever needs them)`
-				: "";
-		const waits =
-			ids.length > 0
-				? ` · waiting for ${names.join(", ")}. You are woken when one of them finishes a run or leaves; a message from one ends your wait on it. Setting status without waitingFor clears it.`
+		const waits = declaring
+			? ids.length > 0
+				? ` · waiting for ${names.join(", ")}. You are woken when one of them finishes a run or leaves. The wait ends by itself when one sends you a message that unblocks you, or you get to work after hearing from them; status keeps it.`
 				: waited
 					? " · no longer waiting for anyone"
-					: "";
+					: ""
+			: kept.length > 0 && message
+				? ` · still waiting for ${names.join(", ")}`
+				: "";
 		// A new task wakes no one: whoever waits on this agent hears it is done from a message.
 		const waiters = rt.team(peers).filter((p) => p.blockedOn?.includes(me.id));
 		const waitedOn =
 			message && waiters.length > 0
-				? `\n${waiters.map((p) => p.callsign).join(", ")} ${waiters.length === 1 ? "waits" : "wait"} for you. If this is what ${waiters.length === 1 ? "it needs" : "they need"}, tell ${waiters.length === 1 ? "it" : "them"}: telecom({ action: "send", to: "${waiters[0]?.callsign}", message: "…" }).`
+				? `\n${waiters.map((p) => p.callsign).join(", ")} ${waiters.length === 1 ? "waits" : "wait"} for you. If this is what ${waiters.length === 1 ? "it needs" : "they need"}, tell ${waiters.length === 1 ? "it" : "them"}: telecom({ action: "send", to: "${waiters[0]?.callsign}", message: "…", unblocks: true }).`
 				: "";
-		return ok(`status set — ${task}${clipped}${waits}${waitedOn}${cycle ? `\n${cycle}` : ""}`, ids.length > 0 ? { waitingFor: names } : {});
+		return ok(`status set — ${task}${waits}${waitedOn}${cycle ? `\n${cycle}` : ""}`, kept.length > 0 ? { waitingFor: names } : {});
 	}
 
 	/** The checks `send` and `ask` share: a target (`to`, or whoever owns `paths`) and a message. */
@@ -185,10 +195,15 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 	function sendAction(call: ActionCall): ToolResult {
 		const target = messageTarget(call);
 		if (!target.ok) return fail(target.reason);
-		const sent = call.net.deliver(rt.envelope(target.peer.id, "message", call.message));
+		const defer = call.params.interrupt === false;
+		const extra: Partial<Envelope> = {
+			...(defer ? { defer: true as const } : {}),
+			...(call.params.unblocks === true ? { unblocks: true as const } : {}),
+		};
+		const sent = call.net.deliver(rt.envelope(target.peer.id, "message", call.message, extra));
 		if (!sent.ok) return fail(sent.reason);
 		rt.noteContact(target.peer.id);
-		return ok(`sent to ${targetName(target)} (${stateHint(target.peer, call.me, rt.peers)})`, { to: target.peer.callsign });
+		return ok(`sent to ${targetName(target)} (${stateHint(target.peer, call.me, rt.peers, defer)})`, { to: target.peer.callsign });
 	}
 
 	async function askAction(call: ActionCall): Promise<ToolResult> {
@@ -236,7 +251,7 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 		if (connected) rt.publishWaits();
 		if (answer.ok) {
 			const asked = target.via ? `${answer.fromCallsign} (it ${target.via}) answered` : `${answer.fromCallsign} answered`;
-			return ok(answerText(asked, answer), {
+			return ok(`${answerText(asked, answer)}${rt.stillWaitingNote(peer.id)}`, {
 				from: answer.fromCallsign,
 				askId: env.id,
 				...(answer.held.length > 0 ? { heldMessages: answer.held.map((m) => m.id) } : {}),
@@ -337,7 +352,7 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 				}`,
 			);
 		}
-		const sent = net.deliver(rt.envelope(to.id, "answer", message, { answerTo: askId }));
+		const sent = net.deliver(rt.envelope(to.id, "answer", message, { answerTo: askId, ...(params.unblocks === true ? { unblocks: true as const } : {}) }));
 		if (!sent.ok) return fail(sent.reason);
 		// A failed delivery leaves the handle available for a retry, including inferred replies.
 		rt.ledger.resolveInbound(askId);
@@ -514,6 +529,12 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 	function claimAction({ me, params, message }: ActionCall): ToolResult {
 		const asked = pathsOf(params);
 		if (asked.length === 0) return fail('"claim" needs `paths` — project-relative paths or globs, or a lock name such as "@cargo"');
+		// A pid that is not running (a job that already ended, a typo) is no reason to turn the claim
+		// away: it is made as a normal claim, and the result says so.
+		const askedPid = params.pid;
+		const pid = askedPid !== undefined && Number.isSafeInteger(askedPid) && askedPid > 0 && jobRuns(askedPid, null) ? askedPid : undefined;
+		// Where the process started, so a reused pid is not mistaken for it.
+		const pidStart = pid === undefined ? null : readStartTicks(pid);
 		const patterns: string[] = [];
 		/** Each path claim's checkout, when it names one. */
 		const scopes = new Map<string, string>();
@@ -543,6 +564,12 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 			.join("\n");
 		if (patterns.length === 0) return fail(away, { refused: [...outside, ...badNames] });
 		const now = Date.now();
+		/** The process a claim lasts for: this call's, else the one a live claim being made again already had. */
+		const tied = (prior?: Claim): Pick<Claim, "pid" | "pidStart"> => {
+			if (askedPid !== undefined) return pid !== undefined ? { pid, ...(pidStart ? { pidStart } : {}) } : {};
+			if (!prior?.pid || prior.expiresAt <= now) return {};
+			return { pid: prior.pid, ...(prior.pidStart ? { pidStart: prior.pidStart } : {}) };
+		};
 		const paths = patterns.filter((p) => !isResource(p));
 		const locks = patterns.filter(isResource);
 		const { conflicts, lanes } = claimConflicts(me, paths.map(scopedOf), now);
@@ -583,8 +610,9 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 		for (const pattern of grantedPaths) {
 			// One claim per pattern: claiming it again, in one checkout or in all, replaces it.
 			const checkout = scopes.get(pattern);
+			const prior = me.claims.find((c) => c.pattern === pattern);
 			me.claims = me.claims.filter((c) => c.pattern !== pattern);
-			me.claims.push({ pattern, since: now, expiresAt: now + rt.cfg.claimTtlMs, ...(note ? { note } : {}), ...(checkout ? { checkout } : {}) });
+			me.claims.push({ pattern, since: now, expiresAt: now + rt.cfg.claimTtlMs, ...(note ? { note } : {}), ...(checkout ? { checkout } : {}), ...tied(prior) });
 		}
 		const renewed: string[] = [];
 		for (const name of grantedLocks) {
@@ -596,7 +624,7 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 			if (prior) renewed.push(name);
 			const why = note || prior?.note;
 			me.claims = me.claims.filter((c) => c.pattern !== name);
-			me.claims.push({ pattern: name, since: prior?.since ?? now, expiresAt: now + rt.cfg.claimTtlMs, ...(why ? { note: why } : {}) });
+			me.claims.push({ pattern: name, since: prior?.since ?? now, expiresAt: now + rt.cfg.claimTtlMs, ...(why ? { note: why } : {}), ...tied(prior) });
 			me.queued = me.queued?.filter((q) => !sameResource(q.pattern, name));
 		}
 		if (me.queued?.length === 0) delete me.queued;
@@ -622,17 +650,24 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 		const lines: string[] = [];
 		if (grantedPaths.length > 0) {
 			lines.push(
-				`claimed ${grantedPaths.map((p) => claimShown(scopedOf(p))).join(", ")}${note ? ` — ${note}` : ""}. Peers editing there are held back and you are told. Release with telecom({ action: "release" }) when done; idle claims expire after ${ttl} min.${overlap}${everywhereHint(me, grantedPaths.filter((p) => !scopes.has(p)))}`,
+				`claimed ${grantedPaths.map((p) => claimShown(scopedOf(p))).join(", ")}${note ? ` — ${note}` : ""}. Peers editing there are held back and you are told. Release with telecom({ action: "release" }) when done; ${pid !== undefined ? `kept while process ${pid} runs` : `idle claims expire after ${ttl} min`}.${overlap}${everywhereHint(me, grantedPaths.filter((p) => !scopes.has(p)))}`,
 			);
 		}
 		if (taken.length > 0) {
 			lines.push(
-				`claimed ${taken.join(", ")}${note ? ` — ${note}` : ""}: yours until you release it — telecom({ action: "release", paths: ${listCall(taken)} }) — and others who claim it are refused and can queue. It stays yours while you are working; once you are idle, it lapses ${ttl} min after you claimed it unless you claim it again.`,
+				`claimed ${taken.join(", ")}${note ? ` — ${note}` : ""}: yours until you release it — telecom({ action: "release", paths: ${listCall(taken)} }) — and others who claim it are refused and can queue. ${
+					pid !== undefined
+						? `It stays yours while process ${pid} runs, and is released when it exits.`
+						: `It stays yours while you are working; once you are idle, it lapses ${ttl} min after you claimed it unless you claim it again (\`pid\` keeps it while a background job runs).`
+				}`,
 			);
 		}
-		if (kept.length > 0) lines.push(`renewed ${kept.join(", ")}: yours for another ${ttl} min.`);
+		if (kept.length > 0) lines.push(`renewed ${kept.join(", ")}: ${pid !== undefined ? `yours while process ${pid} runs` : `yours for another ${ttl} min`}.`);
 		if (lost.length > 0) {
 			lines.push(`${lost.join(", ")}: another agent took ${lost.length === 1 ? "it" : "them"} at the same moment, first. You are first in line, and woken when it frees.`);
+		}
+		if (askedPid !== undefined && pid === undefined && lines.length > 0) {
+			lines.push(`pid ${askedPid} is not running, so this is a normal claim: idle claims expire after ${ttl} min.`);
 		}
 		lines.push(...queuedText);
 		if (refusal) lines.push(`Not claimed: ${refusal}`);

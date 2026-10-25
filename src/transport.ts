@@ -103,6 +103,14 @@ export interface Claim {
 	 * peers ignore it, and read the claim as binding wherever its owner works, as it always did.
 	 */
 	checkout?: string;
+	/**
+	 * A process (a background build or test) the claim lasts for: its owner keeps it alive while the
+	 * process runs and releases it when the process exits. Optional: older peers ignore it, and
+	 * expire the claim by its time as they always did.
+	 */
+	pid?: number;
+	/** The process's start ticks (`readStartTicks`), when readable, so a reused pid is told apart. */
+	pidStart?: number;
 }
 
 /** The tool call a busy agent is inside: it reads nothing it is sent until the call ends. */
@@ -157,6 +165,9 @@ export interface Presence {
 	 * graph (`closesCycle`). Absent when it waits for no one, and on an older telecom.
 	 */
 	blockedOn?: string[];
+	/** When the current set of `blockedOn` was declared (a re-declared set keeps it): the board's
+	 *  "waiting on you" ages. Optional, display only. */
+	blockedSince?: number;
 	/** Resource locks (`@cargo`) this agent waits in line for, and since when; the earliest live
 	 *  waiter takes a lock when it frees. */
 	queued?: QueueEntry[];
@@ -214,6 +225,17 @@ export interface Envelope {
 	 * reply reaches it as a message. Older peers ignore it and treat the ask as a blocking one.
 	 */
 	async?: true;
+	/**
+	 * For `message`: the sender said it can wait (`interrupt: false`), so a busy recipient holds it
+	 * until its run ends. Older peers ignore it and steer the message in.
+	 */
+	defer?: true;
+	/**
+	 * For `message` and `answer`: the sender says this is what the recipient was waiting for, so a
+	 * declared wait on the sender ends. Without it the wait stays (an FYI is not a handoff). Older
+	 * peers ignore it and end the wait on any message, as they always did.
+	 */
+	unblocks?: true;
 	/**
 	 * For `broadcast`: the paths or globs it is about, in the sender's checkout. Agents working
 	 * there get it at once; the rest at their next prompt. Absent: it is about everyone.
@@ -366,7 +388,25 @@ export function settleDepartures(
 	return { departing: next, gone };
 }
 
-function isAlive(pid: number, ticks: number | null): boolean {
+/**
+ * Is the job a claim lasts for (`Claim.pid`) still running? As `isAlive`, except that a process
+ * that exited but is not reaped yet (a zombie) has finished its job, though its pid still answers.
+ */
+export function jobRuns(pid: number, ticks: number | null): boolean {
+	if (process.platform === "linux" && Number.isSafeInteger(pid) && pid > 0) {
+		try {
+			const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+			// The state is the field after comm, which is parenthesised and may hold ')' itself.
+			if (stat.slice(stat.lastIndexOf(")") + 2).startsWith("Z")) return false;
+		} catch {
+			// Unreadable or gone: `isAlive` decides, as it does for presence records.
+		}
+	}
+	return isAlive(pid, ticks);
+}
+
+/** Is process `pid` still there? With `ticks` (its start ticks) a reused pid is told apart too. */
+export function isAlive(pid: number, ticks: number | null): boolean {
 	if (!Number.isSafeInteger(pid) || pid <= 0) return false;
 	if (ticks !== null && process.platform === "linux") {
 		const now = readStartTicks(pid);
@@ -411,7 +451,7 @@ function num(value: unknown): value is number {
  */
 const LIMITS = {
 	name: 60,
-	task: 200,
+	task: 400,
 	note: 160,
 	model: 80,
 	branch: 100,
@@ -452,7 +492,18 @@ function parseClaims(value: unknown): Claim[] {
 		if (!c || !pattern || !num(c.since) || !num(c.expiresAt)) continue;
 		const note = line(c.note, LIMITS.note);
 		const checkout = isPath(c.checkout) && isAbsolute(c.checkout) ? c.checkout : undefined;
-		out.push({ pattern, since: c.since, expiresAt: c.expiresAt, ...(note ? { note } : {}), ...(checkout ? { checkout } : {}) });
+		// A start time means nothing without its pid, and a forged one only ever releases the claim early.
+		const pid = Number.isSafeInteger(c.pid) && (c.pid as number) > 0 ? c.pid : undefined;
+		const pidStart = pid !== undefined && Number.isSafeInteger(c.pidStart) && (c.pidStart as number) > 0 ? c.pidStart : undefined;
+		out.push({
+			pattern,
+			since: c.since,
+			expiresAt: c.expiresAt,
+			...(note ? { note } : {}),
+			...(checkout ? { checkout } : {}),
+			...(pid !== undefined ? { pid } : {}),
+			...(pidStart !== undefined ? { pidStart } : {}),
+		});
 	}
 	return out;
 }
@@ -546,10 +597,15 @@ export function parsePresence(value: unknown): Presence | null {
 	};
 }
 
-function blockedAndQueued(r: Record<string, unknown>, now: number): { blockedOn?: string[]; queued?: QueueEntry[] } {
+function blockedAndQueued(r: Record<string, unknown>, now: number): { blockedOn?: string[]; blockedSince?: number; queued?: QueueEntry[] } {
 	const blockedOn = Array.isArray(r.blockedOn) ? [...new Set(r.blockedOn.filter(isId))].slice(0, LIMITS.blocked) : [];
 	const queued = parseQueued(r.queued, now);
-	return { ...(blockedOn.length > 0 ? { blockedOn } : {}), ...(queued.length > 0 ? { queued } : {}) };
+	return {
+		...(blockedOn.length > 0 ? { blockedOn } : {}),
+		// Only for a wait that is kept: its age means nothing without one. A future time is forged.
+		...(blockedOn.length > 0 && past(r.blockedSince, now) ? { blockedSince: r.blockedSince } : {}),
+		...(queued.length > 0 ? { queued } : {}),
+	};
 }
 
 export function parseEnvelope(value: unknown): Envelope | null {
@@ -578,6 +634,8 @@ export function parseEnvelope(value: unknown): Envelope | null {
 		...(r.human === true ? { human: true } : {}),
 		...(r.kind === "message" && r.human === true && r.triggerTurn === true ? { triggerTurn: true } : {}),
 		...(r.kind === "ask" && r.async === true ? { async: true as const } : {}),
+		...(r.kind === "message" && r.defer === true ? { defer: true as const } : {}),
+		...((r.kind === "message" || r.kind === "answer") && r.unblocks === true ? { unblocks: true as const } : {}),
 		...broadcastPaths(r),
 	};
 }

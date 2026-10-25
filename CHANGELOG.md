@@ -6,6 +6,46 @@ All notable changes to `@justar_96/pi-telecom`. The format follows
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-10-25
+
+### Added
+
+- `send` with `interrupt: false` holds the message until the recipient's run ends, instead of
+  steering it in mid-run: progress updates and FYIs stop breaking a busy agent's work. The run
+  goes on with the held messages, in order, before it stops; an aborted run gets them as an idle
+  agent would. An idle recipient gets it at once. The envelope field `defer` is optional; older
+  peers deliver such a message as before.
+- `send` and `reply` with `unblocks: true` end the recipient's declared wait on the sender at once.
+  The envelope field `unblocks` is optional; older peers ignore it.
+- `claim` with `pid` keeps the claims while that process runs (a background build or test run),
+  and releases them, telling the owner, when it exits. A pid that isn't running makes a normal
+  claim. The claim fields `pid` and `pidStart` are optional; older peers see an ordinary claim.
+- The board has a "Waiting on you" section (who, for how long, on what), and a full brief names
+  who waits on this agent. The record carries an optional `blockedSince`.
+
+### Changed
+
+- A declared wait ends by itself: once the waiter has heard from the teammate and gets to work (an
+  edit, a new path claim, or a long tool call other than `telecom`). A message or answer that
+  leaves the wait in place says so, with the call to end it. `status` without `waitingFor` keeps
+  the wait (`[]` clears it), so restating the task no longer drops it.
+- Claims don't lapse while their owner waits on a teammate who is still at work (busy, idle under
+  30 minutes, or holding a process claim), up to 12 hours after the claim: waiting makes no edits
+  to renew them.
+- A wait cycle is told only once every agent on it has been idle for 5 minutes, and it wakes them,
+  with the `unblocks: true` call that breaks it. A cycle among working agents resolves by itself.
+- The task an agent sets with `status` may be up to 400 characters, and the board shows it whole.
+  Briefs show the first 140 characters, and at most 6 claims per peer, each with a pointer to the
+  board.
+- Briefs count a teammate as near through messages only for 30 minutes after the last one.
+- Recently changed files outside the repository no longer appear in briefs or on the board.
+- Expiry is logged with its reason: a path claim with no edits inside it, or a lock not claimed
+  again.
+- The tool's guideline suggests `interrupt: false` for progress updates and FYIs; results and
+  requests still go at once, since the recipient acts on them.
+- README: the tips for teams of three or more are now one short note: pick a lead, have it write
+  the plan, and give each teammate its part.
+
 ## [0.5.1] - 2026-10-25
 
 ### Added
@@ -374,7 +414,8 @@ First release.
   presence repairs itself.
 - Prompt cache unaffected: 84.4 % hit rate with and without telecom on Claude Sonnet 5.5.
 
-[Unreleased]: https://github.com/Justar96/pi-telecom/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/Justar96/pi-telecom/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/Justar96/pi-telecom/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/Justar96/pi-telecom/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/Justar96/pi-telecom/compare/v0.4.2...v0.5.0
 [0.4.2]: https://github.com/Justar96/pi-telecom/compare/v0.4.1...v0.4.2

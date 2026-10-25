@@ -10,7 +10,7 @@ import { closesCycle, type HeldMessage, type InboundAsk } from "./ledger.ts";
 import { type PendingNotice, renderNotice } from "./notices.ts";
 import { displayPath, isWithin, laneName, sameRepo } from "./project.ts";
 import { MESSAGE_TYPES } from "./render.ts";
-import { type MessageDetails, type Runtime, taskLine } from "./runtime.ts";
+import { CONTACT_NEAR_MS, type MessageDetails, type Runtime, taskLine } from "./runtime.ts";
 import { type Envelope, type FileChangedData, parseEvent, type Presence } from "./transport.ts";
 import { clip, pairKey, setBounded } from "./util.ts";
 import type { Waiting } from "./waiting.ts";
@@ -19,8 +19,6 @@ import type { Waiting } from "./waiting.ts";
 const NOTICE_COALESCE_MS = 1_200;
 /** Envelope ids already handled, so an at-least-once redelivery is not handled twice. */
 const SEEN_CAP = 2_048;
-/** A broadcast from a teammate this agent messaged with this recently is about its work. */
-const CONTACT_NEAR_MS = 30 * 60_000;
 
 export interface Inbound {
 	/** Handle one drained envelope; a redelivery of one already handled is dropped. */
@@ -98,8 +96,9 @@ export function createInbound(rt: Runtime, waiting: Waiting): Inbound {
 		const human = env.human ? " (from their human)" : "";
 		const base: MessageDetails = { from: env.from, fromCallsign: from, id: env.id };
 		if (env.kind === "message" || env.kind === "ask" || env.kind === "answer") rt.noteContact(env.from);
-		// The signal a declared wait was for has arrived: the message itself is what wakes the agent.
-		if (env.kind === "message" || env.kind === "answer") waiting.heard(env.from);
+		// A message marked `unblocks` ends a declared wait on its sender; any other leaves it to end
+		// when the agent gets on with work, so an FYI from the teammate cancels nothing.
+		if (env.kind === "message" || env.kind === "answer") waiting.heard(env.from, env.unblocks === true);
 		switch (env.kind) {
 			case "message": {
 				if (env.human && env.triggerTurn) {
@@ -111,6 +110,12 @@ export function createInbound(rt: Runtime, waiting: Waiting): Inbound {
 				// ask's tool result, which the model reads before anything steered in now. So the
 				// message waits with the ask, to be shown ahead of the answer it came before.
 				if (rt.ledger.hold(message)) return;
+				// A sender that said it can wait (`interrupt: false`) does not break into a run: it
+				// is read when the run ends (`turns.ts`). An idle agent gets it as any message.
+				if (env.defer && rt.isBusy()) {
+					rt.holdDeferred(message);
+					return;
+				}
 				rt.injectMessage(message);
 				return;
 			}
@@ -159,7 +164,7 @@ export function createInbound(rt: Runtime, waiting: Waiting): Inbound {
 				const heading = late ? `${late.async ? "Reply" : "Late reply"} from ${from}** to your ask "${clip(late.text, 80)}"` : `Reply from ${from}**`;
 				rt.inject(
 					MESSAGE_TYPES.reply,
-					`**📡 ${heading}\n\n${env.text}`,
+					`**📡 ${heading}\n\n${env.text}${rt.stillWaitingNote(env.from)}`,
 					{ ...base, tone: "accent" },
 					late ? "wake" : "passive",
 				);

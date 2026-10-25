@@ -10,7 +10,7 @@
  *   node scripts/e2e-rpc.mjs          # exit 0 = pass, 1 = a check failed, 2 = setup problem
  */
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -52,6 +52,30 @@ async function inboxDrained(name, timeoutMs) {
 		if (Date.now() > deadline) throw new Error(`${name}: inbox not drained within ${timeoutMs} ms`);
 		await new Promise((resolve) => setTimeout(resolve, 50));
 	}
+}
+
+/** The session id of the live record named `name`. */
+function sessionId(name) {
+	const dir = join(env.PI_TELECOM_DIR, "presence");
+	const records = readdirSync(dir).filter((n) => n.endsWith(".json") && !n.startsWith("."));
+	const id = records.map((n) => JSON.parse(readFileSync(join(dir, n), "utf8"))).find((r) => r.name === name)?.id;
+	if (!id) throw new Error(`${name}: no presence record`);
+	return id;
+}
+
+/**
+ * Put a direct message in `to`'s inbox the way a peer's telecom does (a temporary name, then a
+ * rename), with `extra` wire fields. The model-driven `send` tool is the only sender of `defer`,
+ * and these checks make no model calls.
+ */
+function sendEnvelope(from, to, text, extra = {}) {
+	const dir = join(env.PI_TELECOM_DIR, "inbox", sessionId(to));
+	mkdirSync(dir, { recursive: true });
+	const id = `msg-e2e-${Math.random().toString(36).slice(2, 10)}`;
+	const envelope = { v: 1, id, ts: Date.now(), from: sessionId(from), fromCallsign: "sender", to: sessionId(to), kind: "message", text, ...extra };
+	const name = `${String(Date.now()).padStart(15, "0")}-${id}.json`;
+	writeFileSync(join(dir, `.${name}`), `${JSON.stringify(envelope)}\n`);
+	renameSync(join(dir, `.${name}`), join(dir, name));
 }
 
 const extra = [];
@@ -258,6 +282,26 @@ try {
 	await leader.command(`/telecom msg ${workerCallsign} wake after busy messages`);
 	const woke = await worker.waitFor(settled, 10_000, wakeOffset).catch(() => null);
 	check("steering into a real busy run preserves the next idle wake", Boolean(woke) && completed(worker, wakeOffset));
+
+	// A message sent with `interrupt: false` waits for the end of the run: a plain one sent at the
+	// same moment, during a tool call, is steered in right after that call.
+	await worker.command("/telecom-test tool");
+	const deferOffset = worker.records.length;
+	worker.send({ type: "prompt", message: "run a slow tool" });
+	await worker.waitFor((r) => r.type === "tool_execution_start", 10_000, deferOffset);
+	sendEnvelope("task-leader", "task-worker", "plain message while the tool runs");
+	sendEnvelope("task-leader", "task-worker", "deferred message while the tool runs", { defer: true });
+	await inboxDrained("task-worker", 10_000);
+	await worker.waitFor(settled, 20_000, deferOffset);
+	const run = worker.records.slice(deferOffset);
+	const at = (re) => run.findIndex((r) => r.type === "message_end" && r.message?.customType === "telecom-message" && re.test(JSON.stringify(r.message.content)));
+	const plainAt = at(/plain message while the tool runs/);
+	const deferredAt = at(/deferred message while the tool runs/);
+	const answeredAt = run.findIndex((r) => r.type === "message_end" && r.message?.role === "assistant" && r.message.stopReason === "stop");
+	check("control: a plain message sent during a tool call is steered in right after it", plainAt !== -1 && answeredAt !== -1 && plainAt < answeredAt,
+		`plain at ${plainAt}, first answer at ${answeredAt}, deferred at ${deferredAt}`);
+	check("a deferred message arrives when the run is about to end, in the same run", deferredAt > answeredAt && answeredAt !== -1 && run.filter((r) => r.type === "agent_start").length === 1,
+		`first answer at ${answeredAt}, deferred at ${deferredAt}, runs ${run.filter((r) => r.type === "agent_start").length}`);
 
 	// The explicit run command also works after the automatic wake allowance is exhausted.
 	const repeatOffsets = [leader.records.length, worker.records.length];

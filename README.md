@@ -37,39 +37,18 @@ Other ways to install:
 ```bash
 pi -e npm:@justar_96/pi-telecom                # one session, without installing
 pi install -l npm:@justar_96/pi-telecom        # one project (loads once the project is trusted)
-pi install npm:@justar_96/pi-telecom@0.5.1     # a pinned version
+pi install npm:@justar_96/pi-telecom@0.5.2     # a pinned version
 pi install git:github.com/Justar96/pi-telecom  # from GitHub
 ```
 
 Requires pi 1.3+ and Node 22.6+ (or newer if your pi needs it), on Linux, macOS or Windows.
 
-## Tips for teams of three or more
+## Teams of three or more
 
-1. Start each agent in its own worktree (`git worktree add ../repo-api`, then run `pi`
-   there). Its claims then bind only in its own copy, and agents in other worktrees are told
-   about overlaps instead of being held back. Agents that start in the main checkout and `cd`
-   into worktrees block each other with every relative claim; telecom then suggests claiming by
-   the worktree's full path.
-2. Split the work by paths, and claim before a larger change. Claim the narrowest glob that
-   covers it and release it when done. `send` and `ask` with `paths` reach the owner without
-   knowing its callsign.
-3. Lock shared things that aren't files, such as a build directory, the test runner, a database
-   or a port. Claim `@cargo` with `queue: true` and the agent is woken on its turn, so it never
-   has to poll.
-4. When an agent is blocked on a teammate, have it say so: `status` with `waitingFor` wakes it
-   when that teammate finishes a run or leaves, and warns it if the teammate stalls. For "tell me
-   when your job is done", use `ask` with `wait: false`; a blocking ask times out during a long
-   job.
-5. Keep `status` to one line naming the task. Send progress and results to whoever needs
-   them, or `broadcast` with `paths`.
-6. Avoid routing everything through one coordinator. It falls behind and the team waits on it.
-   The board shows `owes 3 asks` and `waited on by: …` for such an agent; spread its load.
-7. Watch the board (`/telecom widget` keeps it above the editor). `unread` means a session
-   never acted on a message (it may be stuck), `unresponsive` that it stopped checking in, and a
-   flagged wait cycle that agents wait on each other in a loop.
-8. Steer the team from one terminal. `/telecom run <prompt>` gives every agent a task,
-   `/telecom msg` talks to one, and `/telecom log` shows what was claimed, released and
-   broadcast.
+Pick one agent as the lead and have it write the plan: who does what, in which paths. Give each
+teammate its part (`/telecom run` or the lead's `send`), ideally in its own worktree. After that,
+teammates talk to each other directly and report back to the lead; telecom handles claims, shared
+locks, waits and change notices.
 
 ## What the model receives
 
@@ -142,15 +121,17 @@ departure.
 
 With more than three other agents (subagents not counted), a brief describes at most six peers
 near this agent's work: they changed or claim a file it works with, overlap its claims, share its
-parent, or have messaged with it. The rest share one line:
+parent, or have messaged with it in the last 30 minutes. The rest share one line:
 
 ```
 Also here, not near your work so far: charlie [busy] the api layer (claims src/api); echo [busy] the build
 ```
 
-Updates leave out the task changes and new claims of peers that aren't near (the edit guard
-still applies their claims). Joins, departures, callsign changes and releases of claims the agent
-knows about are always listed. A peer that becomes near is described once, with what was left out.
+A brief shows a peer's first six claims and the first 140 characters of its task; the board shows
+them all. Updates leave out the task changes and new claims of peers that aren't near (the edit
+guard still applies their claims). Joins, departures, callsign changes and releases of claims
+the agent knows about are always listed. A peer that becomes near is described once, with what
+was left out.
 
 ### Change notices
 
@@ -206,7 +187,17 @@ repository can't be claimed; the result says how to tell peers instead.
 
 A claim ends when it is released, when its session ends, or after 2 hours with no edit inside it
 (`PI_TELECOM_CLAIM_TTL_MIN`). The owner is told what expired, and peers it held back are told the
-paths are free.
+paths are free. While its owner waits on a teammate who is still at work, a claim doesn't lapse
+(up to 12 hours).
+
+A claim can be tied to a process, such as a build or test run started in the background:
+
+```
+telecom({ action: "claim", paths: ["@cargo", "target/**"], pid: 48211, message: "release build" })
+```
+
+It stays while the process runs, even with its owner idle, and is released when the process
+exits; the owner is told. A pid that isn't running makes an ordinary claim.
 
 ### Locks
 
@@ -222,9 +213,9 @@ the lock frees (released, holder left, or expired), the first in line gets it an
 `📡 @cargo is yours now (charlie released it)`. Two agents taking a free lock at once settle on
 the earlier claim; the other goes back to the front of the line and is told.
 
-A lock doesn't lapse while its holder is busy (up to 12 hours). Once the holder is idle, it lapses
-the claim TTL after it was claimed. Edits don't renew it; claiming it again does. To claim a path
-that starts with `@`, write `./@…`.
+A lock doesn't lapse while its holder is busy, or while the process it was claimed with runs (up
+to 12 hours). Once the holder is idle, it lapses the claim TTL after it was claimed. Edits don't
+renew it; claiming it again does. To claim a path that starts with `@`, write `./@…`.
 
 ### Waits
 
@@ -232,13 +223,19 @@ that starts with `@`, write `./@…`.
 telecom({ action: "status", message: "waiting for the green run", waitingFor: ["charlie"] })
 ```
 
-The agent is woken when charlie finishes a run or leaves, and the wait ends when charlie messages
-it. If charlie stays idle for 30 minutes or doesn't act on a message, the waiter is told once,
-with the call to nudge it. charlie's own `status` result says who waits on it. A lock handed over
-ends the taker's wait on its previous holder. A `status` without `waitingFor` clears the wait.
+The agent is woken when charlie finishes a run or leaves. The wait is declared once and ends by
+itself: when charlie sends what it needs with `unblocks: true`, or when the agent has heard from
+charlie and gets to work (an edit, claiming files, a long tool call). A message that leaves the wait
+in place says so, with the call to end it. If charlie stays idle for 30 minutes or doesn't act on a
+message, the waiter is told once, with the call to nudge it.
+
+charlie's own `status` result, its board and its full brief say who waits on it. A lock handed
+over ends the taker's wait on its previous holder. A `status` without `waitingFor` keeps the
+wait; `waitingFor: []` clears it.
 
 The board shows locks with their lines (`@cargo — charlie (queue: echo, bravo)`), who waits for
-whom, and wait cycles; each agent on a cycle is told once.
+whom, and wait cycles. A cycle among working agents usually resolves itself; once every agent on it
+has been idle for 5 minutes, each is woken once with the call that breaks it.
 
 ### Team log
 
@@ -306,16 +303,17 @@ or to `subagentOnlyExtensions` in one agent's definition. Each pays the tool's f
 | action | parameters | what it does |
 |---|---|---|
 | `board` | `scope?` | The agents in this repository: state, task, claims, recent changes, asks waiting on this agent. `scope: "machine"` lists every agent on the machine. |
-| `send` | `to` or `paths`, `message` | Messages one agent; starts a turn if it is idle (within the wake limit). |
+| `send` | `to` or `paths`, `message`, `interrupt?`, `unblocks?` | Messages one agent; starts a turn if it is idle (within the wake limit). `interrupt: false` holds it until a busy agent's run ends. |
 | `ask` | `to` or `paths`, `message`, `timeoutSec?`, `wait?` | Asks and waits for the answer (default 300 s, at most 1 h); a late answer arrives as a message. `wait: false` returns at once. |
-| `reply` | `message`, `askId?` | Answers an ask; `askId` is optional when only one is waiting. |
+| `reply` | `message`, `askId?`, `unblocks?` | Answers an ask; `askId` is optional when only one is waiting. |
 | `broadcast` | `message`, `paths?`, `scope?` | Messages every agent in the repository. Never starts a turn. |
-| `status` | `message`, `waitingFor?` | Sets the one-line task peers see (cut at 160 characters) and whom this agent waits for. |
-| `claim` | `paths`, `message?`, `queue?` | Claims paths or globs, or takes `@name` locks; `queue: true` waits in line. |
+| `status` | `message`, `waitingFor?` | Sets the task peers see (up to 400 characters) and whom this agent waits for. |
+| `claim` | `paths`, `message?`, `queue?`, `pid?` | Claims paths or globs, or takes `@name` locks; `queue: true` waits in line, `pid` holds the claims while that process runs. |
 | `release` | `paths?` | Releases those claims (or all) and leaves a lock's line. Releasing nothing is fine. |
 | `log` | `paths?` | The team's recent history (see [Team log](#team-log)). |
 
-`to` is a callsign, session name or id, as the board shows it.
+`to` is a callsign, session name or id, as the board shows it. `unblocks: true` on a `send` or
+`reply` ends the recipient's declared wait on the sender (see [Waits](#waits)).
 
 `send` and `ask` with `paths` instead of `to` go to the agent claiming them (this checkout first,
 then other worktrees), else to the one that last changed a file there. With several claimants,
@@ -332,6 +330,8 @@ that points to the log. A broadcast without `paths` reaches everyone right away.
 
 ### Delivery
 
+- A `send` with `interrupt: false` reaches a busy agent when its run ends: the run goes on
+  with the held messages, in the order they came, before it stops. An idle agent gets it at once.
 - Messages and late answers start at most 6 turns per minute per agent (`PI_TELECOM_MAX_WAKES`);
   beyond that they arrive without starting one. Asks and `/telecom run` always start a turn, and
   messages to a busy agent don't count.

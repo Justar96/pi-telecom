@@ -11,12 +11,17 @@
  *     records actually read: a record kept only because it may come back must never win one;
  *   - a teammate it DECLARED it waits for (`status` with `waitingFor`, published as `blockedOn`):
  *     it is woken when that teammate finishes a run or leaves (then the wait is dropped), and the
- *     wait ends when that teammate messages or answers it, or hands it a lock it queued for.
- *     Declared waits that form a cycle are pointed out, once, to each agent on it.
+ *     wait ends by itself: when that teammate sends a message or answer marked `unblocks`, when the
+ *     agent gets to work after hearing from it (a go-ahead and an FYI look alike, but only a
+ *     go-ahead is followed by work, so nobody has to clear waits by hand), or when it hands the
+ *     agent a lock it queued for. Declared waits
+ *     that form a cycle are pointed out to each agent on it once everyone on it has sat idle a
+ *     while: a cycle with a busy member is usually someone writing the go-ahead, not a stall.
  *
  * The wake-ups use `wake` (wake-limited) although they carry no peer's words: the agent asked for
  * exactly this signal, the way an ask asks for its answer, so it is the reply to its own request,
- * not information pushed at it (AGENTS.md, rule 8). A cycle is information: `passive`.
+ * not information pushed at it (AGENTS.md, rule 8). So is the notice of a stalled cycle: it is
+ * news about teammates the agent declared it waits for, and without it nobody ever moves.
  */
 import { UNRESPONSIVE_MS } from "./awareness.ts";
 import { lineOf } from "./family.ts";
@@ -40,6 +45,12 @@ const FREE = "it was free";
  * its recipient idle all night, and every agent waiting down the line with it.
  */
 const STALE_WAIT_BEATS = 120;
+/**
+ * A wait cycle is a stall once every agent on it has been idle this long (5 min). One busy member
+ * is most likely writing the go-ahead the others wait for: telling them then was noise (21 notices
+ * in one two-day team, all two-agent cycles with a busy side).
+ */
+const CYCLE_STALL_MS = 5 * 60_000;
 
 export interface Waiting {
 	/** After a team refresh: settle lock races against `read` (this refresh's read), take a freed
@@ -52,8 +63,9 @@ export interface Waiting {
 	released(fromId: string, fromCallsign: string, patterns: readonly string[], at: number): string[];
 	/** The inbox was drained: take the locks released in it, if first in line. */
 	afterDrain(): void;
-	/** A peer messaged or answered this agent: a declared wait on it is over. */
-	heard(id: string): void;
+	/** A peer sent this agent a message or answer. With `unblocks` a declared wait on it is over;
+	 *  without, the wait ends when the agent next gets to work (`refresh`, `endHeardWaits`). */
+	heard(id: string, unblocks: boolean): void;
 	/** The agent declared whom it waits for: note how each looks now, so a change is news. Returns
 	 *  a warning when the declaration closes a wait cycle. */
 	declare(peers: readonly Presence[]): string | null;
@@ -73,7 +85,11 @@ export function createWaiting(rt: Runtime): Waiting {
 	/** How each teammate this agent waits for looked when last checked: a change is news. `since`:
 	 *  when the wait began; `told`: the stall last pointed out (see `stallNews`). */
 	const seen = new Map<string, { callsign: string; state: Presence["state"]; task: string; since: number; told?: string }>();
-	/** The wait cycle this agent was told it is on, told once while it lasts. */
+	/** Awaited teammates that messaged or answered this agent since the wait was declared, and when:
+	 *  the wait ends once the agent gets to work after that. */
+	const heardAt = new Map<string, number>();
+	/** The stalled wait cycle this agent was told it is on: the cycle plus when its last member went
+	 *  idle, so a new idle spell is a new stall. */
 	let toldCycle: string | null = null;
 	/** Rivals as the last refresh saw them, to tell what freed a lock: one of them gone since. */
 	let lastSeen: readonly Presence[] = [];
@@ -206,9 +222,35 @@ export function createWaiting(rt: Runtime): Waiting {
 
 	function dropWaits(me: Presence, ids: readonly string[]): void {
 		me.blockedOn = (me.blockedOn ?? []).filter((id) => !ids.includes(id));
-		if (me.blockedOn.length === 0) delete me.blockedOn;
-		for (const id of ids) seen.delete(id);
+		if (me.blockedOn.length === 0) {
+			delete me.blockedOn;
+			delete me.blockedSince;
+		}
+		for (const id of ids) {
+			seen.delete(id);
+			heardAt.delete(id);
+		}
 		rt.publish();
+	}
+
+	/**
+	 * A wait on a teammate it heard from ends when the agent gets to work afterwards: it got on
+	 * with the work it waited to start. Merely reading the message, or going back to waiting (which
+	 * it says by declaring the wait again), ends nothing. Judged on what its own record already
+	 * holds (recent changes, claims, the long step), so no hook or bookkeeping beyond the time heard.
+	 */
+	function endHeardWaits(me: Presence): void {
+		if (heardAt.size === 0) return;
+		// Work is an edit, a new claim on files, or a long command (a gate or a build, which a
+		// go-ahead often starts with no edit at all). Not a lock: one can be handed over while the
+		// agent still waits for something else. Not a long telecom call: that is a blocking ask.
+		const workedSince = (at: number) =>
+			me.recent.some((r) => r.at >= at) ||
+			me.claims.some((c) => !isResource(c.pattern) && c.since >= at) ||
+			(me.step !== undefined && me.step.tool !== "telecom" && me.step.since >= at);
+		const ended = [...heardAt].filter(([id, at]) => me.blockedOn?.includes(id) && workedSince(at)).map(([id]) => id);
+		for (const id of [...heardAt.keys()]) if (!me.blockedOn?.includes(id)) heardAt.delete(id);
+		if (ended.length > 0) dropWaits(me, ended);
 	}
 
 	function wakeDeclared(me: Presence, peers: readonly Presence[]): void {
@@ -290,17 +332,30 @@ export function createWaiting(rt: Runtime): Waiting {
 		return { key, text: `${peer.callsign} has been idle for ${elapsed(idleFrom, now)} while you wait for it.${theirs}` };
 	}
 
-	/** `alpha → bravo → alpha`, and the next agent after this one on the cycle. */
-	function describeCycle(cycle: readonly string[], records: readonly Presence[]): { names: string; next: string } {
-		const names = callsignsOf(cycle, records, "");
-		return { names: names.join(" → "), next: names[1] ?? "" };
-	}
-
-	function onCycle(me: Presence, peers: readonly Presence[]): { key: string; names: string; next: string } | null {
+	/** The cycle through this agent: its key, `alpha → bravo → alpha`, the next agent after this one
+	 *  on it, and the records of everyone on it. */
+	function onCycle(me: Presence, peers: readonly Presence[]): { key: string; names: string; next: string; members: Presence[] } | null {
 		if (!me.blockedOn?.length) return null;
 		const records = [me, ...rt.team(peers)];
 		const cycle = declaredCycle(me.id, records);
-		return cycle ? { key: cycleKey(cycle), ...describeCycle(cycle, records) } : null;
+		if (!cycle) return null;
+		const names = callsignsOf(cycle, records, "");
+		const members = [...new Set(cycle)].flatMap((id) => records.find((r) => r.id === id) ?? []);
+		return { key: cycleKey(cycle), names: names.join(" → "), next: names[1] ?? "", members };
+	}
+
+	/**
+	 * When the last of them went idle, if everyone on the cycle is idle and has been for
+	 * `CYCLE_STALL_MS`; else null. A record without `stateSince` (an older telecom) cannot be judged
+	 * stalled, so it never is: better silent than a notice about a cycle someone is working on.
+	 */
+	function stalledSince(members: readonly Presence[], now: number): number | null {
+		let latest = 0;
+		for (const m of members) {
+			if (m.state !== "idle" || m.stateSince === undefined || now - m.stateSince < CYCLE_STALL_MS) return null;
+			latest = Math.max(latest, m.stateSince);
+		}
+		return latest > 0 ? latest : null;
 	}
 
 	function flagCycle(me: Presence, peers: readonly Presence[]): void {
@@ -309,13 +364,19 @@ export function createWaiting(rt: Runtime): Waiting {
 			toldCycle = null;
 			return;
 		}
-		if (cycle.key === toldCycle) return;
-		toldCycle = cycle.key;
+		const now = Date.now();
+		const since = stalledSince(cycle.members, now);
+		if (since === null) return;
+		const key = `${cycle.key}@${since}`;
+		if (key === toldCycle) return;
+		toldCycle = key;
+		// `wake`: the agent declared it waits for these teammates, and with all of them idle nothing
+		// else will ever move (AGENTS.md, rule 8).
 		rt.inject(
 			MESSAGE_TYPES.message,
-			`**📡 Wait cycle: ${cycle.names}**\n\nEach of you declared it waits for the next, so nobody on it moves until one of you does. Go ahead without ${cycle.next}, or tell them what you need: telecom({ action: "send", to: "${cycle.next}", message: "…" }). Then update your wait: telecom({ action: "status", message: "…" }).`,
+			`**📡 Wait cycle stalled: ${cycle.names}**\n\nEach of you declared it waits for the next, and everyone on it has been idle for ${elapsed(since, now)} or more, so nobody moves unless you do. Give ${cycle.next} what it needs, or go ahead without it: telecom({ action: "send", to: "${cycle.next}", message: "…", unblocks: true }). Then drop the wait: telecom({ action: "status", message: "…", waitingFor: [] }).`,
 			{ tone: "warning" },
-			"passive",
+			"wake",
 		);
 	}
 
@@ -328,12 +389,14 @@ export function createWaiting(rt: Runtime): Waiting {
 				lastSeen = [];
 				toldCycle = null;
 				seen.clear();
+				heardAt.clear();
 				fromLine.clear();
 				return;
 			}
 			for (const name of [...fromLine.keys()]) if (!me.claims.some((c) => sameResource(c.pattern, name))) fromLine.delete(name);
 			settle(me, read, true);
 			takeFreeLocks(me, present);
+			endHeardWaits(me);
 			wakeDeclared(me, present);
 			flagCycle(me, present);
 			lastSeen = rivals(me, present);
@@ -362,23 +425,28 @@ export function createWaiting(rt: Runtime): Waiting {
 			takeFreeLocks(me, rt.presentNow(), new Map([...batch].map(([name, r]) => [name, r.callsign])));
 		},
 
-		heard(id) {
+		heard(id, unblocks) {
 			const me = rt.self;
-			if (me?.blockedOn?.includes(id)) dropWaits(me, [id]);
+			if (!me?.blockedOn?.includes(id)) return;
+			if (unblocks) dropWaits(me, [id]);
+			else heardAt.set(id, Date.now());
 		},
 
 		declare(peers) {
 			const me = rt.self;
 			seen.clear();
+			// Declaring again, after hearing, is the agent saying it still waits.
+			heardAt.clear();
 			if (!me) return null;
 			for (const id of me.blockedOn ?? []) {
 				const peer = peers.find((p) => p.id === id);
 				if (peer) seen.set(id, { callsign: peer.callsign, state: peer.state, task: peer.task ?? "", since: Date.now() });
 			}
+			// The stall notice (`flagCycle`) is told apart from this one: this agent is mid-run, and may
+			// well resolve the cycle itself, so it only learns the fact now.
 			const cycle = onCycle(me, peers);
-			toldCycle = cycle?.key ?? null;
 			return cycle
-				? `⚠ This closes a wait cycle: ${cycle.names}. Nobody on it moves until one of you does: go ahead without ${cycle.next}, or tell them what you need: telecom({ action: "send", to: "${cycle.next}", message: "…" }).`
+				? `This closes a wait cycle: ${cycle.names}. It resolves only when one of you moves, and you are told if all of you sit idle: to move first, go ahead without ${cycle.next}, or tell them what you need: telecom({ action: "send", to: "${cycle.next}", message: "…", unblocks: true }).`
 				: null;
 		},
 
@@ -393,6 +461,7 @@ export function createWaiting(rt: Runtime): Waiting {
 			lastHolder.clear();
 			fromLine.clear();
 			seen.clear();
+			heardAt.clear();
 			toldCycle = null;
 		},
 	};
