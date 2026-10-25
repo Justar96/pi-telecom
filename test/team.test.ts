@@ -871,10 +871,11 @@ test("lanes: a claim naming a worktree binds there only, and a relative claim ma
 	await b.read(join(wtB, "src", "x.ts"));
 	await b.edit(join(wtB, "src", "x.ts"), "x", "B");
 	const wide = await a.tool({ action: "claim", paths: ["src/**"], message: "parser" });
-	assert.match(wide.text, new RegExp(`claim it there instead: telecom\\(\\{ action: "claim", paths: \\["${escapeRegExp(join(wtA, "src", "**"))}"\\] \\}\\)`));
+	// The call quotes each path as a JSON string (Windows backslashes doubled), ready to copy.
+	assert.match(wide.text, new RegExp(`claim it there instead: telecom\\(\\{ action: "claim", paths: \\[${escapeRegExp(JSON.stringify(join(wtA, "src", "**")))}\\] \\}\\)`));
 	// Explained once: the next relative claim from that worktree carries only the call.
 	const again = await a.tool({ action: "claim", paths: ["src/x.ts"], message: "parser" });
-	assert.match(again.text, new RegExp(`Only your worktree\\? Claim \\["${escapeRegExp(join(wtA, "src", "x.ts"))}"\\] instead\\.`));
+	assert.match(again.text, new RegExp(`Only your worktree\\? Claim \\[${escapeRegExp(JSON.stringify(join(wtA, "src", "x.ts")))}\\] instead\\.`));
 	assert.doesNotMatch(again.text, /It binds in every checkout/);
 	// A compaction may have dropped the explanation: it is given in full again.
 	await a.fire("session_compact", {});
@@ -884,7 +885,7 @@ test("lanes: a claim naming a worktree binds there only, and a relative claim ma
 	// is refused, and told how to claim its own copy.
 	const refused = await b.tool({ action: "claim", paths: ["src/x.ts"] });
 	assert.equal(refused.isError, true);
-	assert.match(refused.text, new RegExp(`claim it there: telecom\\(\\{ action: "claim", paths: \\["${escapeRegExp(join(wtB, "src", "x.ts"))}"\\] \\}\\)`));
+	assert.match(refused.text, new RegExp(`claim it there: telecom\\(\\{ action: "claim", paths: \\[${escapeRegExp(JSON.stringify(join(wtB, "src", "x.ts")))}\\] \\}\\)`));
 	const own = await b.tool({ action: "claim", paths: [join(wtB, "src", "x.ts")] });
 	assert.ok(!own.isError, own.text);
 	assert.match(own.text, /claimed src\/x\.ts \(in p-lane-scoped-wb\)/);
@@ -1295,7 +1296,8 @@ test("broadcast with paths: a path in a worktree concerns whoever works on the s
 	const run = await far.prompt("carry on with the docs");
 	const text = run?.message?.content ?? "";
 	assert.match(text, /Older broadcasts, held while you were away.*telecom\(\{ action: "log" \}\)/);
-	assert.match(text, /- 5h ago, Broadcast from alpha — about .*schema\.ts: schema\.ts gains tenant_id/);
+	// The path in "about" is clipped to 80 characters, which a long temp folder fills.
+	assert.match(text, /- 5h ago, Broadcast from alpha — about [^\n]*: schema\.ts gains tenant_id/);
 });
 
 test("broadcast with paths: one from a teammate this agent just talked with is delivered now", async () => {
