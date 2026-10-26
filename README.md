@@ -109,8 +109,10 @@ across a resume, and can change it with `/telecom name ops`. It publishes:
 ### Team briefs
 
 The first brief describes every peer; later ones list only changes: joins, departures, callsign
-and task changes, claims and releases, and moves to another worktree or branch. File edits are
-left to change notices. A full brief is sent again only after a compaction or a callsign change.
+and task changes, claims and releases, and a move into a worktree or branch not reported before
+(an agent editing two checkouts by turns is one move). File edits are
+left to change notices, and `@name` locks changing hands to the lock's line (a `claim` names the
+holder); a teammate queuing for a lock this agent holds is news. A full brief is sent again only after a compaction or a callsign change.
 An agent put to work by a peer's message, with no task yet, is reminded to set one.
 
 A teammate joining or leaving mid-run is told as a short update during the run; an idle agent
@@ -177,7 +179,8 @@ Patterns are paths or globs relative to the project (`src/auth`, `src/**/*.test.
 
 A relative claim binds in every checkout its owner works in: where it started and wherever its
 edits land. A full path into a worktree claims that worktree's copy only, shown as
-`src/auth/** (in repo-api)`. An agent working in a worktree whose relative claim would hold back
+`src/auth/** (in repo-api)`. A whole worktree claimed that way (`/work/repo-api/**`) is that
+copy: edits and claims in other checkouts get no note about it. An agent working in a worktree whose relative claim would hold back
 a teammate in another checkout is given the full-path call.
 
 A path that overlaps a peer's claim in the same checkout is refused, the rest of the call is
@@ -223,10 +226,12 @@ renew it; claiming it again does. To claim a path that starts with `@`, write `.
 telecom({ action: "status", message: "waiting for the green run", waitingFor: ["charlie"] })
 ```
 
-The agent is woken when charlie finishes a run or leaves. The wait is declared once and ends by
-itself: when charlie sends what it needs with `unblocks: true`, or when the agent has heard from
-charlie and gets to work (an edit, claiming files, a long tool call). A message that leaves the wait
-in place says so, with the call to end it. If charlie stays idle for 30 minutes or doesn't act on a
+The agent is woken when charlie finishes a run or leaves (a run that already messaged the agent
+wakes it once, with the message). The wait is declared once and ends by itself: when charlie sends
+what it needs with `unblocks: true`, or when the agent has heard from charlie and gets to work (an
+edit, claiming files, a long tool call); then the agent is told, with the call to keep waiting if
+it still is. A message that leaves the wait in place says so, with the call to end it. A wait
+that closes a wait cycle is pointed out once per cycle. If charlie stays idle for 30 minutes or doesn't act on a
 message, the waiter is told once, with the call to nudge it.
 
 charlie's own `status` result, its board and its full brief say who waits on it. A lock handed
@@ -303,16 +308,18 @@ or to `subagentOnlyExtensions` in one agent's definition. Each pays the tool's f
 | action | parameters | what it does |
 |---|---|---|
 | `board` | `scope?` | The agents in this repository: state, task, claims, recent changes, asks waiting on this agent. `scope: "machine"` lists every agent on the machine. |
-| `send` | `to` or `paths`, `message`, `interrupt?`, `unblocks?` | Messages one agent; starts a turn if it is idle (within the wake limit). `interrupt: false` holds it until a busy agent's run ends. |
+| `send` | `to` or `paths`, `message`, `interrupt?`, `unblocks?` | Messages one agent, or several (`to: "alpha, bravo"`); starts a turn if it is idle (within the wake limit). `interrupt: false` holds it until a busy agent's run ends. |
 | `ask` | `to` or `paths`, `message`, `timeoutSec?`, `wait?` | Asks and waits for the answer (default 300 s, at most 1 h); a late answer arrives as a message. `wait: false` returns at once. |
-| `reply` | `message`, `askId?`, `unblocks?` | Answers an ask; `askId` is optional when only one is waiting. |
+| `reply` | `message`, `askId?`, `to?`, `unblocks?` | Answers an ask; `askId` is optional when only one is waiting, or when `to` names its asker. With `to` and no ask of theirs open, it goes as a message. |
 | `broadcast` | `message`, `paths?`, `scope?` | Messages every agent in the repository. Never starts a turn. |
 | `status` | `message`, `waitingFor?` | Sets the task peers see (up to 400 characters) and whom this agent waits for. |
 | `claim` | `paths`, `message?`, `queue?`, `pid?` | Claims paths or globs, or takes `@name` locks; `queue: true` waits in line, `pid` holds the claims while that process runs. |
 | `release` | `paths?` | Releases those claims (or all) and leaves a lock's line. Releasing nothing is fine. |
 | `log` | `paths?` | The team's recent history (see [Team log](#team-log)). |
 
-`to` is a callsign, session name or id, as the board shows it. `unblocks: true` on a `send` or
+`to` is a callsign, session name or id, as the board shows it. A `send` may name several,
+comma-separated: each recipient sees who else got it and how to answer all of them, so a
+decision two or three teammates must share stays one thread. `unblocks: true` on a `send` or
 `reply` ends the recipient's declared wait on the sender (see [Waits](#waits)).
 
 `send` and `ask` with `paths` instead of `to` go to the agent claiming them (this checkout first,

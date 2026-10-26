@@ -84,7 +84,13 @@ export function createWaiting(rt: Runtime): Waiting {
 	const fromLine = new Map<string, number>();
 	/** How each teammate this agent waits for looked when last checked: a change is news. `since`:
 	 *  when the wait began; `told`: the stall last pointed out (see `stallNews`). */
-	const seen = new Map<string, { callsign: string; state: Presence["state"]; task: string; since: number; told?: string }>();
+	const seen = new Map<string, { callsign: string; state: Presence["state"]; task: string; since: number; told?: string; busyFrom?: number }>();
+	/** When each awaited teammate last messaged or answered this agent, kept past the wait's end
+	 *  of `heardAt`: a run that ended with a message to this agent needs no second wake-up. */
+	const lastHeard = new Map<string, number>();
+	/** Wait cycles this agent was told it closes, by key: a pipeline of handoffs closes the same
+	 *  two-way cycle on every status, and the note said nothing new the second time. */
+	const cyclesTold = new Set<string>();
 	/** Awaited teammates that messaged or answered this agent since the wait was declared, and when:
 	 *  the wait ends once the agent gets to work after that. */
 	const heardAt = new Map<string, number>();
@@ -250,7 +256,21 @@ export function createWaiting(rt: Runtime): Waiting {
 			(me.step !== undefined && me.step.tool !== "telecom" && me.step.since >= at);
 		const ended = [...heardAt].filter(([id, at]) => me.blockedOn?.includes(id) && workedSince(at)).map(([id]) => id);
 		for (const id of [...heardAt.keys()]) if (!me.blockedOn?.includes(id)) heardAt.delete(id);
-		if (ended.length > 0) dropWaits(me, ended);
+		if (ended.length === 0) return;
+		const peers = rt.peers;
+		const names = callsignsOf(ended, peers, me.id);
+		dropWaits(me, ended);
+		// Said, not done silently: the model still believes it waits, its task often says so, and
+		// teammates now see it as not waiting. `passive`: it is at work, so this is steered in.
+		const rest = callsignsOf(me.blockedOn ?? [], peers, me.id);
+		const still = rest.length > 0 ? ` You still wait for ${rest.join(", ")}.` : "";
+		const task = me.task ? ` Peers see your task as "${clip(me.task, 120)}"; if it says you wait, update it: telecom({ action: "status", message: "…" }).` : "";
+		rt.inject(
+			MESSAGE_TYPES.message,
+			`**📡 Your wait on ${names.join(", ")} ended**\n\nYou got to work after hearing from ${names.length === 1 ? "them" : "each"}, so teammates no longer see you as waiting.${still}${task} If you are in fact still blocked, declare it again: telecom({ action: "status", waitingFor: ${JSON.stringify([...rest, ...names])} }).`,
+			{ tone: "info" },
+			"passive",
+		);
 	}
 
 	function wakeDeclared(me: Presence, peers: readonly Presence[]): void {
@@ -270,7 +290,17 @@ export function createWaiting(rt: Runtime): Waiting {
 				news.push(`${before?.callsign ?? shortId(id)} left`);
 				continue;
 			}
-			const now = { callsign: peer.callsign, state: peer.state, task: peer.task ?? "", since: before?.since ?? at, ...(before?.told ? { told: before.told } : {}) };
+			// When its current run began, as first seen busy: a message it sent during that run is
+			// news enough of its end.
+			const busyFrom = peer.state === "busy" ? ((before?.state === "busy" ? before.busyFrom : undefined) ?? peer.stateSince ?? at) : undefined;
+			const now = {
+				callsign: peer.callsign,
+				state: peer.state,
+				task: peer.task ?? "",
+				since: before?.since ?? at,
+				...(before?.told ? { told: before.told } : {}),
+				...(busyFrom !== undefined ? { busyFrom } : {}),
+			};
 			const stall = stallNews(peer, now, at, peers, me.id);
 			if (stall) {
 				now.told = stall.key;
@@ -279,7 +309,9 @@ export function createWaiting(rt: Runtime): Waiting {
 			}
 			seen.set(id, now);
 			if (!before) continue;
-			if (before.state === "busy" && now.state === "idle") {
+			// A run that ended with a message to this agent woke it already, with what it said.
+			const heardInRun = before.busyFrom !== undefined && (lastHeard.get(id) ?? 0) >= before.busyFrom;
+			if (before.state === "busy" && now.state === "idle" && !heardInRun) {
 				news.push(`${now.callsign} finished its run${now.task ? ` (task: ${clip(now.task, TASK_SHOWN)})` : ""}`);
 			}
 			// A new task is not a wake-up: agents set status mid-run to report progress, and in a long
@@ -390,6 +422,7 @@ export function createWaiting(rt: Runtime): Waiting {
 				toldCycle = null;
 				seen.clear();
 				heardAt.clear();
+				lastHeard.clear();
 				fromLine.clear();
 				return;
 			}
@@ -428,6 +461,7 @@ export function createWaiting(rt: Runtime): Waiting {
 		heard(id, unblocks) {
 			const me = rt.self;
 			if (!me?.blockedOn?.includes(id)) return;
+			setBounded(lastHeard, id, Date.now(), HOLDERS_CAP);
 			if (unblocks) dropWaits(me, [id]);
 			else heardAt.set(id, Date.now());
 		},
@@ -440,11 +474,22 @@ export function createWaiting(rt: Runtime): Waiting {
 			if (!me) return null;
 			for (const id of me.blockedOn ?? []) {
 				const peer = peers.find((p) => p.id === id);
-				if (peer) seen.set(id, { callsign: peer.callsign, state: peer.state, task: peer.task ?? "", since: Date.now() });
+				if (!peer) continue;
+				const now = Date.now();
+				seen.set(id, {
+					callsign: peer.callsign,
+					state: peer.state,
+					task: peer.task ?? "",
+					since: now,
+					...(peer.state === "busy" ? { busyFrom: peer.stateSince ?? now } : {}),
+				});
 			}
 			// The stall notice (`flagCycle`) is told apart from this one: this agent is mid-run, and may
 			// well resolve the cycle itself, so it only learns the fact now.
 			const cycle = onCycle(me, peers);
+			if (!cycle || cyclesTold.has(cycle.key)) return null;
+			if (cyclesTold.size >= HOLDERS_CAP) cyclesTold.clear();
+			cyclesTold.add(cycle.key);
 			return cycle
 				? `This closes a wait cycle: ${cycle.names}. It resolves only when one of you moves, and you are told if all of you sit idle: to move first, go ahead without ${cycle.next}, or tell them what you need: telecom({ action: "send", to: "${cycle.next}", message: "…", unblocks: true }).`
 				: null;
@@ -462,6 +507,8 @@ export function createWaiting(rt: Runtime): Waiting {
 			fromLine.clear();
 			seen.clear();
 			heardAt.clear();
+			lastHeard.clear();
+			cyclesTold.clear();
 			toldCycle = null;
 		},
 	};

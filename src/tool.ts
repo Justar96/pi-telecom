@@ -40,7 +40,7 @@ export type ToolAction = (typeof TOOL_ACTIONS)[number];
 const TOOL_PARAMETERS = Type.Object({
 	// StringEnum, not a Union of Literals: Google models reject the anyOf form.
 	action: StringEnum(TOOL_ACTIONS, { description: "What to do." }),
-	to: Type.Optional(Type.String({ description: "send/ask: callsign, session name or id (as the board shows it)." })),
+	to: Type.Optional(Type.String({ description: 'send/ask/reply: callsign, session name or id (as the board shows it). send: several, comma-separated ("alpha, bravo"), each told who else got it.' })),
 	message: Type.Optional(Type.String({ description: "The text; for status your task in one line; for claim the reason." })),
 	askId: Type.Optional(Type.String({ description: "reply: the ask's handle (optional if only one is waiting)." })),
 	paths: Type.Optional(

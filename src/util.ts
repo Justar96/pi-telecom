@@ -79,6 +79,19 @@ export function newId(prefix: string): string {
 	return `${prefix}-${process.pid.toString(36)}-${Date.now().toString(36)}-${idCounter.toString(36)}${rand}`;
 }
 
+/**
+ * `text` without a leading "<callsign>:" or "<callsign> → bravo:" naming its own sender. Every
+ * surface already says who wrote it (the board's "bravo · task", "Message from bravo"), so the
+ * prefix only costs each reader tokens; agents add it by habit. Kept when nothing else is left.
+ */
+export function withoutSelfName(text: string, callsign: string): string {
+	const self = escapeRegExp(callsign);
+	const names = "[a-z0-9][a-z0-9_-]*(?:\\s*(?:,|\\+|&|and)\\s*[a-z0-9][a-z0-9_-]*)*";
+	const prefix = new RegExp(`^${self}\\s*(?:(?:→|->)\\s*${names}\\s*[:,]|[:—–]|-(?=\\s))\\s*`, "i");
+	const rest = text.replace(prefix, "");
+	return rest.trim() ? rest : text;
+}
+
 /** `text` matched literally inside a regular expression. */
 export function escapeRegExp(text: string): string {
 	return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");

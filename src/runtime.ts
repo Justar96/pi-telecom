@@ -104,10 +104,14 @@ export type MessageDetails = TelecomMessageDetails & Record<string, unknown>;
 
 /** A peer's direct message as the model reads it (on arrival, or held until a run ends). `note`:
  *  the line on a wait the sender did not end (`Runtime.stillWaitingNote`), judged at delivery. */
-function messageText(msg: HeldMessage, note = ""): { content: string; details: MessageDetails } {
+function messageText(msg: HeldMessage, note = "", self = ""): { content: string; details: MessageDetails } {
 	const human = msg.human ? " (from their human)" : "";
+	// A message to several: each reads who else got it, and how to answer all of them at once.
+	const others = (msg.group ?? []).filter((c) => c !== self && c !== msg.fromCallsign);
+	const also = others.length > 0 ? ` — also to ${others.join(", ")}` : "";
+	const replyTo = others.length > 0 ? `to "${msg.fromCallsign}", or "${[msg.fromCallsign, ...others].join(", ")}" for all of them` : `to "${msg.fromCallsign}"`;
 	return {
-		content: `**📡 Message from ${msg.fromCallsign}${human}**\n\n${msg.text}\n\n(Reply only if needed: action "send", to "${msg.fromCallsign}".)${note}`,
+		content: `**📡 Message from ${msg.fromCallsign}${human}${also}**\n\n${msg.text}\n\n(Reply only if needed: action "send", ${replyTo}.)${note}`,
 		details: { from: msg.from, fromCallsign: msg.fromCallsign, id: msg.id, tone: "accent" },
 	};
 }
@@ -560,7 +564,7 @@ export class Runtime {
 	 * then exactly as they would have been on arrival.
 	 */
 	injectMessage(msg: HeldMessage): boolean {
-		const { content, details } = messageText(msg, this.stillWaitingNote(msg.from));
+		const { content, details } = messageText(msg, this.stillWaitingNote(msg.from), this.self?.callsign);
 		return this.inject(MESSAGE_TYPES.message, content, details, "wake");
 	}
 
@@ -591,7 +595,7 @@ export class Runtime {
 	 * The same text as a message delivered on arrival.
 	 */
 	deferredEntries(): Array<{ type: "custom_message"; customType: string; content: string; display: true; details: MessageDetails }> {
-		return this.takeDeferred().map((msg) => ({ type: "custom_message", customType: MESSAGE_TYPES.message, display: true, ...messageText(msg, this.stillWaitingNote(msg.from)) }));
+		return this.takeDeferred().map((msg) => ({ type: "custom_message", customType: MESSAGE_TYPES.message, display: true, ...messageText(msg, this.stillWaitingNote(msg.from), this.self?.callsign) }));
 	}
 
 	/**
@@ -602,7 +606,7 @@ export class Runtime {
 	deliverDeferred(): void {
 		const held = this.takeDeferred();
 		held.forEach((msg, i) => {
-			const { content, details } = messageText(msg, this.stillWaitingNote(msg.from));
+			const { content, details } = messageText(msg, this.stillWaitingNote(msg.from), this.self?.callsign);
 			this.inject(MESSAGE_TYPES.message, content, details, i === held.length - 1 ? "wake" : "passive");
 		});
 	}
@@ -655,7 +659,7 @@ export class Runtime {
 	flushLater(): void {
 		for (const msg of this.takeDeferred()) {
 			try {
-				const { content, details } = messageText(msg, this.stillWaitingNote(msg.from));
+				const { content, details } = messageText(msg, this.stillWaitingNote(msg.from), this.self?.callsign);
 				this.pi.sendMessage({ customType: MESSAGE_TYPES.message, content, display: true, details }, { deliverAs: "nextTurn" });
 			} catch (error) {
 				this.report("deliver", error);

@@ -9,15 +9,15 @@ import { ownerOf, resolveTarget, stateHint, type Target, targetName } from "./ad
 import { UNRESPONSIVE_MS } from "./awareness.ts";
 import { MAX_ASK_TIMEOUT_MS } from "./config.ts";
 import { blockedOnMe, isForegroundChild, lineOf, parentOf } from "./family.ts";
-import { absolutePattern, claimShown, claimsOverlap, isResource, isResourceName, laneRelativePattern, resourceKey, sameResource } from "./glob.ts";
+import { absolutePattern, claimShown, claimsOverlap, coversCheckout, isResource, isResourceName, laneRelativePattern, resourceKey, sameResource } from "./glob.ts";
 import { type AskOutcome, closesCycle, type InboundAsk, waitedOn } from "./ledger.ts";
 import { broadcastText, entryTouches, LOG_SHOWN, renderLog } from "./log.ts";
 import { callsignsOf, holdsOf, lineFor } from "./locks.ts";
 import { displayPath, isWithin, laneIn, laneName, workingCheckout } from "./project.ts";
 import { OFF_TEXT, type Runtime } from "./runtime.ts";
 import { deliveryReport, fail, ok, TOOL_SPEC, type ToolAction, type ToolParams, type ToolResult } from "./tool.ts";
-import { BLOCKED_CAP, type Claim, type Envelope, jobRuns, type Presence, QUEUED_CAP, readStartTicks, type Transport } from "./transport.ts";
-import { ago, clip, plural, setBounded } from "./util.ts";
+import { BLOCKED_CAP, type Claim, type Envelope, GROUP_CAP, jobRuns, type Presence, QUEUED_CAP, readStartTicks, type Transport } from "./transport.ts";
+import { ago, clip, plural, setBounded, withoutSelfName } from "./util.ts";
 import type { Waiting } from "./waiting.ts";
 
 const CLAIM_NOTE_CAP = 120;
@@ -34,6 +34,12 @@ const HOLDER_TASK_CAP = 80;
 const ASYNC_ASK_TIMEOUT_MS = 30 * 60_000;
 /** A claim refused again for the same conflicts within this window is a blind retry. */
 const CLAIM_RETRY_WINDOW_MS = 10 * 60_000;
+/**
+ * A path claim made this long after the task was last set points to that task: work that starts
+ * with a claim is often new work, and an agent that just got a go-ahead keeps "on hold" as its
+ * task while it works (peers then plan around a hold that ended).
+ */
+const TASK_STALE_MS = 3 * 60_000;
 /** Worktrees remembered as explained (`everywhereHint`): an agent works in a handful. */
 const SCOPES_EXPLAINED_CAP = 32;
 
@@ -118,6 +124,17 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 	let lastClaimRefusal: { key: string; at: number } | null = null;
 	/** Worktrees whose full-path claim was explained (`everywhereHint`), and at which compaction. */
 	const scopeExplained = new Map<string, number>();
+	/** The task (by when it was set) a claim result last pointed to: once per task is enough. */
+	let taskPointedAt: number | undefined;
+
+	/** After a path claim: the task peers see, when it may no longer say what this agent does. */
+	function staleTaskHint(me: Presence, now: number): string {
+		if (!me.task || me.taskAt === undefined || now - me.taskAt < TASK_STALE_MS || taskPointedAt === me.taskAt) return "";
+		// Solo work pays nothing (AGENTS.md, rule 2): nobody reads the task.
+		if (rt.team().length === 0) return "";
+		taskPointedAt = me.taskAt;
+		return `Peers still see your task as "${clip(me.task, 120)}" (set ${ago(me.taskAt, now)}). If this claim starts other work, say so: telecom({ action: "status", message: "…" }).`;
+	}
 
 	function boardAction({ me, params }: ActionCall): ToolResult {
 		return ok(rt.boardText(params.scope ?? "project"), { callsign: me.callsign, peers: rt.team().map((p) => p.callsign) });
@@ -192,18 +209,67 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 		return params.to?.trim() ? resolveTarget(params.to, me, peers) : ownerOf(paths, params.action, me, peers);
 	}
 
+	/**
+	 * Whom a `send` goes to: one agent (as `messageTarget` finds it), or several named in `to`
+	 * with commas. In a team of more than two, a decision often needs two or three teammates to
+	 * read the same words; one call keeps them in one thread instead of near-copies.
+	 */
+	function sendTargets(call: ActionCall): Array<Target & { ok: true }> | string {
+		const raw = call.params.to?.trim() ?? "";
+		const names = raw.split(",").map((n) => n.trim()).filter(Boolean);
+		if (names.length <= 1) {
+			const target = messageTarget(call);
+			return target.ok ? [target] : target.reason;
+		}
+		if (!call.message) return '"send" needs a `message`';
+		const peers = rt.readPeers();
+		// A session name may itself hold a comma: the whole of `to` naming one agent wins.
+		const whole = resolveTarget(raw, call.me, peers);
+		if (whole.ok) return [whole];
+		const targets: Array<Target & { ok: true }> = [];
+		for (const name of names) {
+			// Naming oneself among the recipients is harmless: the others still get it.
+			if (name.replace(/^@/, "").toLowerCase() === call.me.callsign) continue;
+			const target = resolveTarget(name, call.me, peers);
+			if (!target.ok) return `${target.reason} Nothing was sent.`;
+			if (!targets.some((t) => t.peer.id === target.peer.id)) targets.push(target);
+		}
+		if (targets.length === 0) return "that is you — a message to yourself would arrive as your own turn";
+		if (targets.length > GROUP_CAP) {
+			return `\`to\` names ${targets.length} agents, and one message goes to at most ${GROUP_CAP}. Nothing was sent. To tell the whole team: telecom({ action: "broadcast", message: "…" }).`;
+		}
+		return targets;
+	}
+
 	function sendAction(call: ActionCall): ToolResult {
-		const target = messageTarget(call);
-		if (!target.ok) return fail(target.reason);
+		const targets = sendTargets(call);
+		if (typeof targets === "string") return fail(targets);
 		const defer = call.params.interrupt === false;
 		const extra: Partial<Envelope> = {
 			...(defer ? { defer: true as const } : {}),
 			...(call.params.unblocks === true ? { unblocks: true as const } : {}),
+			...(targets.length > 1 ? { group: targets.map((t) => t.peer.callsign) } : {}),
 		};
-		const sent = call.net.deliver(rt.envelope(target.peer.id, "message", call.message, extra));
-		if (!sent.ok) return fail(sent.reason);
-		rt.noteContact(target.peer.id);
-		return ok(`sent to ${targetName(target)} (${stateHint(target.peer, call.me, rt.peers, defer)})`, { to: target.peer.callsign });
+		const reached: string[] = [];
+		const shown: string[] = [];
+		const failed: string[] = [];
+		const reasons: string[] = [];
+		for (const target of targets) {
+			const sent = call.net.deliver(rt.envelope(target.peer.id, "message", call.message, extra));
+			if (!sent.ok) {
+				failed.push(target.peer.callsign);
+				reasons.push(sent.reason);
+				continue;
+			}
+			rt.noteContact(target.peer.id);
+			reached.push(target.peer.callsign);
+			shown.push(`${targetName(target)} (${stateHint(target.peer, call.me, rt.peers, defer)})`);
+		}
+		const only = targets.length === 1 ? targets[0] : undefined;
+		if (only) return reached.length > 0 ? ok(`sent to ${shown[0]}`, { to: only.peer.callsign }) : fail(reasons[0] ?? "not delivered");
+		if (reached.length === 0) return fail(`not delivered to anyone: ${reasons.join("; ")}`, { failed });
+		const missed = failed.length > 0 ? `\nNot delivered to ${failed.join(", ")}: ${reasons.join("; ")}` : "";
+		return ok(`sent to ${shown.join("; ")}. Each sees who else got it.${missed}`, { reached, failed });
 	}
 
 	async function askAction(call: ActionCall): Promise<ToolResult> {
@@ -317,10 +383,29 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 		}`;
 	}
 
-	function replyAction({ me, net, params, message }: ActionCall): ToolResult {
+	function replyAction(call: ActionCall): ToolResult {
+		const { me, net, params, message } = call;
 		if (!message) return fail('"reply" needs a `message`');
 		const outstanding = rt.ledger.inbound();
 		let askId = params.askId?.trim() ?? "";
+		if (!askId && params.to?.trim()) {
+			// `to` names whom the reply is for: the one ask that peer has waiting, never another
+			// peer's that happens to be the only one open.
+			const target = resolveTarget(params.to, me, rt.readPeers());
+			if (!target.ok) return fail(target.reason);
+			const theirs = outstanding.filter((a) => a.from === target.peer.id);
+			if (theirs.length > 1) return fail(`which ask? ${target.peer.callsign} has ${theirs.length} waiting. Pass askId: ${listAsks(theirs)}`);
+			const only = theirs[0];
+			if (only) askId = only.id;
+			else {
+				// No ask of theirs is open: what the model wants is for them to read this, so it goes
+				// as a message rather than coming back refused.
+				const sent = sendAction(call);
+				if (sent.isError) return sent;
+				const text = sent.content[0]?.text ?? "";
+				return ok(`no ask from ${target.peer.callsign} was waiting, so this went as a message: ${text}`, { ...sent.details, asMessage: true });
+			}
+		}
 		if (!askId && outstanding.length === 1) askId = (outstanding[0] as InboundAsk).id;
 		if (!askId) {
 			return fail(
@@ -403,6 +488,9 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 					if (relative === null || !claimsOverlap(relative, pattern, me.projectRoot)) continue;
 					const what = `"${claimShown(mine)}" overlaps ${peer.callsign}'s claim "${claimShown(theirs)}"${theirs.note ? ` (${theirs.note})` : ""}`;
 					const shared = where.some((c) => (mine.checkout ? c === mine.checkout : mineIn.has(c)));
+					// A whole worktree claimed in another checkout is that copy, not repository paths.
+					const wholeCopy = (c: Scoped) => c.checkout !== undefined && coversCheckout(c.pattern, c.checkout);
+					if (!shared && (wholeCopy(theirs) || wholeCopy(mine))) continue;
 					if (!shared) lanes.push(`${what} in ${laneName(laneIn(theirs.checkout ?? workingCheckout(peer), peer))}`);
 					else conflicts.push({ mine: mine.pattern, scoped: mine.checkout !== undefined, relative, owner: peer, theirs: theirs.pattern, ...(theirs.checkout ? { theirsIn: theirs.checkout } : {}), what });
 				}
@@ -670,6 +758,10 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 			lines.push(`pid ${askedPid} is not running, so this is a normal claim: idle claims expire after ${ttl} min.`);
 		}
 		lines.push(...queuedText);
+		if (grantedPaths.length > 0) {
+			const stale = staleTaskHint(me, now);
+			if (stale) lines.push(stale);
+		}
 		if (refusal) lines.push(`Not claimed: ${refusal}`);
 		if (away) lines.push(`Not claimed: ${away}`);
 		return ok(lines.join("\n"), {
@@ -744,7 +836,7 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 			}
 			// Schema validation should rule this out, but a model can still send anything.
 			if (!Object.hasOwn(actions, params.action)) return fail(`unknown action "${String(params.action)}"`);
-			const message = params.message?.trim() ?? "";
+			const message = withoutSelfName(params.message?.trim() ?? "", rt.self.callsign);
 			return actions[params.action]({ me: rt.self, net: rt.transport, params, message, signal, onUpdate });
 		},
 	});

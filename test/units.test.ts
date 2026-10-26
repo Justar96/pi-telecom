@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { test } from "node:test";
+import { after, test } from "node:test";
 import { renderBrief, TASK_ONLY_HOLD_MS } from "../src/board.ts";
 import { childCallsign, mustYield, pickCallsign } from "../src/callsign.ts";
 import { readConfig } from "../src/config.ts";
@@ -13,6 +13,17 @@ import { canonicalPath, displayPath, findProjectRoot, findRepo, inCheckout, lane
 import { HangingText } from "../src/render.ts";
 import { idMatches, shortId } from "../src/util.ts";
 import { CHILD_SILENT_MS, type Envelope, hostBeats, isLive, openTransport, type Presence, parseEnvelope, parseEvent, parsePresence, transportRoot } from "../src/transport.ts";
+
+/** Scratch directories this file made, removed once its tests are done. */
+const scratchDirs: string[] = [];
+function tempDir(prefix: string): string {
+	const dir = mkdtempSync(join(tmpdir(), prefix));
+	scratchDirs.push(dir);
+	return dir;
+}
+after(() => {
+	for (const dir of scratchDirs) rmSync(dir, { recursive: true, force: true });
+});
 
 const R = "/work/proj";
 
@@ -84,7 +95,7 @@ test("callsigns: first free NATO word, persisted preference, convergence", () =>
 });
 
 test("project: git root, branch, canonical and display paths", () => {
-	const dir = mkdtempSync(join(tmpdir(), "telecom-proj-"));
+	const dir = tempDir("telecom-proj-");
 	mkdirSync(join(dir, ".git"));
 	writeFileSync(join(dir, ".git", "HEAD"), "ref: refs/heads/feature/x\n");
 	mkdirSync(join(dir, "src", "deep"), { recursive: true });
@@ -96,7 +107,7 @@ test("project: git root, branch, canonical and display paths", () => {
 	assert.equal(displayPath(join(root, "src", "a.ts"), root), "src/a.ts");
 	assert.equal(displayPath("/elsewhere/x", root), "/elsewhere/x");
 	// A worktree: .git is a file pointing at the real git dir.
-	const wt = mkdtempSync(join(tmpdir(), "telecom-wt-"));
+	const wt = tempDir("telecom-wt-");
 	mkdirSync(join(dir, ".git", "worktrees", "wt"), { recursive: true });
 	writeFileSync(join(dir, ".git", "worktrees", "wt", "HEAD"), "ref: refs/heads/wt-branch\n");
 	writeFileSync(join(wt, ".git"), `gitdir: ${join(dir, ".git", "worktrees", "wt")}\n`);
@@ -116,7 +127,7 @@ test("config: defaults and validation", () => {
 });
 
 test("transport: root safety, delivery order, validation, sweep of dead sessions", () => {
-	const base = mkdtempSync(join(tmpdir(), "telecom-root-"));
+	const base = tempDir("telecom-root-");
 	const pinned = transportRoot({ PI_TELECOM_DIR: join(base, "sb") });
 	assert.ok(pinned.ok);
 	const fallback = transportRoot({ XDG_RUNTIME_DIR: join(base, "missing") });
@@ -298,7 +309,7 @@ test("ids: the short form tells apart UUIDv7 session ids started in the same min
 // ---------------------------------------------------------------- lanes and families
 
 test("project: worktrees share their repository; submodules and plain folders are their own", () => {
-	const base = realpathSync.native(mkdtempSync(join(tmpdir(), "telecom-repo-")));
+	const base = realpathSync.native(tempDir("telecom-repo-"));
 	const main = join(base, "main");
 	mkdirSync(join(main, ".git", "worktrees", "wt"), { recursive: true });
 	writeFileSync(join(main, ".git", "HEAD"), "ref: refs/heads/main\n");
@@ -358,7 +369,7 @@ test("callsigns: subagents are named after their parent; uniqueness spans the re
 });
 
 test("family: lineage from the runner's environment or from a live parent in this process; a fork is not a child", () => {
-	const dir = mkdtempSync(join(tmpdir(), "telecom-family-"));
+	const dir = tempDir("telecom-family-");
 	const parentFile = join(dir, "2026-10-22T00-00-00-000Z_parent-session-01.jsonl");
 	writeFileSync(parentFile, `${JSON.stringify({ type: "session", id: "parent-session-01", cwd: "/x" })}\n{"type":"message"}\n`);
 	assert.equal(sessionIdOfFile(parentFile), "parent-session-01");
@@ -517,7 +528,7 @@ test("briefs: a task change alone is held, then told once the hold has passed", 
 });
 
 test("briefs: a move to another worktree is held like a task change, a move back is no news, and nothing repeats on a timer", () => {
-	const base = realpathSync.native(mkdtempSync(join(tmpdir(), "telecom-brief-lane-")));
+	const base = realpathSync.native(tempDir("telecom-brief-lane-"));
 	const main = join(base, "main");
 	mkdirSync(join(main, ".git", "worktrees", "wt"), { recursive: true });
 	writeFileSync(join(main, ".git", "HEAD"), "ref: refs/heads/main\n");

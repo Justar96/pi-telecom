@@ -6,6 +6,40 @@ All notable changes to `@justar_96/pi-telecom`. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `send` takes several recipients, comma-separated (`to: "alpha, bravo"`). Each gets the message
+  once, sees who else got it, and is shown how to answer all of them. A name that answers to
+  nobody sends nothing. The envelope field `group` is optional; older peers show a plain message.
+
+### Changed
+
+- `reply` with `to` answers that teammate's ask, and with none of theirs open sends the text as a
+  message instead of refusing.
+- Team updates no longer report `@name` locks being taken and released, nor teammates queuing for
+  a lock someone else holds. Queuing for a lock this agent holds is still news.
+- A declared wait that ends by itself (the waiter heard from the teammate and got to work) is told
+  to the waiter, passively: who is still awaited, the task peers see, and the call to keep waiting.
+- A path claim made 3 minutes or more after the task was set shows the task peers see, once per
+  task, with the call to update it.
+- Team updates name every checkout a teammate works in, and report a move only into a checkout
+  not reported before. An agent editing notes in one checkout and code in another by turns is
+  one update, not one per turn.
+- A teammate's finished run no longer wakes an agent waiting for it when that run already sent the
+  agent a message.
+- The note that a declared wait closes a wait cycle comes once per cycle, not with every `status`.
+- A leading own callsign (`bravo: …`, `bravo → echo: …`) is dropped from tasks and messages; every
+  surface already names the sender.
+
+### Fixed
+
+- `reply` with `to` and no `askId` answered the one open ask even when it came from someone else,
+  so the answer went to the wrong teammate.
+- The note a claim's owner gets about an edit in another checkout named the editor's starting
+  checkout and an absolute path, not the worktree the file lies in.
+- A claim on a whole worktree (`/repo-b/**`) made every edit and claim in every other checkout of
+  the repository "inside" it, with a merge note to both agents.
+
 ## [0.5.2] - 2026-10-25
 
 ### Added

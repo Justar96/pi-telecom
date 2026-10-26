@@ -82,6 +82,8 @@ const TOOL_PATTERN = /^[A-Za-z0-9_.:-]{1,128}$/;
 export const BLOCKED_CAP = 8;
 /** Most resource locks one agent may wait in line for (`queued`). */
 export const QUEUED_CAP = 8;
+/** Recipients one message may go to at once (`to: "alpha, bravo"`); more is a broadcast. */
+export const GROUP_CAP = 8;
 /** A larger count of asks owed is not believed: no session owes that many. */
 const ASKS_OWED_MAX = 999;
 
@@ -236,6 +238,12 @@ export interface Envelope {
 	 * peers ignore it and end the wait on any message, as they always did.
 	 */
 	unblocks?: true;
+	/**
+	 * For `message`: the callsigns of everyone the same message went to (`to: "alpha, bravo"`),
+	 * this recipient among them, so each knows who else read it. Older peers ignore it and show
+	 * a plain message.
+	 */
+	group?: string[];
 	/**
 	 * For `broadcast`: the paths or globs it is about, in the sender's checkout. Agents working
 	 * there get it at once; the rest at their next prompt. Absent: it is about everyone.
@@ -637,7 +645,14 @@ export function parseEnvelope(value: unknown): Envelope | null {
 		...(r.kind === "message" && r.defer === true ? { defer: true as const } : {}),
 		...((r.kind === "message" || r.kind === "answer") && r.unblocks === true ? { unblocks: true as const } : {}),
 		...broadcastPaths(r),
+		...messageGroup(r),
 	};
+}
+
+function messageGroup(r: Record<string, unknown>): { group?: string[] } {
+	if (r.kind !== "message" || !Array.isArray(r.group)) return {};
+	const group = r.group.slice(0, GROUP_CAP).filter((c): c is string => typeof c === "string" && CALLSIGN_PATTERN.test(c));
+	return group.length > 1 ? { group } : {};
 }
 
 function broadcastPaths(r: Record<string, unknown>): { paths?: string[] } {

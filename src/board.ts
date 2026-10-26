@@ -269,7 +269,7 @@ export function renderBoard(input: BoardInput): string {
  *  every file touched (relevant file changes reach the agent as change notices instead). */
 export interface BriefState {
 	/**
-	 * Per unit: `task`, `claims` and `lane` (the checkout and branch it works in) as this agent was
+	 * Per unit: `task`, `claims` and `lanes` (the checkouts and branches it works in) as this agent was
 	 * last TOLD them (a far peer's changes are held back, and must still read as news once it comes
 	 * near), `holders` the session holding each current claim, `members` its folded subagents, and
 	 * `described`: whether it was described in full (not only named on the roster).
@@ -280,7 +280,7 @@ export interface BriefState {
 			callsign: string;
 			task: string;
 			claims: string[];
-			lane: string;
+			lanes: string[];
 			holders: Map<string, string>;
 			members: string[];
 			described: boolean;
@@ -421,10 +421,25 @@ function rosterEntry(unit: Unit, now: number, waits: readonly string[] = []): st
 	}${waits.length > 0 ? ` — waiting for ${waits.join(", ")}` : ""}`;
 }
 
-/** Where a unit works, as an update tells it: `on lane-b in worktree /repo-b`. */
-function laneText(peer: Presence): string {
-	const { lane, branch } = workplace(peer);
-	return `${branch ? `on ${branch} ` : ""}in ${laneName(lane)}`;
+/**
+ * Every checkout a unit works in, as an update names each: `on lane-b in worktree /repo-b`. Its
+ * recent edits in the repository say where (none: where it started). A set, not the newest edit's
+ * checkout: agents keep notes in the main checkout and code in a worktree, and edit both by turns,
+ * so the newest edit flips between them all day and each flip was an update about nothing new.
+ */
+function laneTexts(peer: Presence): string[] {
+	const cache: PlaceCache = new Map();
+	const checkouts = new Set<string>();
+	for (const r of peer.recent) {
+		const place = placeOf(r.path, peer, cache);
+		if (place) checkouts.add(place.checkout);
+	}
+	if (checkouts.size === 0) checkouts.add(peer.projectRoot);
+	return [...checkouts].sort().map((checkout) => {
+		const read = checkout === peer.projectRoot ? undefined : readBranch(checkout);
+		const branch = read ? clip(read, 100) : checkout === peer.projectRoot ? peer.branch : undefined;
+		return `${branch ? `on ${branch} ` : ""}in ${laneName(laneIn(checkout, peer))}`;
+	});
 }
 
 function stateOf(units: readonly Unit[], now: number, described: ReadonlySet<string>, self: Presence, all: readonly Presence[]): BriefState["peers"] {
@@ -438,7 +453,7 @@ function stateOf(units: readonly Unit[], now: number, described: ReadonlySet<str
 				callsign: u.peer.callsign,
 				task: u.peer.task ?? "",
 				claims: unitClaims(u, now),
-				lane: laneText(u.peer),
+				lanes: laneTexts(u.peer),
 				holders: claimHolders(u, now),
 				members: u.subagents.map((s) => s.id),
 				described: described.has(u.peer.id),
@@ -533,9 +548,9 @@ export function renderBrief(
 	};
 	const changes: string[] = [];
 	/** Far units whose news was held back: what this agent still knows of their task, claims and lane. */
-	const held = new Map<string, { task: string; claims: string[]; lane: string; queued: string[]; waits: string[] }>();
+	const held = new Map<string, { task: string; claims: string[]; lanes: string[]; queued: string[]; waits: string[] }>();
 	/** Near units whose task or lane changed: what this agent was told before. */
-	const moves = new Map<string, { task: string; lane: string }>();
+	const moves = new Map<string, { task: string; lanes: string[] }>();
 	/** The update lines that only say a peer moved on (task or lane). */
 	let moveLines = 0;
 	// A subagent folded into a unit last time, now a unit of its own: its parent left, it stayed.
@@ -565,12 +580,12 @@ export function renderBrief(
 			// Far from this agent's work: its task and new claims are not news yet. The guard still
 			// stops an edit inside its claims, and a claim over this agent's files makes it near.
 			// A release of a claim this agent was told about is news: it may be keeping out of it.
-			const dropped = before.claims.filter((c) => !after.claims.includes(c));
+			const dropped = before.claims.filter((c) => !after.claims.includes(c) && !isResource(c));
 			if (dropped.length) changes.push(`• ${name} released ${claimsText(dropped)}`);
 			held.set(peer.id, {
 				task: before.task,
 				claims: before.claims.filter((c) => after.claims.includes(c)),
-				lane: before.lane,
+				lanes: before.lanes ?? [],
 				queued: before.queued ?? [],
 				waits: before.waits ?? [],
 			});
@@ -579,17 +594,26 @@ export function renderBrief(
 		const newTask = before.task !== after.task && after.task !== "";
 		if (newTask) changes.push(`• ${name} is now on: ${briefTask(after.task)}`);
 		// Where its claims bind and its copies of files lie: the full brief said, so a move is news.
-		const newLane = before.lane !== after.lane;
-		if (newLane) changes.push(`• ${name} now works ${after.lane}`);
+		// A checkout it works in that this agent was not told of. One it stopped working in is not
+		// news: its claims, which are what binds, are reported on their own.
+		const newLanes = after.lanes.filter((l) => !(before.lanes ?? []).includes(l));
+		const newLane = newLanes.length > 0;
+		if (newLane) changes.push(`• ${name} now works ${newLanes.join(", and ")}`);
 		if (newTask || newLane) {
-			moves.set(peer.id, { task: before.task, lane: before.lane });
+			moves.set(peer.id, { task: before.task, lanes: before.lanes ?? [] });
 			moveLines += Number(newTask) + Number(newLane);
 		}
-		const added = after.claims.filter((c) => !before.claims.includes(c));
-		const dropped = before.claims.filter((c) => !after.claims.includes(c));
+		// Locks change hands every few minutes in a busy team, and an update for each costs every
+		// teammate a line about a job it is not part of. Whoever needs a lock learns its holder by
+		// claiming it (queue: true is woken when it frees), so taking and releasing one is not news;
+		// someone queuing for this agent's own lock is (it should release it soon).
+		const added = after.claims.filter((c) => !before.claims.includes(c) && !isResource(c));
+		const dropped = before.claims.filter((c) => !after.claims.includes(c) && !isResource(c));
 		if (added.length) changes.push(`• ${name} claimed ${claimsText(added)}`);
 		if (dropped.length) changes.push(`• ${name} released ${claimsText(dropped)}`);
-		const inLine = after.queued.filter((q) => !(before.queued ?? []).includes(q));
+		const inLine = after.queued.filter(
+			(q) => !(before.queued ?? []).includes(q) && liveClaims(self, now).some((c) => sameResource(c.pattern, q)),
+		);
 		if (inLine.length) changes.push(`• ${name} queued for ${inLine.map((q) => lockHolderText(q, self, all, now)).join(", ")}`);
 		// A new declared wait is news; one cleared is not (the agent is simply back at work).
 		if (after.waits.length > 0 && after.waits.join(", ") !== (before.waits ?? []).join(", ")) {

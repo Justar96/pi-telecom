@@ -22,7 +22,7 @@
  */
 import { join } from "node:path";
 import type { GuardMode } from "./config.ts";
-import { claimShown, matchesClaim } from "./glob.ts";
+import { claimShown, coversCheckout, matchesClaim } from "./glob.ts";
 import { displayPath, laneIn, laneName, type Place, type PlaceCache, placeOf, sameRepo, workingCheckout } from "./project.ts";
 import type { Claim, Presence } from "./transport.ts";
 import { ago, fileFingerprint, pairKey, setBounded } from "./util.ts";
@@ -380,6 +380,9 @@ export class Awareness {
 					claim.note ? ` (${claim.note})` : ""
 				}, held since ${ago(claim.since)}`;
 				if (otherLane) {
+					// A claim on a whole worktree of its own reserves that copy, which this edit does not
+					// touch: every file of the repository would otherwise be "inside" it.
+					if (claim.checkout && coversCheckout(claim.pattern, claim.checkout)) continue;
 					lane ??= { peer, claim, what };
 					continue;
 				}

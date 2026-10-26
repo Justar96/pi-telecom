@@ -176,7 +176,8 @@ the module; use `import type` for those.
   Older peers ignore this field and apply their usual wake limit. A `message` may carry optional
   `defer: true` (sent with `interrupt: false`), and a `message` or `answer` optional
   `unblocks: true` (it ends the recipient's declared wait on the sender); older peers deliver
-  such a message as a plain one. Draining checks the recipient;
+  such a message as a plain one. A `message` may carry optional `group` (the callsigns of every
+  recipient of a `send` to several); older peers show a plain message. Draining checks the recipient;
   answers and withdrawals are matched to the session involved in the ask.
 - **Delivery to the model** (`inject` modes):
 
@@ -243,7 +244,9 @@ the module; use `import type` for those.
   and once per stall when the teammate has `unreadSince` or stays idle `STALE_WAIT_BEATS`. It is
   declared once (`status` without `waitingFor` keeps it, `[]` clears it) and ends by itself: on
   a message or answer with `unblocks`, or once the waiter has heard from the teammate and gets to
-  work (an edit, a new path claim, or a step other than `telecom` since then). A message that
+  work (an edit, a new path claim, or a step other than `telecom` since then); the waiter is then
+  told, `passive`. A finished run that messaged the waiter (`lastHeard` after `busyFrom`) wakes
+  nothing more. `declare` names a closed cycle once per cycle (`cyclesTold`). A message that
   leaves it in place carries `stillWaitingNote`. A cycle of declared waits is told only when
   every member has been idle `CYCLE_STALL_MS`, once per stall, as a `wake`: working agents
   resolve one by themselves. `blockedSince` (optional) dates the wait for the board's "Waiting
@@ -276,13 +279,17 @@ the module; use `import type` for those.
   `BRIEF_CLAIMS_SHOWN` claims and `BRIEF_TASK_SHOWN` characters of a task, pointing to the board,
   which shows both whole. Deltas hold back a far unit's task, lane and new
   claims, but always report joins, departures, callsign changes and releases of told claims.
+  `@name` locks taken and released are never delta news (whoever needs one learns its holder by
+  claiming it); a teammate queuing for a lock this agent holds is.
   `BriefState` stores what the model was TOLD, so held-back news is reported once the unit is
   near again; `holders` (current, per claim) decides which claims a departure frees.
 - **Full briefs and updates.** A full brief goes out once, then again only when `fullAt` is 0
   (a compaction, a callsign change): everything told since is still in the context, so a timed
   repeat only spends tokens. An update made only of moves (a near unit's new task or lane, where
   `workplace` is the checkout of its newest in-repository edit) waits up to `TASK_ONLY_HOLD_MS`
-  for other news; a unit that moves back meanwhile is no news at all.
+  for other news; a unit that moves back meanwhile is no news at all. A unit's lanes are a set
+  (`laneTexts`: every checkout of its recent in-repository edits), and only a checkout not told
+  before is a move: agents edit notes in one checkout and code in another by turns.
 
 ## Rules the code must keep
 

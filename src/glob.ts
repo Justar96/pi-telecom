@@ -130,6 +130,15 @@ export function laneRelativePattern(pattern: string, ownerRoot: string): string 
 	return isWithin(trimmed, ownerRoot) ? displayPath(trimmed, ownerRoot) : null;
 }
 
+/**
+ * Does a claim cover its whole checkout (`**`, `.`)? Named with a worktree (`/repo-b/**`), such a
+ * claim says "this copy is mine", not "these files of the repository": no other checkout can
+ * touch that copy, so edits and claims elsewhere are not worth a note about the merge.
+ */
+export function coversCheckout(pattern: string, root: string): boolean {
+	return !isResource(pattern) && absolutePattern(pattern, root) === absolutePattern(".", root);
+}
+
 /** A claim as it reads: its pattern, and the checkout it binds in when its owner named one. */
 export function claimShown(claim: { pattern: string; checkout?: string }): string {
 	return claim.checkout ? `${claim.pattern} (in ${basename(claim.checkout)})` : claim.pattern;

@@ -5,13 +5,16 @@
  * extension instance, and they meet on a scratch switchboard (`PI_TELECOM_DIR`). They share
  * the process id, which is fine — liveness is per pid, and the pid is alive.
  */
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { after, before, type TestContext } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 export const SCRATCH = realpathSync.native(mkdtempSync(join(tmpdir(), "pi-telecom-test-")));
+// Every test file runs in its own process: its scratch directory goes with it, so repeated runs
+// do not pile up projects and switchboards in the temp directory.
+process.on("exit", () => rmSync(SCRATCH, { recursive: true, force: true }));
 process.env.PI_TELECOM_DIR = join(SCRATCH, "switchboard");
 process.env.PI_TELECOM_TICK_MS = "20";
 delete process.env.PI_TELECOM_GUARD;

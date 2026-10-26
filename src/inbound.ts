@@ -8,7 +8,7 @@ import type { PeerChange } from "./awareness.ts";
 import { claimMatcher, claimsOverlap, isResource, laneRelativePattern, matchesClaim } from "./glob.ts";
 import { closesCycle, type HeldMessage, type InboundAsk } from "./ledger.ts";
 import { type PendingNotice, renderNotice } from "./notices.ts";
-import { displayPath, isWithin, laneName, sameRepo } from "./project.ts";
+import { displayPath, isWithin, laneIn, laneName, sameRepo } from "./project.ts";
 import { MESSAGE_TYPES } from "./render.ts";
 import { CONTACT_NEAR_MS, type MessageDetails, type Runtime, taskLine } from "./runtime.ts";
 import { type Envelope, type FileChangedData, parseEvent, type Presence } from "./transport.ts";
@@ -105,7 +105,14 @@ export function createInbound(rt: Runtime, waiting: Waiting): Inbound {
 					runTask(env);
 					return;
 				}
-				const message: HeldMessage = { id: env.id, from: env.from, fromCallsign: from, text: env.text, ...(env.human ? { human: true as const } : {}) };
+				const message: HeldMessage = {
+					id: env.id,
+					from: env.from,
+					fromCallsign: from,
+					text: env.text,
+					...(env.human ? { human: true as const } : {}),
+					...(env.group ? { group: env.group } : {}),
+				};
 				// While this agent is blocked in an ask to the sender, the answer comes back as that
 				// ask's tool result, which the model reads before anything steered in now. So the
 				// message waits with the ask, to be shown ahead of the answer it came before.
@@ -190,10 +197,15 @@ export function createInbound(rt: Runtime, waiting: Waiting): Inbound {
 				if (event.data.lane) {
 					// Nothing was held back (their checkout is separate), so there is no one to tell
 					// on release: this is news about the merge ahead.
+					// Named by where the file lies, not where the sender started: agents often start in
+					// the main checkout and edit a worktree of their own.
 					const sender = rt.peers.find((p) => p.id === env.from);
+					const place = rt.awareness.placeOf(path, sender ?? rt.self);
+					const shown = place ? displayPath(path, place.checkout) : displayPath(path, sender?.projectRoot ?? rt.root());
+					const where = place ? laneName(laneIn(place.checkout, sender ?? rt.self)) : sender ? laneName(sender) : "another checkout of this repository";
 					rt.inject(
 						MESSAGE_TYPES.claim,
-						`**📡 ${env.fromCallsign} changed a path you claimed, in another checkout**\n\n${env.fromCallsign} edited ${displayPath(path, sender?.projectRoot ?? rt.root())} in ${sender ? laneName(sender) : "another checkout of this repository"}, inside your claim "${pattern}". Nothing was held back, since your checkouts are separate, but the two changes meet when the branches merge. If they may conflict, agree on one owner: telecom({ action: "send", to: "${env.fromCallsign}", message: "…" }).`,
+						`**📡 ${env.fromCallsign} changed a path you claimed, in another checkout**\n\n${env.fromCallsign} edited ${shown} in ${where}, inside your claim "${pattern}". Nothing was held back, since your checkouts are separate, but the two changes meet when the branches merge. If they may conflict, agree on one owner: telecom({ action: "send", to: "${env.fromCallsign}", message: "…" }).`,
 						{ ...peer, tone: "warning" },
 						"passive",
 					);

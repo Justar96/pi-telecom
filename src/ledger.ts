@@ -43,6 +43,8 @@ export interface HeldMessage {
 	text: string;
 	/** A human typed it (`/telecom msg`), not the model. */
 	human?: true;
+	/** Everyone the same message went to, this agent among them (`Envelope.group`). */
+	group?: string[];
 }
 
 /**
