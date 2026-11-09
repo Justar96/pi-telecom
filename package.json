@@ -1,6 +1,6 @@
 {
 	"name": "@justar_96/pi-telecom",
-	"version": "0.6.0",
+	"version": "0.7.0",
 	"description": "Telecom for pi: parallel pi agents in the same project see each other, talk, claim work, and get told when a peer changes a file they depend on.",
 	"license": "MIT",
 	"author": "Justar96",
@@ -32,6 +32,11 @@
 			"./src/index.ts"
 		]
 	},
+	"omp": {
+		"extensions": [
+			"./src/index.ts"
+		]
+	},
 	"engines": {
 		"node": ">=22.6"
 	},
@@ -42,6 +47,7 @@
 		"e2e:live": "node scripts/e2e-live.mjs",
 		"e2e:cache": "node scripts/e2e-cache.mjs",
 		"e2e:matrix": "node scripts/e2e-matrix.mjs",
+		"e2e:omp": "node scripts/e2e-omp.mjs",
 		"screenshots": "node scripts/screenshots/capture.mjs",
 		"check": "npm run typecheck && npm test && npm run e2e",
 		"prepublishOnly": "npm run typecheck && npm test"

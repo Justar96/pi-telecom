@@ -6,6 +6,47 @@ All notable changes to `@justar_96/pi-telecom`. The format follows
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-10
+
+### Added
+
+- oh-my-pi (`omp`) support. Telecom loads through omp's pi-extension support (`omp plugin install
+  @justar_96/pi-telecom`), and omp and pi sessions form one team. On omp, telecom goes idle on
+  `agent_end` and busy on `agent_start` (omp has no settle hooks, and a run a wake-up starts skips
+  `before_agent_start`), reminds of owed asks through `session_stop`, and offers its tool without
+  discovery. `npm run e2e:omp` checks it with real omp processes.
+
+### Changed
+
+- Quieter transcript. Telecom messages and tool calls have no blank rows inside their panels.
+  Messages open with a one-line route (`📡 bravo → you · ask · they wait`). Folded, a message
+  leaves out the lines written for the model, a team update is one line, and a call shows its
+  message on the header row. A claim result shows what was claimed, with the guidance once expanded.
+- A short go-ahead ("go ahead", "commit and merge", "yes B is good") no longer replaces the task
+  peers see. A short new task ("fix parser bug") still does.
+- The "still waiting" line comes once per declared wait, not with every message from the awaited
+  teammate. Declaring the wait again, or a compaction, brings it back.
+- Claims lapsing close together are told in one notice. Each is still released at its expiry; only
+  the notice waits, at most a minute (or a quarter of the TTL), for the others.
+- The notice that a declared wait ended is shorter. It names the task only when the task still
+  says the agent waits, and no longer offers a ready-made call to wait again.
+- A `send` result no longer advises `wait: false` when the recipient is in a long step: that
+  advice is for blocking asks.
+- `status` no longer reports a wait on this agent, or a wait cycle through it, that this agent
+  already answered (`reply`) or ended (`unblocks: true`).
+
+### Fixed
+
+- A claim pattern starting with `!` is refused with the reason: claims have no exclusions, so it
+  matched nothing. The other paths are still claimed.
+- An ask with a `timeoutSec` above the cap says it was capped.
+
+- End-of-run continuations preserve draft entries proposed by earlier extensions instead of
+  replacing their messages or saved state.
+- Deferred messages and owed-ask reminders create their own runnable context after a completed
+  response. They are processed before final settlement rather than skipped because the previous
+  context ended with an assistant message. Aborted and failed runs still do not continue.
+
 ## [0.6.0] - 2026-10-26
 
 ### Added
@@ -450,7 +491,8 @@ First release.
   presence repairs itself.
 - Prompt cache unaffected: 84.4 % hit rate with and without telecom on Claude Sonnet 5.5.
 
-[Unreleased]: https://github.com/Justar96/pi-telecom/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/Justar96/pi-telecom/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/Justar96/pi-telecom/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/Justar96/pi-telecom/compare/v0.5.2...v0.6.0
 [0.5.2]: https://github.com/Justar96/pi-telecom/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/Justar96/pi-telecom/compare/v0.5.0...v0.5.1
