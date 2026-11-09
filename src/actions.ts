@@ -7,6 +7,7 @@ import { join, resolve } from "node:path";
 import type { AgentToolUpdateCallback } from "@earendil-works/pi-coding-agent";
 import { ownerOf, resolveTarget, stateHint, type Target, targetName } from "./address.ts";
 import { UNRESPONSIVE_MS } from "./awareness.ts";
+import { hostOf, OMP_TOOL_FIELDS } from "./host.ts";
 import { MAX_ASK_TIMEOUT_MS } from "./config.ts";
 import { blockedOnMe, isForegroundChild, lineOf, parentOf } from "./family.ts";
 import { absolutePattern, claimShown, claimsOverlap, coversCheckout, isResource, isResourceName, laneRelativePattern, resourceKey, sameResource } from "./glob.ts";
@@ -32,6 +33,10 @@ const HOLDER_TASK_CAP = 80;
  * description in `tool.ts` names this default (1800 s): keep the two in step.
  */
 const ASYNC_ASK_TIMEOUT_MS = 30 * 60_000;
+/** A claim pattern starting with `!`: claims have no exclusions, so it would match nothing. */
+const NEGATED = /^!/;
+/** Peers remembered by when this agent last ended their wait, or answered them (`unblockedAt`, `answeredAt`). */
+const SENT_CAP = 64;
 /** A claim refused again for the same conflicts within this window is a blind retry. */
 const CLAIM_RETRY_WINDOW_MS = 10 * 60_000;
 /**
@@ -108,6 +113,16 @@ function badNameRefusal(names: readonly string[]): string {
 	return `${names.map((n) => JSON.stringify(n)).join(", ")} ${names.length === 1 ? "is not a lock name" : "are not lock names"}: a lock is @ followed by letters, digits, ".", "_" or "-" (at most 48), such as "@cargo". To claim a path that starts with @, write it as "./@…".`;
 }
 
+/** Said when `timeoutSec` asked for more than an ask may wait: the result's number is the cap. */
+function cappedNote(requestedMs: number, timeoutMs: number): string {
+	return requestedMs > timeoutMs ? ` (the most an ask waits; you asked for ${Math.round(requestedMs / 1000)}s)` : "";
+}
+
+/** Why `!` patterns were not claimed: claims have no exclusions. */
+function negatedRefusal(negated: readonly string[]): string {
+	return `${negated.join(", ")}: a claim cannot exclude paths (a leading "!" is not supported), so ${negated.length === 1 ? "it" : "they"} would match nothing. To leave a file to a teammate, claim the files or folders around it instead of a glob that covers it.`;
+}
+
 /** `["@cargo", "@runtime"]`, for the exact call a result suggests. */
 function listCall(names: readonly string[]): string {
 	return `[${names.map((n) => JSON.stringify(n)).join(", ")}]`;
@@ -126,6 +141,29 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 	const scopeExplained = new Map<string, number>();
 	/** The task (by when it was set) a claim result last pointed to: once per task is enough. */
 	let taskPointedAt: number | undefined;
+	/**
+	 * When this agent last ended each peer's wait on it (`unblocks: true`), and when it last
+	 * answered that peer's ask. Its record may not show it yet: agents often send the go-ahead and
+	 * set their own status in one batch of calls. A plain message (an FYI) ends nothing, so it is
+	 * not kept: the wait it leaves in place is real.
+	 */
+	const unblockedAt = new Map<string, number>();
+	const answeredAt = new Map<string, number>();
+	const note = (map: Map<string, number>, id: string) => setBounded(map, id, Date.now(), SENT_CAP);
+
+	/**
+	 * `peers`, without the waits on this agent that it ended since they began: by `unblocks`
+	 * (`ended`), or also by answering (`answered`), which is enough to drop a "waits for you" hint
+	 * but not a wait cycle.
+	 */
+	function withoutEnded(me: Presence, peers: readonly Presence[], by: "unblocked" | "answered"): Presence[] {
+		return peers.map((p) => {
+			if (!p.blockedOn?.includes(me.id) || p.blockedSince === undefined) return p;
+			const at = Math.max(unblockedAt.get(p.id) ?? 0, by === "answered" ? (answeredAt.get(p.id) ?? 0) : 0);
+			if (at < p.blockedSince) return p;
+			return { ...p, blockedOn: p.blockedOn.filter((id) => id !== me.id) };
+		});
+	}
 
 	/** After a path claim: the task peers see, when it may no longer say what this agent does. */
 	function staleTaskHint(me: Presence, now: number): string {
@@ -174,8 +212,9 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 				delete me.blockedSince;
 			}
 		}
-		// Declaring resets the stall timers: only when the agent says something about its waits.
-		const cycle = declaring ? waiting.declare(peers) : null;
+		// Declaring resets the stall timers: only when the agent says something about its waits. A
+		// wait on this agent that it ended since (`unblocks`) closes no cycle.
+		const cycle = declaring ? waiting.declare(withoutEnded(me, peers, "unblocked")) : null;
 		rt.publish();
 		const kept = me.blockedOn ?? [];
 		const names = callsignsOf(kept, peers, me.id);
@@ -190,7 +229,8 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 				? ` · still waiting for ${names.join(", ")}`
 				: "";
 		// A new task wakes no one: whoever waits on this agent hears it is done from a message.
-		const waiters = rt.team(peers).filter((p) => p.blockedOn?.includes(me.id));
+		// One it ended or answered since needs no hint to do so.
+		const waiters = rt.team(withoutEnded(me, peers, "answered")).filter((p) => p.blockedOn?.includes(me.id));
 		const waitedOn =
 			message && waiters.length > 0
 				? `\n${waiters.map((p) => p.callsign).join(", ")} ${waiters.length === 1 ? "waits" : "wait"} for you. If this is what ${waiters.length === 1 ? "it needs" : "they need"}, tell ${waiters.length === 1 ? "it" : "them"}: telecom({ action: "send", to: "${waiters[0]?.callsign}", message: "…", unblocks: true }).`
@@ -262,8 +302,9 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 				continue;
 			}
 			rt.noteContact(target.peer.id);
+			if (call.params.unblocks === true) note(unblockedAt, target.peer.id);
 			reached.push(target.peer.callsign);
-			shown.push(`${targetName(target)} (${stateHint(target.peer, call.me, rt.peers, defer)})`);
+			shown.push(`${targetName(target)} (${stateHint(target.peer, call.me, rt.peers, { deferred: defer })})`);
 		}
 		const only = targets.length === 1 ? targets[0] : undefined;
 		if (only) return reached.length > 0 ? ok(`sent to ${shown[0]}`, { to: only.peer.callsign }) : fail(reasons[0] ?? "not delivered");
@@ -294,6 +335,7 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 		if (deadlock) return fail(deadlock);
 		const requested = call.params.timeoutSec && call.params.timeoutSec > 0 ? call.params.timeoutSec * 1000 : rt.cfg.askTimeoutMs;
 		const timeoutMs = Math.min(requested, MAX_ASK_TIMEOUT_MS);
+		const capped = cappedNote(requested, timeoutMs);
 		const env = rt.envelope(peer.id, "ask", message);
 		// Wait before delivering, so an answer that arrives at once has an ask to settle.
 		const waiting = rt.ledger.awaitAnswer(env.id, { to: peer.id, toCallsign: peer.callsign, text: message }, timeoutMs, signal);
@@ -308,7 +350,7 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 		}
 		rt.noteContact(peer.id);
 		onUpdate?.({
-			content: [{ type: "text", text: `waiting for ${targetName(target)} (${stateHint(peer, me, rt.peers)})…` }],
+			content: [{ type: "text", text: `waiting for ${targetName(target)} (${stateHint(peer, me, rt.peers, { blockingAsk: true })})${capped}…` }],
 			details: { waiting: peer.callsign },
 		});
 		const answer: AskOutcome = await waiting;
@@ -348,6 +390,7 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 		const peer = target.peer;
 		const requested = params.timeoutSec && params.timeoutSec > 0 ? params.timeoutSec * 1000 : ASYNC_ASK_TIMEOUT_MS;
 		const timeoutMs = Math.min(requested, MAX_ASK_TIMEOUT_MS);
+		const capped = cappedNote(requested, timeoutMs);
 		const env = rt.envelope(peer.id, "ask", message, { async: true });
 		const sent = net.deliver(env);
 		if (!sent.ok) return fail(sent.reason);
@@ -355,7 +398,7 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 		rt.ledger.trackAsync(env.id, { to: peer.id, toCallsign: peer.callsign, text: message }, timeoutMs);
 		rt.noteContact(peer.id);
 		return ok(
-			`asked ${targetName(target)} (${stateHint(peer, me, rt.peers)}) — handle ${env.id}\nYou are not waiting: carry on with other work. The answer arrives as a message and wakes you; if none comes within ${Math.round(timeoutMs / 1000)}s, you are told.`,
+			`asked ${targetName(target)} (${stateHint(peer, me, rt.peers)}) — handle ${env.id}\nYou are not waiting: carry on with other work. The answer arrives as a message and wakes you; if none comes within ${Math.round(timeoutMs / 1000)}s${capped}, you are told.`,
 			{ to: peer.callsign, askId: env.id, async: true },
 		);
 	}
@@ -442,6 +485,8 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 		// A failed delivery leaves the handle available for a retry, including inferred replies.
 		rt.ledger.resolveInbound(askId);
 		rt.noteContact(to.id);
+		note(answeredAt, to.id);
+		if (params.unblocks === true) note(unblockedAt, to.id);
 		rt.updateStatus();
 		return ok(`replied to ${to.callsign}`, { to: to.callsign, askId });
 	}
@@ -628,7 +673,12 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 		const scopes = new Map<string, string>();
 		const outside: string[] = [];
 		const badNames: string[] = [];
+		const negated: string[] = [];
 		for (const raw of asked) {
+			if (NEGATED.test(raw)) {
+				negated.push(raw);
+				continue;
+			}
 			if (isResource(raw)) {
 				const name = raw.trim();
 				if (!isResourceName(name)) badNames.push(raw);
@@ -647,10 +697,14 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 			return checkout ? { pattern, checkout } : { pattern };
 		};
 		// Like a held path below, a path outside the repository does not cost the ones inside it.
-		const away = [outside.length > 0 ? outsideRefusal(me, outside) : "", badNames.length > 0 ? badNameRefusal(badNames) : ""]
+		const away = [
+			outside.length > 0 ? outsideRefusal(me, outside) : "",
+			badNames.length > 0 ? badNameRefusal(badNames) : "",
+			negated.length > 0 ? negatedRefusal(negated) : "",
+		]
 			.filter(Boolean)
 			.join("\n");
-		if (patterns.length === 0) return fail(away, { refused: [...outside, ...badNames] });
+		if (patterns.length === 0) return fail(away, { refused: [...outside, ...badNames, ...negated] });
 		const now = Date.now();
 		/** The process a claim lasts for: this call's, else the one a live claim being made again already had. */
 		const tied = (prior?: Claim): Pick<Claim, "pid" | "pidStart"> => {
@@ -669,7 +723,7 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 		const grantedLocks = locks.filter((l) => !lockHeld.has(l));
 		const busyLocks = locks.filter((l) => lockHeld.has(l));
 		const line = params.queue === true ? joinLines(me, busyLocks, lockHeld, now) : null;
-		const refused = [...held, ...(line ? line.full : busyLocks), ...outside, ...badNames];
+		const refused = [...held, ...(line ? line.full : busyLocks), ...outside, ...badNames, ...negated];
 		let refusal = "";
 		if (conflicts.length > 0) {
 			const owners = [...new Set(conflicts.map((c) => c.owner.callsign))];
@@ -825,6 +879,8 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 
 	rt.pi.registerTool({
 		...TOOL_SPEC,
+		// omp offers extension tools only on discovery, and asks before running them, unless told.
+		...(hostOf(rt.pi) === "omp" ? OMP_TOOL_FIELDS : {}),
 		async execute(_toolCallId, params, signal, onUpdate) {
 			if (!rt.enabled) return fail(OFF_TEXT);
 			if (!rt.self || !rt.transport) {

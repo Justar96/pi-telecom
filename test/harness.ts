@@ -105,7 +105,8 @@ export class Session {
 	/** Set to simulate pi disposing the session: every `pi.*` call throws from then on. */
 	disposed = false;
 
-	constructor(cwd: string, opts: { name?: string; id?: string; parentSession?: string } = {}) {
+	/** `omp`: the API looks like oh-my-pi's (`host.ts`), which has no settle hooks. */
+	constructor(cwd: string, opts: { name?: string; id?: string; parentSession?: string; omp?: boolean } = {}) {
 		this.cwd = cwd;
 		sessionCounter++;
 		this.id = opts.id ?? `00000000-0000-4000-8000-${String(sessionCounter).padStart(12, "0")}`;
@@ -160,6 +161,7 @@ export class Session {
 				return self.sessionName;
 			},
 			events: { on: () => () => {}, emit: () => {} },
+			...(opts.omp ? { registerTranscriptPresenter: () => {} } : {}),
 		};
 		telecom(pi as unknown as ExtensionAPI);
 	}

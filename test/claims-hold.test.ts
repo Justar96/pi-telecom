@@ -182,6 +182,28 @@ test("a claim made again without a pid keeps the one it had; with one, replaces 
 	assert.equal(published(a)?.claims[0]?.pid, undefined, "a released claim leaves nothing behind");
 });
 
+// ---------------------------------------------------------------- expiry notices
+
+test("claims lapsing close together are released on time and told in one notice", async (t) => {
+	withEnv(t, "PI_TELECOM_CLAIM_TTL_MIN", HOLD_TTL_MIN); // the notice waits up to a quarter of it: 300 ms
+	withEnv(t, "PI_TELECOM_HEARTBEAT_MS", "40");
+	const proj = makeProject("p-expiry-batch");
+	const a = await session(proj);
+	await session(proj);
+	await a.tool({ action: "claim", paths: ["src/a.ts"] });
+	await sleep(120);
+	await a.tool({ action: "claim", paths: ["docs/b.md"] });
+	const first = published(a)?.claims.find((c) => c.pattern === "src/a.ts")?.expiresAt ?? 0;
+	await eventually(() => assert.ok(!published(a)?.claims.some((c) => c.pattern === "src/a.ts")), 5_000);
+	assert.ok(Date.now() < first + 1_000, "the first claim is released on time, not held for the notice");
+	await eventually(() => assert.equal(published(a)?.claims.length, 0), 5_000);
+	await eventually(() => assert.ok(a.sentOf("telecom-claim").some((m) => /expired/.test(m.content))), 2_000);
+	await sleep(400);
+	const notices = a.sentOf("telecom-claim").filter((m) => /expired/.test(m.content));
+	assert.equal(notices.length, 1, "one notice for both");
+	assert.match(notices[0]?.content ?? "", /2 claims expired[\s\S]*Expired: src\/a\.ts, docs\/b\.md\./);
+});
+
 // ---------------------------------------------------------------- a freeze while waiting
 
 test("claims are kept past the TTL while the owner waits on a live teammate, and lapse once the wait is cleared", async (t) => {

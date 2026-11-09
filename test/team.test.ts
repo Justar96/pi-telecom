@@ -691,13 +691,19 @@ test("tool results render folded by default and in full when expanded", async ()
 	const a = await session(proj);
 	const tool = a.tools.get("telecom") as any;
 	const theme = PLAIN_THEME;
-	const long = { content: [{ type: "text", text: Array.from({ length: 20 }, (_, i) => `line ${i}`).join("\n") }], details: { ok: true } };
-	const folded = tool.renderResult(long, { expanded: false, isPartial: false }, theme).render(80).join("\n");
-	assert.match(folded, /line 7/);
-	assert.doesNotMatch(folded, /line 8\b/);
-	assert.match(folded, /12 more lines/);
-	const full = tool.renderResult(long, { expanded: true, isPartial: false }, theme).render(80).join("\n");
-	assert.match(full, /line 19/);
+	const board = { args: { action: "board" } };
+	const long = { content: [{ type: "text", text: Array.from({ length: 30 }, (_, i) => `line ${i}`).join("\n") }], details: { ok: true } };
+	const folded = tool.renderResult(long, { expanded: false, isPartial: false }, theme, board).render(80).join("\n");
+	assert.match(folded, /line 23/);
+	assert.doesNotMatch(folded, /line 24\b/);
+	assert.match(folded, /6 more lines/);
+	const full = tool.renderResult(long, { expanded: true, isPartial: false }, theme, board).render(80).join("\n");
+	assert.match(full, /line 29/);
+	// Other results: what happened, folded; the guidance for the model once expanded.
+	const sent = { content: [{ type: "text", text: "sent to bravo (idle — this wakes them)\nReply only if needed." }], details: { ok: true } };
+	const send = { args: { action: "send", to: "bravo" } };
+	assert.doesNotMatch(tool.renderResult(sent, { expanded: false, isPartial: false }, theme, send).render(80).join("\n"), /Reply only/);
+	assert.match(tool.renderResult(sent, { expanded: true, isPartial: false }, theme, send).render(80).join("\n"), /Reply only/);
 	const waiting = tool.renderResult({ content: [{ type: "text", text: "waiting for bravo…" }], details: {} }, { expanded: false, isPartial: true }, theme);
 	assert.match(waiting.render(80).join("\n"), /waiting for bravo/);
 });
@@ -1440,6 +1446,17 @@ test("status: a short question asks the agent something; it does not replace its
 	assert.match(await taskOf(), /fix the flaky upload test/);
 	await a.prompt("can you drop that and port the importer to streaming reads, so big files never sit in memory?");
 	assert.match(await taskOf(), /port the importer to streaming reads/, "a long question is a new direction");
+});
+
+test("status: a short go-ahead carries on the task; a short new task replaces it", async () => {
+	const proj = makeProject("p-carry-on-task");
+	const a = await session(proj);
+	const taskOf = async () => (await a.tool({ action: "status" })).text;
+	await a.prompt("fix the flaky upload test");
+	for (const reply of ["go ahead", "commit and merge", "yes B is good", "ok push it"]) await a.prompt(reply);
+	assert.match(await taskOf(), /fix the flaky upload test/, "acknowledgements and wrap-up steps answer the agent");
+	await a.prompt("fix parser bug");
+	assert.match(await taskOf(), /fix parser bug/, "a short new task is still a new task");
 });
 
 test("the footer is set only when its text changes", async () => {

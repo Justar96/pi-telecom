@@ -151,7 +151,7 @@ test("wire: a message's group is peer data — callsigns only, capped, and only 
 	assert.equal(parseEnvelope({ ...base, kind: "message", group: "bravo, charlie" })?.group, undefined);
 });
 
-test("waits: a wait that ends by itself says so, with the task peers see and the call to keep waiting", async () => {
+test("waits: a wait that ends by itself says so, briefly, with the task when it still reads as waiting", async () => {
 	const proj = makeProject("p-flow-wait-ended");
 	writeFileSync(join(proj, "notes.md"), "n\n");
 	const a = await session(proj);
@@ -165,8 +165,8 @@ test("waits: a wait that ends by itself says so, with the task peers see and the
 	await eventually(() => assert.deepEqual(published(a)?.blockedOn, [c.id]));
 	await eventually(() => assert.ok(a.sentOf("telecom-message").some((m) => /Your wait on bravo ended/.test(m.content))));
 	const told = a.sentOf("telecom-message").find((m) => /Your wait on bravo ended/.test(m.content));
-	assert.match(told?.content ?? "", /You still wait for charlie\. Peers see your task as "waiting for golf's verdict"; if it says you wait, update it/);
-	assert.match(told?.content ?? "", /telecom\(\{ action: "status", waitingFor: \["charlie","bravo"\] \}\)/);
+	assert.match(told?.content ?? "", /You still wait for charlie\. Your task still says "waiting for golf's verdict": update it when it changes\.$/);
+	assert.doesNotMatch(told?.content ?? "", /telecom\(/, "no ready-made call to wait again");
 	assert.equal(told?.options, undefined, "information: no turn of its own");
 });
 

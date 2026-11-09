@@ -196,8 +196,9 @@ try {
 	// The moment: alpha has replied, bravo has the answer. Prefer frames where bravo's screen still
 	// shows the change notice too; among those, the latest (alpha's summary is complete).
 	const has = (frame, who, ...needles) => needles.every((n) => plain(frame[who] ?? []).includes(n));
-	const answered = frames.filter((f) => has(f, "alpha", "Ask from bravo", "replied to bravo") && has(f, "bravo", "answered:"));
-	const withNotice = answered.filter((f) => has(f, "bravo", "changed a file you are working with"));
+	// The transcript's words (`render.ts`, `tool.ts`): the ask's route header, the reply, the answer.
+	const answered = frames.filter((f) => has(f, "alpha", "bravo → you · ask", "replied to bravo") && has(f, "bravo", "alpha answered"));
+	const withNotice = answered.filter((f) => /alpha changed (a file|\d+ files) you are working with/.test(plain(f.bravo ?? [])));
 	const moment = withNotice.at(-1) ?? answered[0];
 	if (!moment) {
 		console.error(`✖ the ask/reply moment never appeared on screen (${frames.length} frames captured in ${work})`);

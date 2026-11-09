@@ -53,11 +53,14 @@ test("render: a peer's message keeps the model's instructions quiet and fits its
 	const renderers = new Map<string, any>();
 	registerRenderers({ registerMessageRenderer: (type: string, fn: unknown) => renderers.set(type, fn) } as any);
 	const content = `**📡 Ask from bravo** — they are blocked until you reply\n\nIs the new login() final?\n\nReply with telecom({ action: "reply", askId: "ask-1", message: "<your answer>" }).`;
-	const render = (theme: unknown) =>
-		renderers.get(MESSAGE_TYPES.ask)({ content, details: { fromCallsign: "bravo", tone: "warning" } }, { expanded: false, outputPad: 1 }, theme);
+	const render = (theme: unknown, expanded = false) =>
+		renderers.get(MESSAGE_TYPES.ask)({ content, details: { fromCallsign: "bravo", tone: "warning" } }, { expanded, outputPad: 1 }, theme);
 	// Tags count as visible text, so the tagged render gets room enough not to wrap.
 	const text = render(tagged).render(400).join("\n");
-	assert.match(text, /<dim>Reply with telecom/, "the instruction is dimmed");
+	assert.doesNotMatch(text, /Reply with telecom/, "folded, the instruction for the model is left out");
+	assert.match(render(tagged, true).render(400).join("\n"), /<dim>Reply with telecom/, "expanded, it is there, dimmed");
+	assert.match(render(plain).render(200)[0] ?? "", /📡 bravo → you · ask · they wait/, "the header reads as a route");
+	assert.equal(render(plain).render(200).length, 2, "no blank rows: the header and the question");
 	assert.match(text, /<text>Is the new login\(\) final\?<\/text>/, "the question reads as text");
 	assert.match(text, new RegExp(`<${agentColor("bravo")}>▎`), "the edge is the sender's colour");
 	for (const line of render(plain).render(60)) assert.equal(visibleWidth(line), 60);

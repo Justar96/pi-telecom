@@ -14,7 +14,7 @@ import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rename
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { isNotify, isStatus, startPi } from "./rpc-driver.mjs";
+import { entry, isNotify, isStatus, startPi } from "./rpc-driver.mjs";
 
 const scratch = realpathSync.native(mkdtempSync(join(tmpdir(), "pi-telecom-e2e-")));
 const project = join(scratch, "proj with spaces & café");
@@ -245,10 +245,11 @@ try {
 	const taskProject = join(scratch, "tasks");
 	mkdirSync(taskProject);
 	const fixture = fileURLToPath(new URL("./rpc-fixture.ts", import.meta.url));
-	const taskArgs = ["-e", fixture, "--model", "telecom-rpc-test/fixture"];
+	// Load the fixture first: its boundary draft must survive telecom's continuation.
+	const taskArgs = ["-e", fixture, "-e", entry, "--model", "telecom-rpc-test/fixture"];
 	const taskEnv = { ...env, PI_TELECOM_MAX_WAKES: "1" };
-	const leader = startPi("task-leader", { cwd: taskProject, env: taskEnv, args: taskArgs });
-	const worker = startPi("task-worker", { cwd: taskProject, env: taskEnv, args: taskArgs });
+	const leader = startPi("task-leader", { cwd: taskProject, env: taskEnv, args: taskArgs, noTelecom: true });
+	const worker = startPi("task-worker", { cwd: taskProject, env: taskEnv, args: taskArgs, noTelecom: true });
 	extra.push(leader, worker);
 	await Promise.all([leader.waitFor(isStatus(/1 peer/), 30_000), worker.waitFor(isStatus(/1 peer/), 30_000)]);
 	const settled = (record) => record.type === "agent_settled";
@@ -294,14 +295,40 @@ try {
 	await inboxDrained("task-worker", 10_000);
 	await worker.waitFor(settled, 20_000, deferOffset);
 	const run = worker.records.slice(deferOffset);
-	const at = (re) => run.findIndex((r) => r.type === "message_end" && r.message?.customType === "telecom-message" && re.test(JSON.stringify(r.message.content)));
+	// Boundary drafts arrive as entry_appended; immediate messages use message_end.
+	const customMessage = (r) => r.type === "entry_appended" && r.entry?.type === "custom_message" ? r.entry : r.type === "message_end" ? r.message : undefined;
+	const at = (re) => run.findIndex((r) => customMessage(r)?.customType === "telecom-message" && re.test(JSON.stringify(customMessage(r).content)));
 	const plainAt = at(/plain message while the tool runs/);
 	const deferredAt = at(/deferred message while the tool runs/);
 	const answeredAt = run.findIndex((r) => r.type === "message_end" && r.message?.role === "assistant" && r.message.stopReason === "stop");
 	check("control: a plain message sent during a tool call is steered in right after it", plainAt !== -1 && answeredAt !== -1 && plainAt < answeredAt,
 		`plain at ${plainAt}, first answer at ${answeredAt}, deferred at ${deferredAt}`);
-	check("a deferred message arrives when the run is about to end, in the same run", deferredAt > answeredAt && answeredAt !== -1 && run.filter((r) => r.type === "agent_start").length === 1,
-		`first answer at ${answeredAt}, deferred at ${deferredAt}, runs ${run.filter((r) => r.type === "agent_start").length}`);
+	const continuedAt = run.findIndex((r, i) => i > deferredAt && r.type === "message_end" && r.message?.role === "assistant" && r.message.stopReason === "stop");
+	const settledAt = run.findIndex(settled);
+	// agent_start counts low-level runs, including a boundary continuation. The important
+	// contract is a committed deferred draft and another response BEFORE final settlement.
+	check("a deferred message creates runnable context and is answered before final settlement",
+		answeredAt !== -1 && deferredAt > answeredAt && run[deferredAt]?.type === "entry_appended" && continuedAt > deferredAt && settledAt > continuedAt,
+		`first answer at ${answeredAt}, deferred at ${deferredAt} (${run[deferredAt]?.type}), continuation at ${continuedAt}, settled at ${settledAt}`);
+
+	// A second real boundary also has a draft from an earlier-loaded extension. Neither
+	// extension's message may replace the other's, and both must reach the continuation.
+	await worker.command("/telecom-test hold");
+	await worker.command("/telecom-test boundary");
+	const composeOffset = worker.records.length;
+	worker.send({ type: "prompt", message: "hold the composition check" });
+	await worker.waitFor((r) => r.type === "message_start" && r.message?.role === "assistant", 10_000, composeOffset);
+	sendEnvelope("task-leader", "task-worker", "deferred composition report", { defer: true });
+	await inboxDrained("task-worker", 10_000);
+	await worker.command("/telecom-test release");
+	await worker.waitFor(settled, 10_000, composeOffset);
+	const composed = worker.records.slice(composeOffset);
+	const priorDrafts = composed.filter((r) => customMessage(r)?.customType === "rpc-boundary-fixture");
+	const priorDraftAt = composed.findIndex((r) => r === priorDrafts[0]);
+	const composedDeferredAt = composed.findIndex((r) => r.type === "entry_appended" && r.entry?.customType === "telecom-message" && /deferred composition report/.test(JSON.stringify(r.entry.content)));
+	check("telecom preserves an earlier extension's settlement draft, once and before its deferred message",
+		priorDrafts.length === 1 && priorDraftAt !== -1 && composedDeferredAt > priorDraftAt,
+		`earlier drafts ${priorDrafts.length}, prior draft at ${priorDraftAt}, deferred at ${composedDeferredAt}`);
 
 	// The explicit run command also works after the automatic wake allowance is exhausted.
 	const repeatOffsets = [leader.records.length, worker.records.length];

@@ -32,6 +32,8 @@ import type { Runtime } from "./runtime.ts";
 import { type Presence, QUEUED_CAP } from "./transport.ts";
 import { ago, clip, elapsed, setBounded, shortId } from "./util.ts";
 
+/** A task that says its agent waits: once the wait ends, peers would read it wrong. */
+const WAITING_TASK = /\b(?:wait(?:s|ing)?|await(?:s|ing)?|blocked|until)\b/i;
 /** A teammate's task, as a wake-up quotes it. */
 const TASK_SHOWN = 120;
 /** Locks whose last holder is remembered, to say how each freed. */
@@ -260,14 +262,17 @@ export function createWaiting(rt: Runtime): Waiting {
 		const peers = rt.peers;
 		const names = callsignsOf(ended, peers, me.id);
 		dropWaits(me, ended);
-		// Said, not done silently: the model still believes it waits, its task often says so, and
-		// teammates now see it as not waiting. `passive`: it is at work, so this is steered in.
+		// Said, not done silently: the model still believes it waits, and teammates now see it as not
+		// waiting. Short, and with no ready-made call to wait again: agents that work in rounds
+		// (hear, work, report back) declare the next wait when they report, and a call here had them
+		// declare it at once, mid-round. The task is named only when it still reads as waiting.
+		// `passive`: it is at work, so this is steered in.
 		const rest = callsignsOf(me.blockedOn ?? [], peers, me.id);
 		const still = rest.length > 0 ? ` You still wait for ${rest.join(", ")}.` : "";
-		const task = me.task ? ` Peers see your task as "${clip(me.task, 120)}"; if it says you wait, update it: telecom({ action: "status", message: "…" }).` : "";
+		const task = me.task && WAITING_TASK.test(me.task) ? ` Your task still says "${clip(me.task, TASK_SHOWN)}": update it when it changes.` : "";
 		rt.inject(
 			MESSAGE_TYPES.message,
-			`**📡 Your wait on ${names.join(", ")} ended**\n\nYou got to work after hearing from ${names.length === 1 ? "them" : "each"}, so teammates no longer see you as waiting.${still}${task} If you are in fact still blocked, declare it again: telecom({ action: "status", waitingFor: ${JSON.stringify([...rest, ...names])} }).`,
+			`**📡 Your wait on ${names.join(", ")} ended**\n\nYou got to work after hearing from ${names.length === 1 ? "them" : "each"}, so teammates no longer see you as waiting.${still}${task}`,
 			{ tone: "info" },
 			"passive",
 		);

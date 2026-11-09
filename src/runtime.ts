@@ -50,6 +50,8 @@ const WAKE_WINDOW_MS = 60_000;
  * space is short (briefs, widget); an older peer clips it to its own, smaller cap when it parses.
  */
 export const TASK_CAP = 400;
+/** "Still waiting" lines remembered as told; a bound, since senders come and go. */
+const STILL_WAITING_CAP = 64;
 /** Sessions remembered as direct contacts, each with when it was last talked with. */
 const CONTACTS_CAP = 256;
 /**
@@ -158,6 +160,8 @@ export class Runtime {
 	/** Sessions this agent has talked with directly, and when last: they stay relevant in its
 	 *  briefs, and a broadcast from one in the last while is about its work (`inbound.ts`). */
 	readonly contacts = new Map<string, number>();
+	/** Waits (`sender@blockedSince`) whose "still waiting" line was told (`stillWaitingNote`). */
+	private readonly stillWaitingTold = new Set<string>();
 	/** Who was held back by each of our claims (pattern → peer id → callsign), so a release can tell them. */
 	readonly contesters = new Map<string, Map<string, string>>();
 	/** The open `/telecom` panel (TUI only), redrawn on every team refresh like the widget. */
@@ -416,6 +420,8 @@ export class Runtime {
 
 	/** The next brief describes the team in full: the context may no longer hold the last one. */
 	requestFullBrief(): void {
+		// Nor the "still waiting" lines told so far.
+		this.stillWaitingTold.clear();
 		if (this.briefState) this.briefState = { ...this.briefState, fullAt: 0 };
 	}
 
@@ -620,6 +626,12 @@ export class Runtime {
 	stillWaitingNote(fromId: string): string {
 		const me = this.self;
 		if (!me?.blockedOn?.includes(fromId)) return "";
+		// Once per declared wait and sender: on every message of a long exchange it was the same line
+		// again. A new declaration (a new `blockedSince`) or a compaction says it again.
+		const key = `${fromId}@${me.blockedSince ?? 0}`;
+		if (this.stillWaitingTold.has(key)) return "";
+		if (this.stillWaitingTold.size >= STILL_WAITING_CAP) this.stillWaitingTold.clear();
+		this.stillWaitingTold.add(key);
 		const names = callsignsOf(me.blockedOn, this.peers, me.id);
 		const rest = callsignsOf(
 			me.blockedOn.filter((id) => id !== fromId),

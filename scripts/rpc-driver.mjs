@@ -21,13 +21,15 @@ function piCli() {
 	return cli;
 }
 
-export function startPi(name, { cwd, env, args = [], session = ["--no-session"], noTelecom = false }) {
+/**
+ * `host`: another pi-compatible host instead of the local pi, as `{ command: [exe, ...args],
+ * flags: [...] }` (its own isolation flags; omp has no `--name` or `--no-mcp`).
+ */
+export function startPi(name, { cwd, env, args = [], session = ["--no-session"], noTelecom = false, host }) {
 	const telecom = noTelecom ? [] : ["-e", entry];
-	const child = spawn(
-		process.execPath,
-		[piCli(), "--mode", "rpc", ...session, "--no-extensions", "--no-mcp", "--no-skills", "--no-context-files", ...telecom, "--name", name, ...args],
-		{ cwd, env, stdio: ["pipe", "pipe", "pipe"] },
-	);
+	const [exe, ...prefix] = host?.command ?? [process.execPath, piCli()];
+	const flags = host?.flags ?? ["--no-extensions", "--no-mcp", "--no-skills", "--no-context-files", "--name", name];
+	const child = spawn(exe, [...prefix, "--mode", "rpc", ...session, ...flags, ...telecom, ...args], { cwd, env, stdio: ["pipe", "pipe", "pipe"] });
 	const records = [];
 	const waiters = new Set();
 	let buffer = "";

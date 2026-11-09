@@ -6,6 +6,8 @@ export default function rpcFixture(pi: ExtensionAPI): void {
 	let holdNext = false;
 	// The next request asks for a three-second tool call, so a run has a step to be steered into.
 	let toolNext = false;
+	// One draft from an earlier extension, to check that telecom composes the boundary.
+	let boundaryNext = false;
 	let release: (() => void) | undefined;
 	pi.registerProvider("telecom-rpc-test", {
 		api: "openai-completions",
@@ -58,11 +60,22 @@ export default function rpcFixture(pi: ExtensionAPI): void {
 			return stream;
 		},
 	});
+	pi.on("agent_before_settle", (event) => {
+		if (!boundaryNext || event.outcome !== "completed") return;
+		boundaryNext = false;
+		return {
+			entries: [...event.entries, {
+				type: "custom_message", customType: "rpc-boundary-fixture",
+				content: "Keep the earlier extension's boundary message.", display: true,
+			}],
+		};
+	});
 	pi.registerCommand("telecom-test", {
 		description: "Control the local RPC fixture",
 		handler: async (args) => {
 			if (args.trim() === "hold") holdNext = true;
 			if (args.trim() === "tool") toolNext = true;
+			if (args.trim() === "boundary") boundaryNext = true;
 			if (args.trim() === "release") release?.();
 		},
 	});

@@ -47,9 +47,12 @@ export type Paint = Pick<Theme, "fg" | "bold">;
 /** Plain text: for RPC and print modes, whose clients get no terminal colours. */
 export const PLAIN: Paint = { fg: (_color, text) => text, bold: (text) => text };
 
-const FOLD_LINES = 12;
+/** A message body folds after this many lines until expanded. */
+const FOLD_LINES = 8;
 /** A change notice's excerpt line: deep indent, then the diff sign. */
 const DIFF_LINE = /^(\s{4,})([-+])/;
+/** Horizontal padding inside a panel when the host gives none (pi's own default). */
+const DEFAULT_PAD = 1;
 /** The left edge of every telecom panel. */
 const EDGE = "▎";
 
@@ -135,16 +138,23 @@ function restyle(text: string, pattern: RegExp, onMatch: (match: string) => stri
  */
 export class HangingText implements Component {
 	private readonly text: string;
+	/** Source lines kept to one row, cut with "…" instead of wrapped: previews. */
+	private readonly clipped: ReadonlySet<number>;
 	private cache: { width: number; lines: string[] } | undefined;
 
-	constructor(text: string) {
+	constructor(text: string, clipped: ReadonlySet<number> = new Set()) {
 		this.text = text;
+		this.clipped = clipped;
 	}
 
 	render(width: number): string[] {
 		if (this.cache?.width === width) return this.cache.lines;
 		const lines: string[] = [];
-		for (const line of this.text.replace(/\t/g, "   ").split("\n")) {
+		for (const [index, line] of this.text.replace(/\t/g, "   ").split("\n").entries()) {
+			if (this.clipped.has(index)) {
+				lines.push(oneRow(line, width));
+				continue;
+			}
 			const plain = line.replace(/\x1b\[[0-9;]*m/g, "");
 			const hang = Math.min(/^\s*(?:[•\-*●○◌✓✗⚠?] )?/.exec(plain)?.[0].length ?? 0, Math.floor(width / 2));
 			const [first = "", ...rest] = wrapTextWithAnsi(line, Math.max(1, width));
@@ -171,16 +181,13 @@ interface PanelOptions {
 	bg?: (line: string) => string;
 	/** Columns between the edge and the text, and after the text. */
 	padX: number;
-	/** A blank row above the content (the top of the panel). */
-	top?: boolean;
-	/** A blank row below the content (the bottom of the panel). */
-	bottom?: boolean;
 }
 
 /**
  * A block with a coloured left edge and a background across the full width. The tool's call and
- * result are two panels (pi renders them separately), so the call draws the top row and the
- * result the bottom one, and together they read as one block.
+ * result are two panels (pi renders them separately) with the same edge, so they read as one
+ * block. No blank rows inside: with several agents the transcript is mostly telecom, and every
+ * padding row pushed the work itself off the screen.
  */
 export class Panel implements Component {
 	private readonly child: Component;
@@ -194,11 +201,13 @@ export class Panel implements Component {
 
 	render(width: number): string[] {
 		if (this.cache?.width === width) return this.cache.lines;
-		const { edge = "", bg, padX, top = false, bottom = false } = this.opts;
+		const { edge = "", bg } = this.opts;
+		// A host that passes no padding (omp has no `outputPad`) gets pi's default, not NaN widths.
+		const padX = Number.isFinite(this.opts.padX) && this.opts.padX >= 0 ? this.opts.padX : DEFAULT_PAD;
 		const edgeWidth = edge ? visibleWidth(edge) : 0;
 		const left = edge + " ".repeat(padX);
 		const inner = Math.max(1, width - edgeWidth - padX * 2);
-		const rows = [...(top ? [""] : []), ...this.child.render(inner), ...(bottom ? [""] : [])];
+		const rows = this.child.render(inner);
 		const lines = rows.map((row) => {
 			const fill = Math.max(0, width - edgeWidth - padX - visibleWidth(row));
 			const line = left + row + " ".repeat(fill);
@@ -214,13 +223,30 @@ export class Panel implements Component {
 	}
 }
 
-/** The panel every telecom message and call is drawn in. */
-export function telecomPanel(theme: Theme, body: string, edgeColor: ThemeColor, padX: number, rows: { top: boolean; bottom: boolean }): Panel {
-	return new Panel(new HangingText(body), {
+/** `line` in one row of `width`: cut with "…" when it would wrap. Only the shared wrap helper is
+ *  used: pi's and omp's `truncateToWidth` take different ellipsis arguments. */
+export function oneRow(line: string, width: number): string {
+	if (visibleWidth(line) <= width) return line;
+	const head = wrapTextWithAnsi(line, Math.max(1, width - 1))[0] ?? "";
+	return `${head.replace(/\s+$/, "")}\x1b[0m…`;
+}
+
+/**
+ * The panel every telecom message and call is drawn in: a coloured edge on the message
+ * background, no blank rows of its own (the transcript spaces blocks already). `clipped`: body
+ * lines (by index) kept to one row.
+ */
+export function telecomPanel(
+	theme: Theme,
+	body: string,
+	edgeColor: ThemeColor,
+	padX: number | undefined,
+	clipped: ReadonlySet<number> = new Set(),
+): Panel {
+	return new Panel(new HangingText(body, clipped), {
 		edge: theme.fg(edgeColor, EDGE),
 		bg: (line) => theme.bg("customMessageBg", line),
-		padX,
-		...rows,
+		padX: padX ?? DEFAULT_PAD,
 	});
 }
 
@@ -380,9 +406,68 @@ function styleBody(paint: Paint, customType: string, lines: readonly string[], c
 	});
 }
 
+/** A message header, as the human reads it: who it is from, to whom, and what kind. */
+interface Route {
+	from: string;
+	/** "you", "team", or the recipients besides you. */
+	to: string;
+	/** `ask`, `reply`, …; none for a plain message. */
+	kind?: string;
+	/** Said after the kind, quieter: `about src/db`, `to "the question…"`. */
+	note?: string;
+	/** Said after the kind in the tone's colour: `blocked until you reply`. */
+	flag?: string;
+}
+
+/**
+ * The header of a peer's message, a reply or a broadcast, read as a route (`bravo → you · ask`),
+ * or null for any other header (it is shown as written). Display only: the model reads the
+ * content as sent, and an older or newer peer's wording that does not match falls back to it.
+ */
+export function routeOf(first: string): Route | null {
+	const head = /^\*\*📡 (.*?)\*\*(.*)$/.exec(first.trim());
+	if (!head) return null;
+	const [, strong = "", after = ""] = head;
+	const human = (t: string) => / \(from their human\)/.test(t);
+	const who = (t: string) => `${t.replace(/ \(from their human\).*$/, "")}${human(t) ? "'s human" : ""}`;
+	let m = /^Message from (\S+(?: \(from their human\))?)(?: — also to (.+))?$/.exec(strong);
+	if (m) return { from: who(m[1] ?? ""), to: m[2] ? `you, ${m[2]}` : "you" };
+	m = /^Ask from (\S+(?: \(from their human\))?)$/.exec(strong);
+	if (m) return { from: who(m[1] ?? ""), to: "you", kind: "ask", ...(/blocked until you reply/.test(after) ? { flag: "they wait" } : {}) };
+	m = /^(Late reply|Reply) from (\S+(?: \(from their human\))?)$/.exec(strong);
+	if (m) {
+		const about = /^ to your ask (".*")$/.exec(after);
+		return { from: who(m[2] ?? ""), to: "you", kind: m[1] === "Late reply" ? "late reply" : "reply", ...(about?.[1] ? { note: `to ${about[1]}` } : {}) };
+	}
+	m = /^Broadcast from (\S+(?: \(from their human\))?)(?: — about (.+))?$/.exec(strong);
+	if (m) return { from: who(m[1] ?? ""), to: "team", ...(m[2] ? { note: `about ${m[2]}` } : {}) };
+	return null;
+}
+
+function styleRoute(paint: Paint, route: Route, color: ThemeColor, callsigns: readonly string[]): string {
+	const muted = (t: string) => paintCallsigns(paint, t, callsigns, (x) => paint.fg("muted", x));
+	const from = /^[a-z0-9][a-z0-9_-]*/.exec(route.from)?.[0] ?? route.from;
+	const sender = `${callsignText(paint, from)}${muted(route.from.slice(from.length))}`;
+	let out = `📡 ${sender} ${muted(`→ ${route.to}`)}`;
+	if (route.kind) out += `${paint.fg("muted", " · ")}${paint.bold(paint.fg(color, route.kind))}`;
+	if (route.flag) out += `${paint.fg("muted", " · ")}${paint.fg(color, route.flag)}`;
+	if (route.note) out += muted(` · ${route.note}`);
+	return out;
+}
+
+/** A brief's first line, shortened: `📡 team` (the first brief) or `📡 team update`. */
+function briefTitle(paint: Paint, first: string): string | null {
+	if (/^📡 Telecom — team update\b/.test(first)) return `📡 ${paint.bold(paint.fg("customMessageLabel", "team update"))}`;
+	if (/^📡 Telecom — /.test(first)) return `📡 ${paint.bold(paint.fg("customMessageLabel", "team"))}`;
+	return null;
+}
+
 export function registerRenderers(pi: ExtensionAPI): void {
 	for (const customType of Object.values(MESSAGE_TYPES)) {
-		pi.registerMessageRenderer<TelecomMessageDetails>(customType, (message, { expanded, outputPad }, theme) => {
+		pi.registerMessageRenderer<TelecomMessageDetails>(customType, (message, options, theme) => {
+			// omp passes no `outputPad`: the panel then takes pi's default.
+			const { expanded } = options;
+			const outputPad = (options as { outputPad?: number }).outputPad;
 			const details = message.details ?? {};
 			const raw = textOf(message.content).trim();
 			const [first = "", ...rest] = raw.split("\n");
@@ -393,21 +478,31 @@ export function registerRenderers(pi: ExtensionAPI): void {
 				...(customType === MESSAGE_TYPES.brief && !details.callsigns ? boardCallsigns(raw) : []),
 			];
 			const tone = toneColor(details.tone);
-			const header = styleHeader(theme, first, tone, callsigns);
-			let body: string[];
-			if (customType === MESSAGE_TYPES.brief && !expanded) {
-				body = details.summary ? [paintCallsigns(theme, details.summary, callsigns, (t) => theme.fg("muted", t))] : [];
-			} else {
-				const lines = rest.join("\n").replace(/^\n+/, "").split("\n");
-				const shown = !expanded && lines.length > FOLD_LINES ? lines.slice(0, FOLD_LINES) : lines;
-				body = styleBody(theme, customType, shown, callsigns);
-				if (shown.length < lines.length) body.push(moreLines(theme, lines.length - shown.length));
-			}
 			// The edge takes the sender's colour, so one agent's messages read as one thread; news
 			// with no single sender (a brief, an expiry) takes the tone's.
 			const edge = details.fromCallsign ? agentColor(details.fromCallsign) : details.tone ? tone : "borderMuted";
+			// A folded brief is one row: what changed, after its title.
+			if (customType === MESSAGE_TYPES.brief && !expanded) {
+				const title = briefTitle(theme, first) ?? styleHeader(theme, first, tone, callsigns);
+				const summary = details.summary ? `${theme.fg("muted", " · ")}${paintCallsigns(theme, details.summary, callsigns, (t) => theme.fg("muted", t))}` : "";
+				return telecomPanel(theme, `${title}${summary}`, edge, outputPad, new Set([0]));
+			}
+			const route = routeOf(first);
+			const header = route
+				? styleRoute(theme, route, tone, callsigns)
+				: customType === MESSAGE_TYPES.brief
+					? (briefTitle(theme, first) ?? styleHeader(theme, first, tone, callsigns))
+					: styleHeader(theme, first, tone, callsigns);
+			let lines = rest.join("\n").replace(/^\n+/, "").replace(/\n+$/, "").split("\n");
+			// Folded, the lines written for the model (how to reply, notes in parentheses) are left
+			// out, and blank rows close up: the human reads the message itself.
+			if (!expanded) lines = lines.filter((l) => !isHint(l)).filter((l, i, all) => l.trim() !== "" || (i > 0 && all[i - 1]?.trim() !== ""));
+			while (lines.length > 0 && lines.at(-1)?.trim() === "") lines.pop();
+			const shown = !expanded && lines.length > FOLD_LINES ? lines.slice(0, FOLD_LINES) : lines;
+			const body = styleBody(theme, customType, shown, callsigns);
+			if (shown.length < lines.length) body.push(moreLines(theme, lines.length - shown.length));
 			const text = body.some((l) => l.trim()) ? `${header}\n${body.join("\n")}` : header;
-			return telecomPanel(theme, text, edge, outputPad, { top: true, bottom: true });
+			return telecomPanel(theme, text, edge, outputPad);
 		});
 	}
 }

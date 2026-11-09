@@ -90,7 +90,7 @@ test("deferred: it joins the reminder of an ask still owed in one continuation",
 	assert.match(settled.entries[1].content, /1 ask still waiting for your reply/);
 });
 
-test("deferred: a run that cannot continue delivers it as an idle wake-up when it settles", async () => {
+test("deferred: an aborted or failed run delivers it as an idle wake-up when it settles", async () => {
 	const proj = makeProject("p-deferred-noncontinue");
 	const a = await session(proj);
 	const b = await session(proj);
@@ -99,8 +99,8 @@ test("deferred: a run that cannot continue delivers it as an idle wake-up when i
 	await a.tool({ action: "send", to: "bravo", message: "report two", ...defer });
 	await fence(a, b, "plain fence");
 	const before = b.sentOf("telecom-message").length;
-	// pi cannot go on (an abort, or nothing to continue with): the boundary adds nothing.
-	for (const [outcome, canContinue] of [["aborted", true], ["completed", false]] as const) {
+	// Hard exits must not ask for a continuation, even if a preview has runnable context.
+	for (const [outcome, canContinue] of [["aborted", true], ["aborted", false], ["error", true], ["error", false]] as const) {
 		const result = await b.fire("agent_before_settle", { entries: [], continue: false, outcome, context: { canContinue } });
 		assert.equal(result, undefined);
 	}

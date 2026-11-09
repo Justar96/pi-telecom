@@ -43,6 +43,18 @@ pi install git:github.com/Justar96/pi-telecom  # from GitHub
 
 Requires pi 1.3+ and Node 22.6+ (or newer if your pi needs it), on Linux, macOS or Windows.
 
+### oh-my-pi
+
+Telecom also loads in [oh-my-pi](https://github.com/can1357/oh-my-pi) (`omp`), through its
+support for pi extensions, and omp and pi sessions in one repository form one team:
+
+```bash
+omp plugin install @justar_96/pi-telecom
+```
+
+omp has no hook at the very end of a run, so there messages sent with `interrupt: false` arrive
+as a wake-up just after the run ends, not inside it. omp draws the tool's calls in its own cards.
+
 ## Teams of three or more
 
 Pick one agent as the lead and have it write the plan: who does what, in which paths. Give each
@@ -98,8 +110,9 @@ across a resume, and can change it with `/telecom name ops`. It publishes:
 
 - busy or idle, for how long, and which long tool call it is in (`bravo [busy · bash 14m]`);
 - its task: set with `status` or `/telecom run`, else the first line of its latest prompt (a
-  one-word prompt or a short question never replaces it, and a task set with `status` is
-  replaced only by a prompt of 10 words or more);
+  one-word prompt, a short question or a short go-ahead such as "go ahead" or "commit and merge"
+  never replaces it, and a task set with `status` is replaced only by a prompt of 10 words or
+  more);
 - its checkout and git branch;
 - its claims and locks, its place in a lock's line, and whom it waits for;
 - how many asks it owes, whom its own asks wait on, and `unread` when a message it was sent

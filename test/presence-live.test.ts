@@ -115,9 +115,11 @@ test("stateHint: a long tool call is named, with the non-blocking ask; idle time
 	const now = Date.now();
 	const self = record("me", "alpha");
 	const long = record("p1", "bravo", { state: "busy", stateSince: now - 20 * MINUTE, step: { tool: "bash", since: now - 14 * MINUTE } });
-	const hint = stateHint(long, self, [self, long]);
+	const hint = stateHint(long, self, [self, long], { blockingAsk: true });
 	assert.match(hint, /^busy in bash for 14m — it reads this when that call ends/);
 	assert.match(hint, /may time out/);
+	// A message or a `wait: false` ask cannot time out: the advice would read as a correction.
+	assert.equal(stateHint(long, self, [self, long]), "busy in bash for 14m — it reads this when that call ends");
 	assert.match(hint, /telecom\(\{ action: "ask", to: "bravo", message: "…", wait: false \}\) returns at once/);
 	const short = record("p2", "charlie", { state: "busy", step: { tool: "bash", since: now - 20_000 } });
 	assert.equal(stateHint(short, self, [self, short]), "busy — it reaches them before their next step", "a call that may end soon is not news");
@@ -179,7 +181,8 @@ test("presence: a tool call is published as the step only once it runs long, and
 	await eventually(async () => {
 		const sent = await a.tool({ action: "send", to: "bravo", message: "the api moved" });
 		assert.match(sent.text, /busy in bash for 15m — it reads this when that call ends/);
-		assert.match(sent.text, /wait: false/);
+		// A message cannot time out: the advice for a blocking ask is not for it.
+		assert.doesNotMatch(sent.text, /wait: false/);
 	});
 
 	// Its end clears it; a blocked call has no tool_result, but always a tool_execution_end.

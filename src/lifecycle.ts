@@ -39,6 +39,8 @@ const TEAM_REFRESH_TICKS = 2;
 const STARTUP_TICKS = 2;
 /** A reload handoff older than this belongs to a runtime that did not come back. */
 const HANDOFF_MAX_AGE_MS = 5 * 60_000;
+/** How long the notice of a lapsed claim waits for others about to lapse (`tellLapsed`). */
+const EXPIRY_NOTICE_HOLD_MS = 60_000;
 /** The expired path claims a notice names, in characters. */
 const EXPIRED_SHOWN = 400;
 /**
@@ -306,36 +308,61 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard, w
 		}
 	}
 
+	/** Claims that lapsed and the model was not yet told of (`tellLapsed`). */
+	const lapsedUntold: { pattern: string; at: number }[] = [];
+
+	/**
+	 * One notice for claims lapsing close together. Claims made together lapse heartbeats apart,
+	 * and each lapse was its own notice: a run of them for one idle spell. While another claim is
+	 * due within `EXPIRY_NOTICE_HOLD_MS` (or a quarter of the TTL), the notice waits for it, at
+	 * most that long after the first lapse. A claim made again meanwhile is no news.
+	 */
+	function tellLapsed(me: Presence, now: number): void {
+		for (let i = lapsedUntold.length - 1; i >= 0; i--) {
+			if (me.claims.some((c) => c.pattern === lapsedUntold[i]?.pattern)) lapsedUntold.splice(i, 1);
+		}
+		const oldest = lapsedUntold[0]?.at;
+		if (oldest === undefined) return;
+		// A quarter of the TTL at most: claims made together are seconds apart, not a TTL.
+		const hold = Math.min(EXPIRY_NOTICE_HOLD_MS, rt.cfg.claimTtlMs / 4);
+		const more = me.claims.some((c) => c.expiresAt <= now + hold);
+		if (more && now - oldest < hold) return;
+		const lapsed = [...new Set(lapsedUntold.splice(0).map((c) => c.pattern))];
+		const paths = lapsed.filter((p) => !isResource(p));
+		const locks = lapsed.filter((p) => isResource(p));
+		const count = lapsed.length;
+		// Two kinds, told apart: a path claim is kept by edits inside it, a lock only by a run in
+		// progress or by claiming it again, and a lock matches no path, so it is never "unused".
+		const minutes = rt.claimTtlMinutes();
+		const why = [
+			paths.length > 0 ? `No activity inside ${paths.length === 1 ? "it" : "them"} for ${minutes} minutes, so peers may work there now.` : "",
+			locks.length > 0
+				? `${locks.join(", ")} ${locks.length === 1 ? "was" : "were"} not claimed again within ${minutes} minutes while you were idle, so the next in line may take ${locks.length === 1 ? "it" : "them"} now.`
+				: "",
+		]
+			.filter(Boolean)
+			.join(" ");
+		// Named, so "claim again" can be acted on: the model may hold claims from hours ago.
+		const named = paths.length > 0 ? ` Expired: ${clip(paths.join(", "), EXPIRED_SHOWN)}.` : "";
+		rt.inject(MESSAGE_TYPES.claim, `**📡 ${plural(count, "claim")} expired**\n\n${why}${named} Claim again if you still need ${count === 1 ? "it" : "them"}.`, {}, "passive");
+	}
+
 	function heartbeat(): void {
 		const me = rt.self;
 		if (!me || !rt.transport) return;
 		const now = Date.now();
 		releaseExited(me);
 		holdClaims(me, now);
-		const before = me.claims.length;
-		const lapsed = me.claims.filter((c) => c.expiresAt <= now).map((c) => c.pattern);
-		const locks = me.claims.filter((c) => c.expiresAt <= now && isResource(c.pattern)).map((c) => c.pattern);
-		const paths = lapsed.filter((p) => !isResource(p));
+		const lapsed = me.claims.filter((c) => c.expiresAt <= now);
 		me.claims = me.claims.filter((c) => c.expiresAt > now);
-		const expired = before - me.claims.length;
-		if (expired > 0) {
-			// Two kinds, told apart: a path claim is kept by edits inside it, a lock only by a run in
-			// progress or by claiming it again, and a lock matches no path, so it is never "unused".
-			const minutes = rt.claimTtlMinutes();
-			if (paths.length > 0) rt.logEntry("release", `claim expired (no edits inside for ${minutes} min): ${paths.join(", ")}`, paths);
-			if (locks.length > 0) rt.logEntry("release", `lock lapsed (not claimed again within ${minutes} min): ${locks.join(", ")}`, locks);
-			const why = [
-				paths.length > 0 ? `No activity inside ${paths.length === 1 ? "it" : "them"} for ${minutes} minutes, so peers may work there now.` : "",
-				locks.length > 0
-					? `${locks.join(", ")} ${locks.length === 1 ? "was" : "were"} not claimed again within ${minutes} minutes while you were idle, so the next in line may take ${locks.length === 1 ? "it" : "them"} now.`
-					: "",
-			]
-				.filter(Boolean)
-				.join(" ");
-			// Named, so "claim again" can be acted on: the model may hold claims from hours ago.
-			const named = paths.length > 0 ? ` Expired: ${clip(paths.join(", "), EXPIRED_SHOWN)}.` : "";
-			rt.inject(MESSAGE_TYPES.claim, `**📡 ${plural(expired, "claim")} expired**\n\n${why}${named} Claim again if you still need ${expired === 1 ? "it" : "them"}.`, {}, "passive");
-		}
+		// Released at `expiresAt`, as peers expect, and logged at once; only the model's notice waits.
+		const minutes = rt.claimTtlMinutes();
+		const paths = lapsed.filter((c) => !isResource(c.pattern)).map((c) => c.pattern);
+		const locks = lapsed.filter((c) => isResource(c.pattern)).map((c) => c.pattern);
+		if (paths.length > 0) rt.logEntry("release", `claim expired (no edits inside for ${minutes} min): ${paths.join(", ")}`, paths);
+		if (locks.length > 0) rt.logEntry("release", `lock lapsed (not claimed again within ${minutes} min): ${locks.join(", ")}`, locks);
+		for (const c of lapsed) lapsedUntold.push({ pattern: c.pattern, at: now });
+		tellLapsed(me, now);
 		adoptRepo(me);
 		const branch = readBranch(me.projectRoot);
 		if (branch) me.branch = branch;

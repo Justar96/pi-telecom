@@ -116,8 +116,15 @@ export function targetName(target: Target & { ok: true }): string {
 	return target.via ? `${target.peer.callsign}, which ${target.via}` : target.peer.callsign;
 }
 
-/** When a message to `peer` reaches its model, as its sender is told (`deferred`: sent with `interrupt: false`). */
-export function stateHint(peer: Presence, self: Presence, peers: readonly Presence[], deferred = false): string {
+/**
+ * How a message is sent, for `stateHint`: `deferred`, with `interrupt: false`; `blockingAsk`, an
+ * ask whose sender waits for the answer (only that one can time out while the peer is busy).
+ */
+export type HintFor = { deferred?: boolean; blockingAsk?: boolean };
+
+/** When a message to `peer` reaches its model, as its sender is told. */
+export function stateHint(peer: Presence, self: Presence, peers: readonly Presence[], how: HintFor = {}): string {
+	const { deferred = false, blockingAsk = false } = how;
 	if (Date.now() - peer.heartbeatAt > UNRESPONSIVE_MS) {
 		return `unresponsive since ${ago(peer.heartbeatAt)} — it waits in their inbox until they are back`;
 	}
@@ -135,10 +142,14 @@ export function stateHint(peer: Presence, self: Presence, peers: readonly Presen
 		const child = peers.find((c) => c.state === "busy" && isForegroundChild(c, peer));
 		if (child) return `busy waiting on its subagent ${child.callsign} — it reads this when that run ends`;
 		// One long call (a test suite, a build, a subagent): nothing reaches its model until it ends,
-		// and an ask that waits for it may time out first.
+		// and an ask that waits for it may time out first. Only a blocking ask is told so: on a
+		// message or a `wait: false` ask the advice was noise, and read as a correction.
 		const step = peer.step;
 		if (step && Date.now() - step.since >= LONG_STEP_MS) {
-			return `busy in ${step.tool} for ${elapsed(step.since)} — it reads this when that call ends. A blocking ask may time out before then; telecom({ action: "ask", to: "${peer.callsign}", message: "…", wait: false }) returns at once`;
+			const advice = blockingAsk
+				? `. This ask may time out before then; telecom({ action: "ask", to: "${peer.callsign}", message: "…", wait: false }) returns at once`
+				: "";
+			return `busy in ${step.tool} for ${elapsed(step.since)} — it reads this when that call ends${advice}${owedHint(peer)}`;
 		}
 		return `busy — it reaches them before their next step${owedHint(peer)}`;
 	}

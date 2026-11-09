@@ -9,13 +9,16 @@
  */
 import { type JsonValue, StringEnum } from "@earendil-works/pi-ai";
 import type { Theme, ThemeColor, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { Component } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
 import { CALLSIGN_PATTERN } from "./callsign.ts";
+import { type RenderContext, renderContext } from "./host.ts";
 import {
 	agentColor,
 	boardCallsigns,
 	callsignText,
 	dimCalls,
+	HangingText,
 	isHint,
 	moreLines,
 	paintCallsigns,
@@ -29,8 +32,10 @@ const TOOL_NAME = "telecom";
 
 /** Tool results are folded to this many lines until expanded. */
 const RESULT_FOLD_LINES = 8;
+/** The board and the log fold later: they are the answer the call asked for. */
+const BOARD_FOLD_LINES = 24;
 /** A call's message is previewed up to this many characters until expanded. */
-const CALL_PREVIEW_CHARS = 240;
+const CALL_PREVIEW_CHARS = 400;
 /** Where a delivery report lists the agents it did not reach; the result renderer looks for it. */
 const FAILED_MARK = " (failed: ";
 
@@ -124,48 +129,66 @@ export const TOOL_SPEC = {
 	outputSchema: Type.Object({ ok: Type.Boolean() }, { additionalProperties: true }),
 
 	// telecom draws its own panel (the same one peers' messages arrive in), not pi's green tool box:
-	// coordination reads as one thread in the transcript. The call draws the panel's top, the
-	// result its bottom (`render.ts`, `Panel`).
+	// coordination reads as one thread in the transcript. The call and the result are two panels
+	// with one edge (`render.ts`, `Panel`). omp ignores this and draws its own card (`framed`).
 	renderShell: "self",
 
-	renderCall(args, theme, context) {
+	renderCall(args, theme, last) {
+		// omp passes its options (with `expanded`) where pi passes the theme, and the theme last.
+		const context = renderContext<ToolParams>(last, theme as unknown as { expanded?: unknown });
+		const header = callHeader(args, theme);
 		const message = args.message?.trim() ?? "";
-		const preview = context?.expanded ? message : clip(message, CALL_PREVIEW_CHARS);
-		let body = "";
-		if (preview) {
-			// A claim's message is its reason; everywhere else it is what the peer reads.
-			body = args.action === "claim" ? theme.fg("muted", preview) : paintCallsigns(theme, preview, mentioned(args));
-		}
-		const text = body ? `${callHeader(args, theme)}\n${body}` : callHeader(args, theme);
-		return telecomPanel(theme, text, edgeColor(args, context?.isError === true), context?.outputPad ?? 1, { top: true, bottom: false });
+		// A claim's message is its reason; everywhere else it is what the peer reads.
+		const paint = (t: string) => (args.action === "claim" ? theme.fg("muted", t) : paintCallsigns(theme, t, mentioned(args)));
+		// Folded: the header and the start of the message share one row. Expanded: all of it.
+		const text = !message
+			? header
+			: context.expanded
+				? `${header}\n${paint(message)}`
+				: `${header}${theme.fg("muted", "  ")}${paint(clip(message.replace(/\s+/g, " "), CALL_PREVIEW_CHARS))}`;
+		return framed(context, theme, text, edgeColor(args, context.isError), context.expanded ? new Set() : new Set([0]));
 	},
 
-	// Compact by default (the board can be long); the full text when expanded.
-	renderResult(result, { expanded, isPartial }, theme, context) {
+	// Folded: what happened, in a row or two (a board or an answer, up to RESULT_FOLD_LINES); the
+	// guidance written for the model shows once expanded.
+	renderResult(result, options, theme, last) {
+		const { expanded, isPartial } = options;
+		const context = renderContext<ToolParams>(last, options);
 		const text = result.content
 			.map((part) => (part.type === "text" ? part.text : ""))
 			.join("\n")
 			.trim();
 		const details = (result.details ?? {}) as Record<string, unknown>;
-		const failed = context?.isError === true || details.ok === false;
-		const names = [...mentioned(context?.args), ...detailCallsigns(details)];
+		const failed = context.isError || details.ok === false;
+		const names = [...mentioned(context.args), ...detailCallsigns(details)];
 		let lines: string[];
 		if (isPartial) {
 			lines = [paintCallsigns(theme, `◌ ${text || "working…"}`, names, (t) => theme.fg("muted", t))];
 		} else if (failed) {
-			const reason = text.replace(/^telecom: /, "");
-			lines = [`${theme.fg("error", "✗")} ${dimCalls(theme, reason, (t) => paintCallsigns(theme, t, names, (s) => theme.fg("error", s)))}`];
+			// A refusal says what to do next: that is for the human too, so it is never cut.
+			// Styled line by line: a colour does not carry past a line break once the text is wrapped.
+			const reason = text.replace(/^telecom: /, "").split("\n");
+			const paintLine = (l: string) => dimCalls(theme, l, (t) => paintCallsigns(theme, t, names, (x) => theme.fg("error", x)));
+			lines = reason.map((l, i) => (i === 0 ? `${theme.fg("error", "✗")} ${paintLine(l)}` : `  ${paintLine(l)}`));
 		} else {
-			lines = resultLines(context?.args?.action, text, details, names, theme);
+			lines = resultLines(context.args?.action, text, details, names, theme)
+				.filter((l) => expanded || !l.quiet)
+				.map((l) => l.text);
 		}
-		if (!expanded && lines.length > RESULT_FOLD_LINES) {
-			lines = [...lines.slice(0, RESULT_FOLD_LINES), moreLines(theme, lines.length - RESULT_FOLD_LINES)];
-		}
-		return telecomPanel(theme, lines.join("\n"), edgeColor(context?.args, failed), context?.outputPad ?? 1, { top: false, bottom: true });
+		// A board or log is what was asked for: it folds later than other results.
+		const fold = context.args?.action === "board" || context.args?.action === "log" ? BOARD_FOLD_LINES : RESULT_FOLD_LINES;
+		if (!expanded && lines.length > fold) lines = [...lines.slice(0, fold), moreLines(theme, lines.length - fold)];
+		return framed(context, theme, lines.join("\n"), edgeColor(context.args, failed));
 	},
 } satisfies Omit<ToolDefinition<typeof TOOL_PARAMETERS>, "execute">;
 
 // ------------------------------------------------------------------ how a call and its result look
+
+/** The tool's rendering in telecom's panel on pi; bare on omp, which draws its own tinted card. */
+function framed(context: RenderContext<ToolParams>, theme: Theme, text: string, edge: ThemeColor, clipped: ReadonlySet<number> = new Set()): Component {
+	if (context.host === "omp") return new HangingText(text, clipped);
+	return telecomPanel(theme, text, edge, context.outputPad, clipped);
+}
 
 /** The callsign `to` names, when it names one (it may also be a session name or an id). */
 function targetCallsign(args: Partial<ToolParams> | undefined): string | undefined {
@@ -244,6 +267,32 @@ function splitOnce(text: string, separator: string): [string, string | undefined
 	return at < 0 ? [text, undefined] : [text.slice(0, at), text.slice(at + separator.length)];
 }
 
+/** A result row: `quiet` rows are guidance written for the model, shown once expanded. */
+interface Row {
+	text: string;
+	quiet?: boolean;
+}
+
+/** A claim result's line, for the human: a claim made (✓), one not made (⚠), or guidance. */
+function claimRow(line: string, theme: Theme, say: (t: string) => string, muted: (t: string) => string): Row[] {
+	const tick = theme.fg("success", "✓");
+	const warn = theme.fg("warning", "⚠");
+	// "claimed src/x — why. Peers editing there …" / "claimed @cargo — why: yours until …" /
+	// "renewed @cargo: yours for …" / "queued for @cargo, held by bravo …. You get it …".
+	const made = /^(claimed|renewed|queued for) (.*?)(?:(?: — .*?)?(?:\. Peers editing| ?: yours|, held by|\. You get it|; ahead of you)(.*))$/.exec(line);
+	if (made) {
+		const [, verb = "", what = "", tail = ""] = made;
+		const rows: Row[] = [{ text: `${verb === "queued for" ? theme.fg("accent", "◷") : tick} ${say(`${verb} ${what}`)}` }];
+		// A lane overlap is news for the human too.
+		const [, note] = splitOnce(tail, " Note: ");
+		if (note !== undefined) rows.push({ text: `${warn} ${theme.fg("warning", note.replace(/ Your checkouts are separate.*$/, ""))}` });
+		rows.push({ text: muted(line), quiet: true });
+		return rows;
+	}
+	if (/^Not claimed: /.test(line) || /another agent took/.test(line)) return [{ text: `${warn} ${muted(line)}` }];
+	return [{ text: muted(line), quiet: true }];
+}
+
 /** A successful result, for the human: what happened first, the model's guidance quieter below. */
 function resultLines(
 	action: string | undefined,
@@ -251,50 +300,68 @@ function resultLines(
 	details: Record<string, unknown>,
 	names: readonly string[],
 	theme: Theme,
-): string[] {
+): Row[] {
 	const tick = theme.fg("success", "✓");
 	const say = (t: string) => paintCallsigns(theme, t, names);
 	const muted = (t: string) => dimCalls(theme, t, (s) => paintCallsigns(theme, s, names, (x) => theme.fg("muted", x)));
+	const quiet = (lines: readonly string[]): Row[] => lines.filter((l) => l.trim()).map((l) => ({ text: muted(l), quiet: true }));
 	const [first = "", ...rest] = text.split("\n");
 	switch (action) {
 		case "board":
-			return styleBoard(theme, text, [...names, ...boardCallsigns(text)], { title: true }).split("\n");
+		case "log":
+			return styleBoard(theme, text, [...names, ...boardCallsigns(text)], { title: true })
+				.split("\n")
+				.map((l) => ({ text: l }));
 		case "send": {
 			// "sent to bravo (idle — this wakes them)": the delivery, then what it means.
 			// The hint itself may hold a call (`telecom({ … })`), so it runs to the last parenthesis.
 			const hint = /^(.*?) \((.*)\)$/.exec(first);
-			return hint ? [`${tick} ${say(hint[1] ?? "")}${theme.fg("muted", ` · ${hint[2]}`)}`] : [`${tick} ${say(first)}`];
+			const head = hint ? `${tick} ${say(hint[1] ?? "")}${theme.fg("muted", ` · ${hint[2]}`)}` : `${tick} ${say(first)}`;
+			return [{ text: head }, ...quiet(rest)];
 		}
 		case "ask": {
 			if (details.interrupted === true) {
 				const [why = "", ...more] = text.split("\n\n");
-				return [`${theme.fg("warning", "⚠")} ${theme.fg("warning", why)}`, ...more.join("\n\n").split("\n").map((l) => (isHint(l) ? theme.fg("dim", l) : say(l)))];
+				return [
+					{ text: `${theme.fg("warning", "⚠")} ${theme.fg("warning", why)}` },
+					...more
+						.join("\n\n")
+						.split("\n")
+						.map((l) => (isHint(l) ? { text: theme.fg("dim", l), quiet: true } : { text: say(l) })),
+				];
 			}
 			// "asked bravo (…) — ask-…": what happened, then the model's guidance, quieter.
-			if (details.async === true) return [`${tick} ${say(first)}`, ...rest.map(muted)];
+			if (details.async === true) {
+				const [what, handle] = splitOnce(first, " — handle ");
+				return [{ text: `${tick} ${say(what)}${handle ? theme.fg("dim", ` · ${handle}`) : ""}` }, ...quiet(rest)];
+			}
 			// "alpha answered:\n\n<the answer>": the answer is what the human wants to read.
-			return [`${tick} ${say(first.replace(/:$/, ""))}`, ...rest.join("\n").replace(/^\n+/, "").split("\n").map(say)];
+			const answer = rest.join("\n").replace(/^\n+/, "").split("\n");
+			return [{ text: `${tick} ${say(first.replace(/:$/, ""))}` }, ...answer.map((l) => (isHint(l) ? { text: theme.fg("dim", l), quiet: true } : { text: say(l) }))];
 		}
-		case "claim": {
-			const cut = first.indexOf(". Peers editing");
-			if (cut < 0) return [`${tick} ${say(first)}`, ...rest.map(muted)];
-			const [held, note] = splitOnce(first.slice(cut + ". ".length), " Note: ");
-			// "claimed src/auth/** — reason": the call above already shows the reason.
-			const lines = [`${tick} ${say(splitOnce(first.slice(0, cut), " — ")[0])}`, muted(held)];
-			if (note !== undefined) lines.push(`${theme.fg("warning", "⚠")} ${theme.fg("warning", note)}`);
-			// "Not claimed: …": the paths left out (a peer holds them, or they are outside the repository).
-			for (const l of rest) lines.push(`${theme.fg("warning", "⚠")} ${muted(l)}`);
-			return lines;
-		}
+		case "claim":
+			return text.split("\n").flatMap((l) => claimRow(l, theme, say, muted));
 		case "release":
 		case "broadcast": {
 			// "released src/x — told bravo, …" / "broadcast to bravo — about …": the act, then detail.
 			const [head, detail] = splitOnce(first, " — ");
 			const [reached, failed] = splitOnce(head, FAILED_MARK);
 			const shown = failed === undefined ? say(head) : `${say(reached)}${theme.fg("error", head.slice(reached.length))}`;
-			return [`${tick} ${shown}${detail === undefined ? "" : theme.fg("muted", ` · ${detail}`)}`, ...rest.map(muted)];
+			return [{ text: `${tick} ${shown}${detail === undefined ? "" : theme.fg("muted", ` · ${detail}`)}` }, ...quiet(rest)];
+		}
+		case "status": {
+			// "status set — peers now see alpha: task · waiting for …. You are woken …": the task.
+			const [, after = first] = splitOnce(first, " — ");
+			const [task, waits] = splitOnce(after, " · ");
+			const waitShort = waits?.replace(/\. You are woken.*$/, "");
+			return [
+				{ text: `${tick} ${say(task)}${waitShort ? theme.fg("warning", ` · ${waitShort}`) : ""}` },
+				...(waits && waitShort !== waits ? [{ text: muted(waits), quiet: true }] : []),
+				// "bravo waits for you", "This closes a wait cycle": news for the human as well.
+				...rest.map((l) => (/waits? for you|wait cycle/.test(l) ? { text: `${theme.fg("warning", "⚠")} ${muted(l)}` } : { text: muted(l), quiet: true })),
+			];
 		}
 		default:
-			return [`${tick} ${say(first)}`, ...rest.map(muted)];
+			return [{ text: `${tick} ${say(first)}` }, ...quiet(rest)];
 	}
 }

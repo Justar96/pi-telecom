@@ -6,6 +6,7 @@
  * mark it idle and deliver the change notices it was spared mid-run.
  */
 import type { SessionBoundaryDraft } from "@earendil-works/pi-coding-agent";
+import { hostOf } from "./host.ts";
 import type { Inbound } from "./inbound.ts";
 import { adoptRepo } from "./lifecycle.ts";
 import { LOG_HINT } from "./log.ts";
@@ -20,16 +21,23 @@ import { clip, plural } from "./util.ts";
  * don't reassign it, and each replacement reaches every teammate's brief as news.
  */
 const NEW_DIRECTION_WORDS = 10;
+/**
+ * How a short prompt that carries on the standing task starts: an acknowledgement ("go ahead",
+ * "yes B is good", "lgtm") or a wrap-up step of the same work ("commit and merge", "push it").
+ * Teammates read "commit and merge" as the task otherwise. Only these: "fix parser bug" is short
+ * and a new task, and must replace the old one.
+ */
+const CARRY_ON = /^(?:ok(?:ay)?|k|yes|yeah|yep|yup|ya|sure|go|continue|proceed|carry|keep|do it|please|sounds|lgtm|looks good|thanks?|thx|ty|great|good|nice|cool|perfect|agreed?|approved?|right|fine|alright|correct|exactly|commit|push|merge|ship|retry|try again|again)\b/i;
 
 export function registerTurns(rt: Runtime, inbound: Inbound): void {
 	/** A prompt becomes the task unless it only answers or asks the agent something: one word
-	 *  ("continue", "yes"), a short follow-up while a task set on purpose stands, or a short
-	 *  question ("you tested ?") while any task stands. */
+	 *  ("continue", "yes"), a short follow-up while a task set on purpose stands, or, while any
+	 *  task stands, a short question ("you tested ?") or a short go-ahead (`CARRY_ON`). */
 	function taskFromPrompt(me: Presence, prompt: string): void {
 		const words = prompt.trim().split(/\s+/).length;
 		if (words < 2 || (rt.taskExplicit && words < NEW_DIRECTION_WORDS)) return;
-		const first = taskLine(prompt);
-		if (me.task && words < NEW_DIRECTION_WORDS && first.trim().endsWith("?")) return;
+		const first = taskLine(prompt).trim();
+		if (me.task && words < NEW_DIRECTION_WORDS && (first.endsWith("?") || CARRY_ON.test(first))) return;
 		rt.setTask(me, first, false);
 	}
 
@@ -82,38 +90,77 @@ export function registerTurns(rt: Runtime, inbound: Inbound): void {
 		if (message.role === "assistant" && message.stopReason !== "error" && message.stopReason !== "aborted") rt.noteModelTurn();
 	});
 
-	rt.on("agent_before_settle", (event) => {
-		if (!rt.self || event.outcome === "aborted" || !event.context.canContinue) return;
-		// Messages that could wait for the end of the run (`interrupt: false`) are read now, in the
-		// order they came, and the run goes on with them. Without a continuation they wait for
-		// `agent_settled`.
-		const entries: SessionBoundaryDraft[] = rt.deferredEntries();
+	/** Asks still owed an answer that were not pointed out yet, as one reminder (and mark them told). */
+	function owedReminder(): string | null {
 		const due = rt.ledger.inbound().filter((a) => !a.reminded);
-		if (due.length > 0) {
-			for (const ask of due) ask.reminded = true;
-			const list = due.map((a) => `  ${a.id} from ${a.fromCallsign}${a.async ? " (not blocked)" : ""}: ${clip(a.text, 120)}`).join("\n");
-			// An ask made with `wait: false` blocks nobody, but its asker still counts on the reply.
-			const blocked = due.some((a) => !a.async);
-			const heading = blocked ? `${plural(due.length, "peer")} still blocked on your reply` : `${plural(due.length, "ask")} still waiting for your reply`;
-			const why = blocked ? `even "I can't help with that" unblocks them` : `even "I can't help with that" tells them where they stand`;
-			entries.push({
-				type: "custom_message",
-				customType: MESSAGE_TYPES.reminder,
-				content: `**📡 ${heading}**\n${list}\nAnswer each with telecom({ action: "reply", askId: "…", message: "…" }) before you stop — ${why}.`,
-				display: true,
-				details: { tone: "warning" } satisfies TelecomMessageDetails,
-			});
-		}
-		return entries.length > 0 ? { entries, continue: true } : undefined;
-	});
+		if (due.length === 0) return null;
+		for (const ask of due) ask.reminded = true;
+		const list = due.map((a) => `  ${a.id} from ${a.fromCallsign}${a.async ? " (not blocked)" : ""}: ${clip(a.text, 120)}`).join("\n");
+		// An ask made with `wait: false` blocks nobody, but its asker still counts on the reply.
+		const blocked = due.some((a) => !a.async);
+		const heading = blocked ? `${plural(due.length, "peer")} still blocked on your reply` : `${plural(due.length, "ask")} still waiting for your reply`;
+		const why = blocked ? `even "I can't help with that" unblocks them` : `even "I can't help with that" tells them where they stand`;
+		return `**📡 ${heading}**\n${list}\nAnswer each with telecom({ action: "reply", askId: "…", message: "…" }) before you stop — ${why}.`;
+	}
 
-	rt.on("agent_settled", () => {
+	/** The run is over: idle, and what waited for its end is delivered. */
+	function settled(): void {
 		if (!rt.self) return;
 		rt.setState(rt.self, "idle");
-		// Held messages the run could not continue with (it was aborted, or could not go on).
+		// Held messages the run could not continue with (it was aborted, or could not go on; on omp,
+		// always: it has no boundary to add them at, so they arrive as a wake-up).
 		rt.deliverDeferred();
 		inbound.flushNotices(true);
 		rt.publish();
 		rt.updateStatus();
+	}
+
+	if (hostOf(rt.pi) === "omp") {
+		// omp has no `agent_before_settle`/`agent_settled` (host.ts). Its `session_stop` can continue
+		// the run with model-only context, which is enough for a reminder; its `agent_end` comes from
+		// the settled path, after any continuation, so there it ends the run.
+		(rt.on as (event: string, handler: (event: unknown) => unknown) => void)("session_stop", () => {
+			if (!rt.self) return;
+			const reminder = owedReminder();
+			return reminder ? { continue: true, additionalContext: reminder } : undefined;
+		});
+		// A run an extension message starts (a telecom wake-up) skips `before_agent_start` on omp:
+		// without this, peers saw the woken agent idle for its whole run.
+		rt.on("agent_start", () => {
+			const me = rt.self;
+			if (!me || me.state === "busy") return;
+			rt.setState(me, "busy");
+			rt.publish();
+			rt.updateStatus();
+		});
+		rt.on("agent_end", settled);
+		return;
+	}
+
+	rt.on("agent_before_settle", (event) => {
+		if (!rt.self || event.outcome !== "completed") return;
+		// canContinue describes the current preview, which normally ends in an assistant
+		// response. Our custom messages add runnable context; pi validates the final proposal.
+		// Checking that preview first would skip exactly the reminders that must continue it.
+		// Messages that could wait for the end of the run (`interrupt: false`) are read now, in the
+		// order they came, and the run goes on with them. Without a continuation they wait for
+		// `agent_settled`.
+		const entries: SessionBoundaryDraft[] = rt.deferredEntries();
+		const reminder = owedReminder();
+		if (reminder) {
+			entries.push({
+				type: "custom_message",
+				customType: MESSAGE_TYPES.reminder,
+				content: reminder,
+				display: true,
+				details: { tone: "warning" } satisfies TelecomMessageDetails,
+			});
+		}
+		// Boundary results replace the proposal, rather than append to it. Preserve earlier
+		// extensions' drafts (including context edits and state) before adding our own. With
+		// nothing to add, leave both their entries and their continuation decision untouched.
+		return entries.length > 0 ? { entries: [...event.entries, ...entries], continue: true } : undefined;
 	});
+
+	rt.on("agent_settled", settled);
 }
