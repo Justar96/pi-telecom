@@ -315,7 +315,19 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard, w
 	 * first in line gets its lock at once.
 	 */
 	function releaseExited(me: Presence, now: number): void {
-		const gone = me.claims.filter((c) => c.pid !== undefined && !jobRuns(c.pid, c.pidStart ?? null));
+		// Asked once per process: a process dying between two of its claims' checks had one claim
+		// released now and the rest a heartbeat later, as two notices for one exit.
+		const runs = new Map<string, boolean>();
+		const running = (c: Claim): boolean => {
+			const key = `${c.pid}:${c.pidStart ?? ""}`;
+			let alive = runs.get(key);
+			if (alive === undefined) {
+				alive = c.pid !== undefined && jobRuns(c.pid, c.pidStart ?? null);
+				runs.set(key, alive);
+			}
+			return alive;
+		};
+		const gone = me.claims.filter((c) => c.pid !== undefined && !running(c));
 		for (const pid of new Set(gone.map((c) => c.pid))) {
 			if (pid === undefined) continue;
 			const tied = gone.filter((c) => c.pid === pid);

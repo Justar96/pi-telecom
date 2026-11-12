@@ -6,6 +6,12 @@ All notable changes to `@justar_96/pi-telecom`. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- One process's exit releases all the claims tied to it together, in one notice. Each claim
+  asked on its own whether the process still ran, so a process dying between two checks had one
+  claim released at once and the rest a heartbeat later.
+
 ## [0.8.0] - 2026-11-12
 
 ### Added
