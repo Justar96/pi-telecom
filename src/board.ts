@@ -41,6 +41,14 @@ const IDLE_SHOWN_AFTER_MS = 60_000;
 /** A teammate's task, as the board's "Waiting on you" line quotes it. */
 const WAITER_TASK_SHOWN = 60;
 
+/**
+ * A callsign, with the one its session had before it was renamed (`Presence.formerly`): what a
+ * model read before the rename names this session by the old word, which another may hold now.
+ */
+function named(peer: Presence): string {
+	return peer.formerly ? `${peer.callsign} (was ${peer.formerly})` : peer.callsign;
+}
+
 function label(peer: Presence, viewer: Presence, peers: readonly Presence[]): string {
 	const name = peer.name && peer.name !== peer.callsign ? ` "${clip(peer.name, 30)}"` : "";
 	let role = "";
@@ -48,7 +56,9 @@ function label(peer: Presence, viewer: Presence, peers: readonly Presence[]): st
 		const parent = peer.parent === viewer.id ? viewer : peers.find((p) => p.id === peer.parent);
 		role = parent === viewer && peer.id !== viewer.id ? " (your subagent)" : parent ? ` (subagent of ${parent.callsign})` : " (subagent)";
 	}
-	return `${peer.callsign}${name}${role}`;
+	// After the name, where a subagent's role goes (a subagent has no former callsign): the
+	// transcript reads a board line as `callsign "name" (…) [state]` (render.ts, `PEER_LINE`).
+	return `${peer.callsign}${name}${role}${peer.formerly ? ` (was ${peer.formerly})` : ""}`;
 }
 
 /** Peers in start order, each followed by its subagents, so a family reads as one block. */
@@ -237,7 +247,7 @@ export function renderBoard(input: BoardInput): string {
 	lines.push("", ...describePeer(self, self, { self: true, peers: input.peers }));
 	const team = [self, ...others.filter((p) => sameRepo(p, self))];
 	const locks = lockLines(team, self.id, Date.now());
-	if (locks.length > 0) lines.push("", "Locks (claim one with queue: true to wait in line):", ...locks.map((l) => `  ${l}`));
+	if (locks.length > 0) lines.push("", "Locks (claiming a held one waits in line for it):", ...locks.map((l) => `  ${l}`));
 	for (const cycle of declaredCycles(team)) {
 		const names = callsignsOf(cycle, team, "");
 		lines.push("", `⚠ Wait cycle: ${names.join(" → ")} — each declared it waits for the next, so none of them moves until one goes ahead.`);
@@ -416,7 +426,7 @@ function unitTouches(unit: Unit, self: Presence, focus: Focus, now: number): boo
 function rosterEntry(unit: Unit, now: number, waits: readonly string[] = []): string {
 	const claims = unitClaims(unit, now);
 	const folded = unit.subagents.length > 0 ? ` +${plural(unit.subagents.length, "subagent")}` : "";
-	return `${unit.peer.callsign} [${unit.peer.state}]${unit.peer.task ? ` ${clip(unit.peer.task, 40)}` : ""}${folded}${
+	return `${named(unit.peer)} [${unit.peer.state}]${unit.peer.task ? ` ${clip(unit.peer.task, 40)}` : ""}${folded}${
 		claims.length > 0 ? ` (claims ${claimsText(claims)})` : ""
 	}${waits.length > 0 ? ` — waiting for ${waits.join(", ")}` : ""}`;
 }
@@ -503,6 +513,8 @@ export function renderBrief(
 	if (!previous && units.length === 0) return { text: null, summary, state: { peers: new Map(), fullAt: 0, toldAt: 0 } };
 	const parent = self.parent ? peers.find((p) => p.id === self.parent) : undefined;
 	const you = `you are "${self.callsign}"${parent ? `, a subagent of ${parent.callsign}` : ""}`;
+	// Its own context calls it by the old word, and so do messages it sent: said in a full brief.
+	const renamed = self.formerly ? ` (you were "${self.formerly}" before; that name may be another agent's now)` : "";
 
 	if (!previous || (units.length > 0 && previous.fullAt === 0)) {
 		const described = units.filter((u) => relevant.has(u.peer.id)).slice(0, MAX_DESCRIBED);
@@ -511,7 +523,7 @@ export function renderBrief(
 		const folded = units.reduce((n, u) => n + u.subagents.length, 0);
 		const others = `${plural(units.length, "other agent")}${folded > 0 ? ` (and ${plural(folded, "subagent")})` : ""}`;
 		const lines = [
-			`📡 Telecom — ${you}. ${others} ${units.length === 1 && folded === 0 ? "is" : "are"} working in this ${
+			`📡 Telecom — ${you}${renamed}. ${others} ${units.length === 1 && folded === 0 ? "is" : "are"} working in this ${
 				units.some((u) => u.peer.projectRoot !== self.projectRoot) ? "repository" : "project"
 			} right now:`,
 		];
@@ -605,7 +617,7 @@ export function renderBrief(
 		}
 		// Locks change hands every few minutes in a busy team, and an update for each costs every
 		// teammate a line about a job it is not part of. Whoever needs a lock learns its holder by
-		// claiming it (queue: true is woken when it frees), so taking and releasing one is not news;
+		// claiming it (which waits in line, and is woken when it frees), so taking and releasing one is not news;
 		// someone queuing for this agent's own lock is (it should release it soon).
 		const added = after.claims.filter((c) => !before.claims.includes(c) && !isResource(c));
 		const dropped = before.claims.filter((c) => !after.claims.includes(c) && !isResource(c));

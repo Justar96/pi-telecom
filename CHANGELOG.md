@@ -6,6 +6,72 @@ All notable changes to `@justar_96/pi-telecom`. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Telecom names the pi session after its callsign and task (`📡 alpha · fix the upload test`), so
+  `/resume`, the terminal title and pi's notifications say which agent a session is and what it
+  last worked on. pi shows a session's first message otherwise. The name follows the task (when a
+  run ends, and on the heartbeat), keeps the last task over a restart, and is never put over a
+  name the human gave; peers are not shown it as the session's name. `PI_TELECOM_SESSION_NAME=off`
+  turns it off.
+
+- The transcript draws what agents write to each other as Markdown, the way pi draws an
+  assistant's text: `**bold**` is bold, `code` takes the code colour, and bullets, numbered
+  lists, headings, quotes, links and code blocks are styled. This covers a peer's message, ask,
+  answer and broadcast, this agent's own `send`/`ask`/`reply`/`broadcast` call, and the answer
+  in an `ask` result. Claim patterns (`src/**`) are never read as emphasis, and telecom's own
+  notices are shown as written. Display only: the model reads the text as sent.
+
+### Fixed
+
+- Callsigns survive a restart of the whole team. Every `pi` starts in a new session, which took
+  the first free callsign before its human resumed the session they came for; the resumed
+  sessions found their words held by each other's empty windows, took the next free ones, and
+  the team was renamed, so a message to "delta" from memory reached another agent. A new session
+  nothing has run in now holds its word only for now (`provisional` in its record, optional on the
+  wire) and gives it to a resumed session that remembers it. A session its human named
+  (`/telecom name`) keeps that word. Sessions on an older telecom are judged by age, as before.
+- A relative claim keeps binding in the worktree its owner edits after the owner writes notes
+  outside the repository. A record published its 12 newest edits wherever they were, and where a
+  claim binds is read from the ones inside the repository: a dozen notes pushed those out. Edits
+  outside the repository now have 8 slots of their own.
+- A restart keeps the task. Only a `/reload` carried it over, so a resumed session whose runs
+  teammates' messages started (no prompt, no `status`) stood on the board with no task, whatever
+  it held. The task is written to the session when a run ends and on the heartbeat (only when it
+  changed), and a resumed session starts with it, its age, and whether it was set on purpose. A
+  fork starts without one.
+- A status set in the last 30 minutes is not replaced by a prompt. A task set on purpose gave way
+  to any prompt of 10 words or more, so a lead's status carrying the order of work for the team
+  became its human's next long follow-up, typos included, in every teammate's brief. Past 30
+  minutes a long prompt replaces it, as before.
+- A holder can claim its lock again while others are in line for it. It was told the lock was
+  free and the first waiter's, and refused, so a lock could not be renewed for a next job once
+  anyone queued.
+
+### Changed
+
+- Claiming a held `@lock` waits in line for it. It was refused with the call to queue, and
+  nearly every refusal was followed by that same claim with `queue: true`; agents that skipped it
+  negotiated handbacks by message and collided. The result says the lock is not held yet and
+  that the agent is woken when it is. `queue: false` refuses instead, as before.
+- A busy holder keeps a lock for 2 minutes after the process it was claimed for exits (or the
+  claim TTL, if shorter), and is told so at once: claiming it again for the next job keeps it,
+  so a build, a test run and the next build no longer hand the lock to the line between each.
+  Without that claim it is released when the time is up. An idle holder's lock goes to the first
+  in line at once, as before, and path claims are released at the exit.
+- `status` and `claim` results are shorter. A `status` result no longer repeats the task (only
+  what peers see of one past 400 characters), and how a claim, a lock, a line and a wait work is
+  explained the first time it comes up in a context and again after a compaction, where every
+  result repeated it. Who waits on the agent is still said on every `status`; the call to end
+  that wait once per wait.
+
+- A resumed session that is renamed all the same (a session at work holds its word) says what it
+  was called: the board, the widget and briefs show `bravo (was alpha)`, its own brief and a
+  notice to its human say so, and the log reads `bravo joined (was alpha)`.
+- A session joins the team log with its first run (or when its human names it), and one that
+  never did logs no departure. A window opened and closed before a resume no longer fills the log
+  with joins and leaves.
+
 ## [0.7.0] - 2026-11-10
 
 ### Added

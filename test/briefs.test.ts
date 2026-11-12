@@ -143,14 +143,13 @@ test("status: a long status is kept whole on the board, shortened with a pointer
 	const task = `Phase 3 accepted 4/4 at commit 980; strict SQL plus public positive opening is next. ${"evidence ".repeat(20)}`.trim();
 	assert.ok(task.length > 200 && task.length < 400);
 	const res = await b.tool({ action: "status", message: task });
-	assert.ok(res.text.includes(task));
-	assert.doesNotMatch(res.text, /cut to|characters/);
+	assert.equal(res.text, "status set", "kept whole: nothing to say back");
 	const full = (await a.prompt("work"))?.message?.content ?? "";
 	assert.match(full, /task: Phase 3 accepted 4\/4 at commit 980; [^\n]*… \(full: telecom board\)/);
 	assert.ok(!full.includes(task));
 	assert.ok(((await a.tool({ action: "board" })).text).includes(task), "the board shows it whole");
 	// A status past the wire cap is cut quietly: the result shows what peers see.
 	const huge = await b.tool({ action: "status", message: "x ".repeat(400) });
-	assert.match(huge.text, /peers now see bravo: (x ){100,}x?…?/);
+	assert.match(huge.text, /^status set — peers see: (x ){100,}x?…?/);
 	assert.doesNotMatch(huge.text, /cut to/);
 });

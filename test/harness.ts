@@ -94,6 +94,10 @@ export class Session {
 	readonly sent: Sent[] = [];
 	readonly notified: string[] = [];
 	readonly entries: Array<{ type: "custom"; customType: string; data: unknown }> = [];
+	/** The session's messages, as far as telecom looks: whether anything has run in it. Kept apart
+	 *  from `entries`, which tests read as telecom's own. `{ ran: true }` is a session resumed
+	 *  with history. */
+	readonly messages: Array<{ type: "message" }> = [];
 	status: string | undefined;
 	sessionName: string | undefined;
 	readonly ctx: any;
@@ -106,8 +110,9 @@ export class Session {
 	disposed = false;
 
 	/** `omp`: the API looks like oh-my-pi's (`host.ts`), which has no settle hooks. */
-	constructor(cwd: string, opts: { name?: string; id?: string; parentSession?: string; omp?: boolean } = {}) {
+	constructor(cwd: string, opts: { name?: string; id?: string; parentSession?: string; omp?: boolean; ran?: boolean } = {}) {
 		this.cwd = cwd;
+		if (opts.ran) this.messages.push({ type: "message" });
 		sessionCounter++;
 		this.id = opts.id ?? `00000000-0000-4000-8000-${String(sessionCounter).padStart(12, "0")}`;
 		this.sessionName = opts.name;
@@ -121,8 +126,8 @@ export class Session {
 			sessionManager: {
 				getSessionId: () => self.id,
 				getHeader: () => ({ type: "session", id: self.id, timestamp: "", cwd, ...(self.parentSession ? { parentSession: self.parentSession } : {}) }),
-				getEntries: () => self.entries,
-				getBranch: () => self.entries,
+				getEntries: () => [...self.messages, ...self.entries],
+				getBranch: () => [...self.messages, ...self.entries],
 			},
 			ui: {
 				theme: PLAIN_THEME,
@@ -156,6 +161,9 @@ export class Session {
 				});
 			},
 			appendEntry: (customType: string, data: unknown) => self.entries.push({ type: "custom", customType, data }),
+			setSessionName: (name: string) => {
+				self.sessionName = name;
+			},
 			getSessionName: () => {
 				if (self.disposed) throw new Error("This extension ctx is stale after session replacement or reload.");
 				return self.sessionName;
@@ -196,6 +204,7 @@ export class Session {
 	}
 
 	async prompt(text: string): Promise<any> {
+		this.messages.push({ type: "message" });
 		return this.fire("before_agent_start", { messageType: "user", prompt: text, systemPrompt: "", systemPromptOptions: {} });
 	}
 

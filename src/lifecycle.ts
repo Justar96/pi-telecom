@@ -9,7 +9,7 @@
  * compaction, renames and model changes.
  */
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { childCallsign, mustYield, pickCallsign } from "./callsign.ts";
+import { childCallsign, mustYield, pickCallsign, reclaimable } from "./callsign.ts";
 import { UNRESPONSIVE_MS } from "./awareness.ts";
 import { readConfig } from "./config.ts";
 import { detectLineage, parentOf } from "./family.ts";
@@ -19,7 +19,7 @@ import type { Inbound } from "./inbound.ts";
 import type { AsyncAsk, EndedAsync, LateAsk } from "./ledger.ts";
 import { findProjectRoot, findRepo, readBranch, sameRepo } from "./project.ts";
 import { MESSAGE_TYPES } from "./render.ts";
-import { rememberedCallsign, rememberedEnabled, type Runtime } from "./runtime.ts";
+import { hasRun, rememberedCallsign, rememberedEnabled, rememberedTask, type Runtime } from "./runtime.ts";
 import {
 	type Claim,
 	jobRuns,
@@ -69,6 +69,8 @@ interface Handoff {
 	pid: number;
 	at: number;
 	callsign: string;
+	/** The callsign before a rename teammates may still know this session by (`Presence.formerly`). */
+	formerly?: string;
 	startedAt: number;
 	claims: Claim[];
 	task?: string;
@@ -264,7 +266,11 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard, w
 		const taken = new Set(rt.team(peers).map((p) => p.callsign));
 		// A subagent whose parent is live is named after it again; anyone else takes a free word.
 		const parent = parentOf(me, peers);
+		// Teammates know a session that has run by its word; one that has not told nobody. The
+		// first name they knew stays, should it move twice.
+		if (me.role !== "child" && me.provisional === false) me.formerly ??= me.callsign;
 		me.callsign = parent ? childCallsign(parent.callsign, taken) : pickCallsign(taken);
+		if (me.formerly === me.callsign) delete me.formerly;
 		rt.persistCallsign();
 		rt.publish();
 	}
@@ -293,18 +299,56 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard, w
 		}
 	}
 
+	/** What the model is told of claims released for a process that exited. */
+	function exitedText(pid: number, patterns: readonly string[]): string {
+		const one = patterns.length === 1;
+		return `Process ${pid} exited, so ${clip(patterns.join(", "), EXPIRED_SHOWN)} ${one ? "is" : "are"} released. Claim again if you still need ${one ? "it" : "them"}.`;
+	}
+
 	/**
 	 * Release the claims whose process has exited, as `release` would (peers held back, and those in
 	 * line for a lock, are told at once), and tell the model in one line. Expired or not: the exit
-	 * is the better reason.
+	 * is the better reason. A busy agent keeps its locks a while longer (`Runtime.exitGraceMs`): a
+	 * job that ended inside its run is often followed by the next one, and claiming the lock again
+	 * for it keeps the lock (`claimAction` ends the grace); it is told so at once, and without that
+	 * claim the lock is released when the time is up. An idle agent cannot claim again, so the
+	 * first in line gets its lock at once.
 	 */
-	function releaseExited(me: Presence): void {
+	function releaseExited(me: Presence, now: number): void {
 		const gone = me.claims.filter((c) => c.pid !== undefined && !jobRuns(c.pid, c.pidStart ?? null));
 		for (const pid of new Set(gone.map((c) => c.pid))) {
-			const patterns = gone.filter((c) => c.pid === pid).map((c) => c.pattern);
+			if (pid === undefined) continue;
+			const tied = gone.filter((c) => c.pid === pid);
+			const kept = me.state === "busy" ? tied.filter((c) => isResource(c.pattern)) : [];
+			const freed = tied.filter((c) => !kept.includes(c)).map((c) => c.pattern);
+			for (const claim of kept) {
+				delete claim.pid;
+				delete claim.pidStart;
+				rt.exitGrace.set(claim.pattern, { until: now + rt.exitGraceMs(), pid });
+			}
+			if (freed.length > 0) rt.releaseClaims(me, freed, `process ${pid} exited`);
+			const locks = kept.map((c) => c.pattern);
+			const one = locks.length === 1;
+			const text = [
+				freed.length > 0 ? exitedText(pid, freed) : "",
+				locks.length > 0
+					? `${locks.join(", ")} ${one ? "stays" : "stay"} yours for ${rt.exitGraceText()} more, for a next job: claim ${one ? "it" : "them"} again with that job's pid to keep ${one ? "it" : "them"}. Done with ${one ? "it" : "them"}? Release now, since others may be in line: telecom({ action: "release", paths: ${JSON.stringify(locks)} }).`
+					: "",
+			]
+				.filter(Boolean)
+				.join(" ");
+			const heading = freed.length > 0 ? `${plural(freed.length, "claim")} released` : `process ${pid} exited`;
+			rt.inject(MESSAGE_TYPES.claim, `**📡 ${heading}**\n\n${text}`, {}, "passive");
+		}
+		// Locks kept for a next job that did not come.
+		const over = new Map<number, string[]>();
+		for (const [pattern, grace] of rt.exitGrace) {
+			if (!me.claims.some((c) => c.pattern === pattern)) rt.exitGrace.delete(pattern);
+			else if (now >= grace.until) over.set(grace.pid, [...(over.get(grace.pid) ?? []), pattern]);
+		}
+		for (const [pid, patterns] of over) {
 			rt.releaseClaims(me, patterns, `process ${pid} exited`);
-			const shown = clip(patterns.join(", "), EXPIRED_SHOWN);
-			rt.inject(MESSAGE_TYPES.claim, `**📡 ${plural(patterns.length, "claim")} released**\n\nProcess ${pid} exited, so ${shown} ${patterns.length === 1 ? "is" : "are"} released. Claim again if you still need ${patterns.length === 1 ? "it" : "them"}.`, {}, "passive");
+			rt.inject(MESSAGE_TYPES.claim, `**📡 ${plural(patterns.length, "claim")} released**\n\n${exitedText(pid, patterns)}`, {}, "passive");
 		}
 	}
 
@@ -351,7 +395,7 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard, w
 		const me = rt.self;
 		if (!me || !rt.transport) return;
 		const now = Date.now();
-		releaseExited(me);
+		releaseExited(me, now);
 		holdClaims(me, now);
 		const lapsed = me.claims.filter((c) => c.expiresAt <= now);
 		me.claims = me.claims.filter((c) => c.expiresAt > now);
@@ -367,6 +411,10 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard, w
 		const branch = readBranch(me.projectRoot);
 		if (branch) me.branch = branch;
 		else delete me.branch;
+		// A run can last hours, and a crash in it would leave the session under the name of what it
+		// did before: the name follows the task here too, not only when a run ends.
+		rt.nameSession();
+		rt.persistTask();
 		rt.publish();
 		try {
 			rt.transport.sweep();
@@ -384,6 +432,7 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard, w
 		timer = null;
 		inbound.clear();
 		guard.clear();
+		rt.exitGrace.clear();
 		rt.endSteps();
 		waiting.clear();
 		rt.briefState = null;
@@ -411,7 +460,8 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard, w
 		const { transport, self: me } = rt;
 		// A reload is not a departure: the next runtime of this session continues the same log.
 		// Subagents come and go with every delegation; their arrivals and departures are not history.
-		if (me && !keepLine && me.role !== "child") rt.logEntry("leave", "left");
+		// Nor is a session nothing ran in: it never joined the log (`Runtime.setState`).
+		if (me && !keepLine && me.role !== "child" && me.provisional !== true) rt.logEntry("leave", "left");
 		rt.step("log", () => {
 			const written = rt.log.close();
 			if (written && !written.ok) rt.report("log", written.reason);
@@ -455,6 +505,7 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard, w
 			pid: process.pid,
 			at: Date.now(),
 			callsign: me.callsign,
+			...(me.formerly ? { formerly: me.formerly } : {}),
 			startedAt: me.startedAt,
 			claims: me.claims,
 			...(me.task ? { task: me.task } : {}),
@@ -509,8 +560,9 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard, w
 				pid: process.pid,
 				selfId: id,
 			});
-			const taken = new Set(peers.filter((p) => sameRepo(p, { projectRoot, repo })).map((p) => p.callsign));
-			const remembered = rememberedCallsign(ctx);
+			const mates = peers.filter((p) => sameRepo(p, { projectRoot, repo }));
+			const taken = new Set(mates.map((p) => p.callsign));
+			const remembered = rememberedCallsign(ctx, id);
 			const handoff = takeReloadHandoff(id);
 			const parent = lineage.parent ? peers.find((p) => p.id === lineage.parent) : undefined;
 			// A subagent inherits its parent's environment, PI_TELECOM_CALLSIGN included: that name
@@ -519,16 +571,36 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard, w
 			// which the parent holds: then it is named after the parent too, not given a free word.
 			const wanted =
 				lineage.role === "child"
-					? ((remembered && !taken.has(remembered) ? remembered : undefined) ??
+					? ((remembered && !taken.has(remembered.callsign) ? remembered.callsign : undefined) ??
 						(parent ? childCallsign(parent.callsign, taken) : undefined))
-					: (rt.cfg.callsign ?? remembered);
-			const callsign = pickCallsign(taken, handoff?.callsign ?? wanted);
+					: (rt.cfg.callsign ?? remembered?.callsign);
+			const preferred = handoff?.callsign ?? wanted;
+			// A new session nothing has run in holds its word only for now (`Presence.provisional`).
+			// Every `pi` starts in one and takes the first free word, so after a restart the sessions
+			// being resumed found their words held by each other's empty windows, took the next free
+			// ones, and the whole team was renamed. A session that has run takes its word back.
+			// One its human named is in use all the same, and keeps the word it was given.
+			const provisional = lineage.role !== "child" && !hasRun(ctx) && !remembered?.chosen;
+			const takesBack = lineage.role !== "child" && !provisional && preferred !== undefined && reclaimable(preferred, mates);
+			const callsign = takesBack ? preferred : pickCallsign(taken, preferred);
+			// Renamed all the same (a session that has run holds the word): teammates' contexts know
+			// this session by the old one. Only a word it held itself: a fork remembers its parent's.
+			const formerly =
+				handoff?.formerly ?? (lineage.role !== "child" && remembered?.own && remembered.callsign !== callsign ? remembered.callsign : undefined);
 			const now = Date.now();
 			const branch = readBranch(projectRoot);
+			// The task a restart would lose (`Runtime.persistTask`), with its age: the board shows how
+			// old it is, and a new direction from its human replaces it (`turns.ts`).
+			const stored = lineage.role === "child" ? undefined : rememberedTask(ctx, id);
+			const kept = handoff ? undefined : stored;
+			const task = handoff?.task ?? kept?.task;
+			const taskAt = handoff?.task ? handoff.taskAt : kept?.at;
 			const me: Presence = {
 				v: WIRE_VERSION,
 				id,
 				callsign,
+				...(lineage.role !== "child" ? { provisional } : {}),
+				...(formerly && formerly !== callsign ? { formerly } : {}),
 				pid: process.pid,
 				ticks: processStartTicks(process.pid),
 				cwd: ctx.cwd,
@@ -546,8 +618,8 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard, w
 				heartbeatAt: now,
 				...(branch ? { branch } : {}),
 				...(ctx.model?.id ? { model: ctx.model.id } : {}),
-				...(handoff?.task ? { task: handoff.task } : {}),
-				...(handoff?.taskAt ? { taskAt: handoff.taskAt } : {}),
+				...(task ? { task } : {}),
+				...(taskAt ? { taskAt } : {}),
 				...(Array.isArray(handoff?.queued) && handoff.queued.length > 0 ? { queued: handoff.queued } : {}),
 				...(Array.isArray(handoff?.blockedOn) && handoff.blockedOn.length > 0
 					? { blockedOn: handoff.blockedOn, ...(typeof handoff.blockedSince === "number" ? { blockedSince: handoff.blockedSince } : {}) }
@@ -556,13 +628,19 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard, w
 			rt.self = me;
 			// The log continues what this session's file holds (a resume, a reload); a reload is no join.
 			rt.log.open(transport.root, id);
-			if (!handoff && lineage.role !== "child") rt.logEntry("join", "joined");
-			rt.taskExplicit = handoff?.taskExplicit === true;
+			// A session nothing has run in joins the log with its first run (`Runtime.setState`): the
+			// window every `pi` opens before a resume would otherwise fill it with joins and leaves.
+			if (!handoff && lineage.role !== "child" && !provisional) rt.logEntry("join", me.formerly ? `joined (was ${me.formerly})` : "joined");
+			rt.taskExplicit = handoff ? handoff.taskExplicit === true : kept?.explicit === true;
+			// What the session file already says is not written to it again.
+			if (stored && stored.task === task && stored.explicit === rt.taskExplicit) rt.notePersistedTask(stored.task, stored.explicit);
 			for (const ask of handoff?.inboundAsks ?? []) rt.ledger.noteInbound(ask);
 			if (Array.isArray(handoff?.abandonedAsks)) rt.ledger.restoreAbandoned(handoff.abandonedAsks);
 			if (Array.isArray(handoff?.asyncAsks)) rt.ledger.restoreAsync(handoff.asyncAsks);
 			for (const [pattern, who] of handoff?.contesters ?? []) rt.contesters.set(pattern, new Map(who));
-			if (callsign !== remembered) rt.persistCallsign();
+			// Also when the word is kept but its entry does not say this session held it (a fork's, an
+			// older telecom's): the next resume then knows it for its own.
+			if (callsign !== remembered?.callsign || !remembered.own) rt.persistCallsign(remembered?.chosen === true && callsign === remembered.callsign);
 			// Back after a `/telecom off` or a resume: an old leave mark must not make a later one-read
 			// miss of this record count as a departure.
 			transport.clearLeft(id);
@@ -573,6 +651,8 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard, w
 			if (mustYield(me, rt.peers)) yieldCallsign(me, rt.peers);
 			rt.resetTeam(rt.peers);
 			teamIds = new Map(rt.team(rt.present).map((p) => [p.id, { role: p.role, callsign: p.callsign }]));
+			// Its human resumed "alpha" and the footer says another word: say why, once.
+			if (!handoff && me.formerly) rt.notifyUser(`📡 this session was ${me.formerly}; a session at work holds that callsign now, so it is ${me.callsign}`);
 			tickCount = 0;
 			lastBeat = Date.now();
 			timer ??= setInterval(tick, rt.cfg.tickMs);

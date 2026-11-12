@@ -42,6 +42,7 @@ test("status: a status without waitingFor keeps the wait, the same set keeps its
 	const c = await session(proj);
 	const set = await a.tool({ action: "status", message: "waiting on the schema", waitingFor: ["bravo"] });
 	assert.ok(!set.isError, set.text);
+	assert.match(set.text, /^status set · waiting for bravo\. You are woken when one of them finishes a run or leaves\./);
 	const since = published(a)?.blockedSince;
 	assert.ok(since && since <= Date.now());
 	await sleep(15);
@@ -59,7 +60,7 @@ test("status: a status without waitingFor keeps the wait, the same set keeps its
 	assert.deepEqual(published(a)?.blockedOn, [b.id, c.id]);
 	assert.ok((published(a)?.blockedSince ?? 0) > (since ?? 0), "a different set is a new wait");
 	const replaced = await a.tool({ action: "status", message: "now on the docs", waitingFor: ["charlie"] });
-	assert.match(replaced.text, /waiting for charlie\./);
+	assert.equal(replaced.text, "status set · waiting for charlie", "how a wait works was said once already");
 	assert.deepEqual(published(a)?.blockedOn, [c.id]);
 	const cleared = await a.tool({ action: "status", waitingFor: [] });
 	assert.match(cleared.text, /no longer waiting for anyone/);

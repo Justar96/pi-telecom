@@ -2,7 +2,7 @@
  * waiting — acting for an agent that waits on its teammates, so it never has to poll or negotiate
  * in prose. Two kinds of wait:
  *
- *   - a LOCK it queued for (`claim` with `queue: true` on a held `@resource`): when the holder
+ *   - a LOCK it queued for (`claim` on a held `@resource`, unless `queue: false`): when the holder
  *     releases it, leaves, or lets it expire, the first live waiter takes it and is woken. Two
  *     sessions that took one free lock at once settle on the same winner (`locks.ts`, `lostRaces`);
  *     the loser goes back to the front of the line and, once it was told the lock was its own, is

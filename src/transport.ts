@@ -140,6 +140,17 @@ export interface Presence {
 	v: number;
 	id: string;
 	callsign: string;
+	/**
+	 * Whether this session holds its callsign only for now: a new session in which nothing has run
+	 * yet, so no teammate knows it by that word. It gives the word up to a session that comes back
+	 * for it (a resume remembers its callsign), where age alone would rename the one the team knows.
+	 * Always published by a top-level session, `false` from its first run on; a record without it
+	 * comes from an older telecom, and callsign collisions with it go by age (`mustYield`).
+	 */
+	provisional?: boolean;
+	/** The callsign this session had before it had to take another (it came back and found its
+	 *  word held): teammates' contexts still know it by that name. Optional, display only. */
+	formerly?: string;
 	name?: string;
 	pid: number;
 	/** `/proc/<pid>/stat` start time on Linux; `null` elsewhere. */
@@ -577,6 +588,8 @@ export function parsePresence(value: unknown): Presence | null {
 		v: WIRE_VERSION,
 		id: r.id,
 		callsign: r.callsign,
+		...(typeof r.provisional === "boolean" ? { provisional: r.provisional } : {}),
+		...(typeof r.formerly === "string" && CALLSIGN_PATTERN.test(r.formerly) && r.formerly !== r.callsign ? { formerly: r.formerly } : {}),
 		pid: r.pid,
 		ticks: r.ticks as number | null,
 		cwd: r.cwd,

@@ -8,7 +8,7 @@ import { basename, join } from "node:path";
 import { afterEach, test } from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { findProjectRoot, findRepo } from "../src/project.ts";
-import { agentColor, MESSAGE_TYPES, paintCallsigns, PLAIN, registerRenderers, styleBoard } from "../src/render.ts";
+import { agentColor, MESSAGE_TYPES, paintCallsigns, PLAIN, proseStyler, registerRenderers, styleBoard } from "../src/render.ts";
 import { TOOL_SPEC } from "../src/tool.ts";
 import { escapeRegExp } from "../src/util.ts";
 import { COMMANDS, helpText, statusText, widgetLines } from "../src/view.ts";
@@ -66,6 +66,73 @@ test("render: a peer's message keeps the model's instructions quiet and fits its
 	for (const line of render(plain).render(60)) assert.equal(visibleWidth(line), 60);
 });
 
+test("render: what an agent wrote to another is drawn as Markdown, and claim patterns are not emphasis", () => {
+	const lines = (text: string) => {
+		const prose = proseStyler(tagged as any, ["alpha", "bravo"]);
+		return text.split("\n").map(prose);
+	};
+	const one = (text: string) => lines(text)[0] ?? "";
+	// Bold and code lose their marks and take a style; bold may hold code, and names a callsign.
+	assert.equal(one("**Why 8:** it matches `NEXTEST_TEST_THREADS=8`."), "*<text>Why 8:</text>*<text> it matches </text><mdCode>NEXTEST_TEST_THREADS=8</mdCode><text>.</text>");
+	assert.equal(one("**pinned to `c2755aac5`, git only**"), "*<text>pinned to </text>**<mdCode>c2755aac5</mdCode>**<text>, git only</text>*");
+	const [b, a] = [agentColor("bravo"), agentColor("alpha")];
+	assert.equal(one("**bravo decides**, alpha waits"), `*<${b}>bravo</${b}>**<text> decides</text>*<text>, </text>*<${a}>alpha</${a}>*<text> waits</text>`);
+	// Claim patterns are everywhere in telecom: two in a sentence are not a bold span.
+	for (const literal of ["claimed src/** and test/** for the parser", "**/x.ts and src/**/y.ts", "a ** b ** c", "2**8 and 3**2"]) {
+		assert.equal(one(literal), `<text>${literal}</text>`, literal);
+	}
+	assert.equal(one("see `src/**` and `**/*.ts`"), "<text>see </text><mdCode>src/**</mdCode><text> and </text><mdCode>**/*.ts</mdCode>");
+	// Lists, headings, quotes and links.
+	assert.equal(one("- **Ref:** `origin/main`"), "<mdListBullet>•</mdListBullet> *<text>Ref:</text>*<text> </text><mdCode>origin/main</mdCode>");
+	assert.equal(one("  * nested"), "  <mdListBullet>•</mdListBullet> <text>nested</text>");
+	assert.equal(one("2. then merge"), "<mdListBullet>2.</mdListBullet> <text>then merge</text>");
+	assert.equal(one("## What it **runs**"), "*<mdHeading>What it runs</mdHeading>*");
+	assert.equal(one("> as foxtrot ruled"), "<mdQuoteBorder>│</mdQuoteBorder> <mdQuote>as foxtrot ruled</mdQuote>");
+	assert.equal(one("see [#1644](https://example.com/i/1644) first"), "<text>see </text><mdLink>#1644</mdLink><dim> (https://example.com/i/1644)</dim><text> first</text>");
+	assert.equal(one("-export function login()"), "<text>-export function login()</text>", "a diff line is no bullet");
+	// A code block is code, mark for mark, and one styled line comes back per line given.
+	const block = lines("run this:\n```sh\ncargo test -- **bold**\n```\nthen **stop**");
+	assert.deepEqual(block, [
+		"<text>run this:</text>",
+		"<dim>```sh</dim>",
+		"<mdCodeBlock>cargo test -- **bold**</mdCodeBlock>",
+		"<dim>```</dim>",
+		"<text>then </text>*<text>stop</text>*",
+	]);
+	// A call written for the model stays dimmed, as before.
+	assert.match(one('then telecom({ action: "release" }) it'), /<dim>telecom\(\{ action: "release" \}\)<\/dim>/);
+	// A theme without Markdown colours (another host's, a custom one) must not lose the message.
+	const bare = {
+		...tagged,
+		fg: (color: string, text: string) => {
+			if (color.startsWith("md")) throw new Error(`Unknown theme color: ${color}`);
+			return tagged.fg(color, text);
+		},
+	};
+	assert.equal(proseStyler(bare as any, [])("- run `gate.sh`"), "<muted>•</muted> <text>run </text><accent>gate.sh</accent>");
+});
+
+test("render: a peer's message, this agent's own send and an answer all draw Markdown; telecom's own notices do not", () => {
+	const renderers = new Map<string, any>();
+	registerRenderers({ registerMessageRenderer: (type: string, fn: unknown) => renderers.set(type, fn) } as any);
+	const body = "**Script:** `gate.sh`\n- run it **once**";
+	const shown = (type: string, content: string) => renderers.get(type)({ content, details: { fromCallsign: "bravo" } }, { expanded: true, outputPad: 1 }, tagged).render(400).join("\n");
+	const message = shown(MESSAGE_TYPES.message, `**📡 Message from bravo**\n\n${body}`);
+	assert.match(message, /\*<text>Script:<\/text>\*<text> <\/text><mdCode>gate\.sh<\/mdCode>/);
+	assert.match(message, /<mdListBullet>•<\/mdListBullet> <text>run it <\/text>\*<text>once<\/text>\*/);
+	// A claim notice names patterns, and a change notice quotes code: shown as written.
+	const claim = shown(MESSAGE_TYPES.claim, "**📡 1 claim released**\n\nsrc/** and test/** are free; `x` stays");
+	assert.match(claim, /src\/\*\* and test\/\*\* are free; `x` stays/);
+	// This agent's own send, expanded, and the answer to its ask.
+	const call = (TOOL_SPEC as any).renderCall({ action: "send", to: "bravo", message: body }, tagged, { expanded: true, args: {} }).render(400).join("\n");
+	assert.match(call, /<mdCode>gate\.sh<\/mdCode>/);
+	const status = (TOOL_SPEC as any).renderCall({ action: "status", message: "gate on src/** and test/** running" }, tagged, { expanded: true, args: {} }).render(400).join("\n");
+	assert.match(status, /gate on src\/\*\* and test\/\*\* running/, "a status is a plain line");
+	const result = { content: [{ type: "text", text: `bravo answered:\n\n${body}` }], details: { ok: true } };
+	const answer = (TOOL_SPEC as any).renderResult(result, { expanded: true, isPartial: false }, tagged, { args: { action: "ask", to: "bravo" } }).render(400).join("\n");
+	assert.match(answer, /<mdListBullet>•<\/mdListBullet> <text>run it <\/text>\*<text>once<\/text>\*/);
+});
+
 test("render: the board shows a dot per state and marks this agent", () => {
 	const board = [
 		"📡 You are alpha. 2 other agents live in /work/p:",
@@ -120,6 +187,16 @@ test("view: the widget names the worktree a peer works in, not the checkout it s
 	assert.doesNotMatch(lines.find((l) => /alpha/.test(l)) ?? "", / in /, "this agent works where it started");
 });
 
+test("view: the widget and the board panel say what a renamed session was called", () => {
+	const root = findProjectRoot(makeProject("p-widget-was"));
+	const started = { cwd: root, projectRoot: root, repo: findRepo(root) };
+	const self = presence("a", "alpha", started);
+	const bravo = presence("b", "bravo", { ...started, formerly: "delta" });
+	const lines = widgetLines({ self, peers: [self, bravo], asks: [], now }, PLAIN, 100);
+	assert.match(lines.find((l) => /bravo/.test(l)) ?? "", /was delta/, lines.join("\n"));
+	assert.doesNotMatch(lines.find((l) => /alpha/.test(l)) ?? "", /was /);
+});
+
 test("render: a claim result shows the paths it left out under what it claimed", () => {
 	const text = [
 		'claimed src/x.ts — parser. Peers editing there are held back and you are told. Release with telecom({ action: "release" }) when done; idle claims expire after 120 min.',
@@ -130,6 +207,30 @@ test("render: a claim result shows the paths it left out under what it claimed",
 	const out = rendered.render(160).join("\n");
 	assert.match(out, /✓ claimed src\/x\.ts/);
 	assert.match(out, /⚠ Not claimed: \/notes\/TEAM\.md is outside this repository/);
+});
+
+test("render: the short claim, lock, queue and status results show what happened in a row each", () => {
+	const show = (action: string, text: string) =>
+		(TOOL_SPEC as any)
+			.renderResult({ content: [{ type: "text", text }], details: { ok: true } }, { expanded: false, isPartial: false }, PLAIN_THEME, { args: { action } })
+			.render(160)
+			// Without the panel's edge.
+			.map((l: string) => l.replace(/^▎ ?/, "").trimEnd())
+			.join("\n")
+			.trim();
+	// What a claim covers ends at its reason or its full stop, never inside a file name.
+	assert.equal(show("claim", "claimed src/x.ts, docs/a.md."), "✓ claimed src/x.ts, docs/a.md");
+	assert.equal(show("claim", "claimed src/x.ts — the parser."), "✓ claimed src/x.ts");
+	assert.equal(show("claim", "claimed src/x.ts. Kept while process 4242 runs."), "✓ claimed src/x.ts");
+	assert.equal(show("claim", "claimed @cargo — build: yours until you release it."), "✓ claimed @cargo");
+	assert.equal(show("claim", "renewed @cargo: yours while process 4242 runs."), "✓ renewed @cargo");
+	assert.equal(show("claim", "queued for @cargo, held by bravo since 2m ago (busy) — build. Not yours yet. You are woken when it is."), "◷ queued for @cargo");
+	assert.equal(show("claim", "queued for @cargo, free, but bravo is first in line for it and takes it now; ahead of you: bravo. Not yours yet. You are woken when it is."), "◷ queued for @cargo");
+	assert.equal(show("status", "status set"), "✓ status set");
+	assert.equal(show("status", "status set · waiting for bravo"), "✓ status set · waiting for bravo");
+	assert.equal(show("status", "task unchanged · no longer waiting for anyone"), "✓ task unchanged · no longer waiting for anyone");
+	assert.equal(show("status", `status set — peers see: ${"x ".repeat(40)}…`), "✓ status set");
+	assert.match(show("status", "status set\nbravo waits for you."), /^✓ status set\n\s*⚠ bravo waits for you\.$/);
 });
 
 test("view: the help names every command", () => {

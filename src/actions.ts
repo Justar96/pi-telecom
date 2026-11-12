@@ -201,6 +201,7 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 		}
 		const waited = (me.blockedOn?.length ?? 0) > 0;
 		if (message) rt.setTask(me, message, true);
+		const cut = message !== "" && me.task !== message;
 		if (declaring) {
 			// The age of a wait is of the set, so the same set declared again keeps it.
 			const same = ids.length === (me.blockedOn?.length ?? 0) && ids.every((id) => me.blockedOn?.includes(id));
@@ -218,10 +219,18 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 		rt.publish();
 		const kept = me.blockedOn ?? [];
 		const names = callsignsOf(kept, peers, me.id);
-		const task = message ? `peers now see ${me.callsign}: ${me.task}` : `your task stays: ${me.task ?? "(none)"}`;
+		// The task is not said back: the agent just wrote it, and over a day the echo was most of
+		// what `status` returned. Only when peers see less than it wrote, and then as what they
+		// see, not as a correction: told it was cut, a model sends the status again.
+		const task = message ? `status set${cut ? ` — peers see: ${me.task}` : ""}` : "task unchanged";
+		// How a wait works is explained once per context (`Runtime.firstTime`), like the rest below.
 		const waits = declaring
 			? ids.length > 0
-				? ` · waiting for ${names.join(", ")}. You are woken when one of them finishes a run or leaves. The wait ends by itself when one sends you a message that unblocks you, or you get to work after hearing from them; status keeps it.`
+				? ` · waiting for ${names.join(", ")}${
+						rt.firstTime("wait")
+							? ". You are woken when one of them finishes a run or leaves. The wait ends by itself when one sends you a message that unblocks you, or you get to work after hearing from them; status keeps it."
+							: ""
+					}`
 				: waited
 					? " · no longer waiting for anyone"
 					: ""
@@ -229,13 +238,18 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 				? ` · still waiting for ${names.join(", ")}`
 				: "";
 		// A new task wakes no one: whoever waits on this agent hears it is done from a message.
-		// One it ended or answered since needs no hint to do so.
+		// One it ended or answered since needs no hint to do so. The call is given once per wait.
 		const waiters = rt.team(withoutEnded(me, peers, "answered")).filter((p) => p.blockedOn?.includes(me.id));
+		const one = waiters.length === 1;
 		const waitedOn =
 			message && waiters.length > 0
-				? `\n${waiters.map((p) => p.callsign).join(", ")} ${waiters.length === 1 ? "waits" : "wait"} for you. If this is what ${waiters.length === 1 ? "it needs" : "they need"}, tell ${waiters.length === 1 ? "it" : "them"}: telecom({ action: "send", to: "${waiters[0]?.callsign}", message: "…", unblocks: true }).`
+				? `\n${waiters.map((p) => p.callsign).join(", ")} ${one ? "waits" : "wait"} for you.${
+						rt.firstTime(`waiters:${waiters.map((p) => `${p.id}@${p.blockedSince ?? 0}`).join(",")}`)
+							? ` If this is what ${one ? "it needs" : "they need"}, tell ${one ? "it" : "them"}: telecom({ action: "send", to: "${waiters[0]?.callsign}", message: "…", unblocks: true }).`
+							: ""
+					}`
 				: "";
-		return ok(`status set — ${task}${waits}${waitedOn}${cycle ? `\n${cycle}` : ""}`, kept.length > 0 ? { waitingFor: names } : {});
+		return ok(`${task}${waits}${waitedOn}${cycle ? `\n${cycle}` : ""}`, kept.length > 0 ? { waitingFor: names } : {});
 	}
 
 	/** The checks `send` and `ask` share: a target (`to`, or whoever owns `paths`) and a message. */
@@ -602,6 +616,9 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 		if (names.length === 0) return conflicts;
 		const rivals = lockRivals(me);
 		for (const name of names) {
+			// A lock this agent holds is its own to claim again, whoever is in line for it: a holder
+			// renewing it (for its next job) was told the lock was free and the first waiter's.
+			if (me.claims.some((c) => c.expiresAt > now && sameResource(c.pattern, name))) continue;
 			const hold = holdsOf(name, rivals, now)[0];
 			if (hold) {
 				const { peer, claim } = hold;
@@ -651,7 +668,11 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 		const text = queued.map((name) => {
 			const order = lineFor(name, everyone).map((w) => w.peer);
 			const ahead = order.slice(0, Math.max(0, order.findIndex((p) => p.id === me.id))).map((p) => p.callsign);
-			return `queued for ${name}${conflicts.has(name) ? `, ${conflicts.get(name)}` : ""}${ahead.length > 0 ? `; ahead of you: ${ahead.join(", ")}` : ""}. You get it, and are woken, when it frees, so there is nothing to poll. Leave the line with telecom({ action: "release", paths: ["${name}"] }).`;
+			// Every time: it is not held. Once per context: that waiting needs no polling, and the way out.
+			const how = rt.firstTime("queue")
+				? ` You get it, and are woken, when it frees, so there is nothing to poll. Leave the line with telecom({ action: "release", paths: ["${name}"] }).`
+				: " You are woken when it is.";
+			return `queued for ${name}${conflicts.has(name) ? `, ${conflicts.get(name)}` : ""}${ahead.length > 0 ? `; ahead of you: ${ahead.join(", ")}` : ""}. Not yours yet.${how}`;
 		});
 		if (full.length > 0) {
 			text.push(`Not queued for ${full.join(", ")}: you are already in line for ${QUEUED_CAP} locks. Leave one first: telecom({ action: "release", paths: ["…"] }).`);
@@ -722,7 +743,9 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 		const grantedPaths = paths.filter((p) => !held.has(p));
 		const grantedLocks = locks.filter((l) => !lockHeld.has(l));
 		const busyLocks = locks.filter((l) => lockHeld.has(l));
-		const line = params.queue === true ? joinLines(me, busyLocks, lockHeld, now) : null;
+		// A held lock is waited for unless the call says not to: nearly every refusal was followed
+		// by the same claim with `queue: true`, and agents that skipped it negotiated by message.
+		const line = params.queue !== false ? joinLines(me, busyLocks, lockHeld, now) : null;
 		const refused = [...held, ...(line ? line.full : busyLocks), ...outside, ...badNames, ...negated];
 		let refusal = "";
 		if (conflicts.length > 0) {
@@ -740,7 +763,7 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 		if (!line && busyLocks.length > 0) {
 			const one = busyLocks.length === 1;
 			const why = busyLocks.map((l) => `${l} is ${lockHeld.get(l)}`).join("; ");
-			const queue = `Queue for ${one ? "it" : "them"} — you get ${one ? "it" : "each"}, and are woken, when it frees: telecom({ action: "claim", paths: ${listCall(busyLocks)}, queue: true }).`;
+			const queue = `You are not in line (queue: false). To wait for ${one ? "it" : "them"} — you get ${one ? "it" : "each"}, and are woken, when it frees: telecom({ action: "claim", paths: ${listCall(busyLocks)} }).`;
 			refusal = [refusal, `${why}. ${queue}`].filter(Boolean).join("\n");
 		}
 		const queuedText = line?.text ?? [];
@@ -767,6 +790,8 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 			const why = note || prior?.note;
 			me.claims = me.claims.filter((c) => c.pattern !== name);
 			me.claims.push({ pattern: name, since: prior?.since ?? now, expiresAt: now + rt.cfg.claimTtlMs, ...(why ? { note: why } : {}), ...tied(prior) });
+			// Claimed again after its process exited: it is kept for the next job (`releaseExited`).
+			rt.exitGrace.delete(name);
 			me.queued = me.queued?.filter((q) => !sameResource(q.pattern, name));
 		}
 		if (me.queued?.length === 0) delete me.queued;
@@ -790,19 +815,37 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 				? ` Note: ${lanes.join("; ")}. Your checkouts are separate, so both claims stand, but the work meets when the branches merge; agree on one owner if it may conflict.`
 				: "";
 		const lines: string[] = [];
+		// How a claim and a lock work is said once per context (`Runtime.firstTime`): on every call
+		// it was most of what `claim` returned. What this claim lasts for is said every time.
 		if (grantedPaths.length > 0) {
+			const how = rt.firstTime("claim")
+				? ` Peers editing there are held back and you are told. Release with telecom({ action: "release" }) when done; ${pid !== undefined ? `kept while process ${pid} runs` : `idle claims expire after ${ttl} min`}.`
+				: pid !== undefined
+					? ` Kept while process ${pid} runs.`
+					: "";
 			lines.push(
-				`claimed ${grantedPaths.map((p) => claimShown(scopedOf(p))).join(", ")}${note ? ` — ${note}` : ""}. Peers editing there are held back and you are told. Release with telecom({ action: "release" }) when done; ${pid !== undefined ? `kept while process ${pid} runs` : `idle claims expire after ${ttl} min`}.${overlap}${everywhereHint(me, grantedPaths.filter((p) => !scopes.has(p)))}`,
+				`claimed ${grantedPaths.map((p) => claimShown(scopedOf(p))).join(", ")}${note ? ` — ${note}` : ""}.${how}${overlap}${everywhereHint(me, grantedPaths.filter((p) => !scopes.has(p)))}`,
 			);
 		}
 		if (taken.length > 0) {
-			lines.push(
-				`claimed ${taken.join(", ")}${note ? ` — ${note}` : ""}: yours until you release it — telecom({ action: "release", paths: ${listCall(taken)} }) — and others who claim it are refused and can queue. ${
-					pid !== undefined
-						? `It stays yours while process ${pid} runs, and is released when it exits.`
-						: `It stays yours while you are working; once you are idle, it lapses ${ttl} min after you claimed it unless you claim it again (\`pid\` keeps it while a background job runs).`
-				}`,
-			);
+			const held = `claimed ${taken.join(", ")}${note ? ` — ${note}` : ""}: `;
+			if (pid !== undefined) {
+				lines.push(
+					`${held}yours while process ${pid} runs${
+						rt.firstTime("lock-pid")
+							? `. When it exits, the lock is released: at once if you are idle, and ${rt.exitGraceText()} later if you are working, so a next job can keep it (claim it again with that job's pid). Others who claim it wait in line.`
+							: "."
+					}`,
+				);
+			} else {
+				lines.push(
+					`${held}yours until you release it${
+						rt.firstTime("lock")
+							? ` — telecom({ action: "release", paths: ${listCall(taken)} }) — and others who claim it wait in line. It stays yours while you are working; once you are idle, it lapses ${ttl} min after you claimed it unless you claim it again (\`pid\` keeps it while a background job runs).`
+							: "."
+					}`,
+				);
+			}
 		}
 		if (kept.length > 0) lines.push(`renewed ${kept.join(", ")}: ${pid !== undefined ? `yours while process ${pid} runs` : `yours for another ${ttl} min`}.`);
 		if (lost.length > 0) {

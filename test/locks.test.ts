@@ -147,7 +147,7 @@ test("races are judged on records actually read: a departing record still holds 
 
 // ---------------------------------------------------------------- scenarios
 
-test("locks: claiming a held @resource is refused with its holder, since when, its state and the exact call to queue; files never touch it", async () => {
+test("locks: claiming a held @resource with queue: false is refused with its holder, since when, its state and the exact call to wait; files never touch it", async () => {
 	const proj = makeProject("p-lock-refuse");
 	mkdirSync(join(proj, "@cargo"), { recursive: true });
 	writeFileSync(join(proj, "@cargo", "x.ts"), "x\n");
@@ -158,11 +158,12 @@ test("locks: claiming a held @resource is refused with its holder, since when, i
 	assert.ok(!got.isError, got.text);
 	assert.match(got.text, /^claimed @cargo — building: yours until you release it/);
 	assert.deepEqual(got.details.claims, ["@cargo"]);
-	const refused = await b.tool({ action: "claim", paths: ["@cargo"] });
+	const refused = await b.tool({ action: "claim", paths: ["@cargo"], queue: false });
 	assert.ok(refused.isError, refused.text);
 	assert.match(refused.text, /@cargo is held by alpha since just now \(busy, task: run the cargo build for release\) — building/);
-	assert.match(refused.text, /telecom\(\{ action: "claim", paths: \["@cargo"\], queue: true \}\)/);
+	assert.match(refused.text, /You are not in line \(queue: false\)\. To wait for it — you get it, and are woken, when it frees: telecom\(\{ action: "claim", paths: \["@cargo"\] \}\)/);
 	assert.deepEqual(refused.details.refused, ["@cargo"]);
+	assert.equal(published(b)?.queued, undefined);
 	// A folder named @cargo holds files, not the lock: the guard lets an edit there through.
 	await b.read("@cargo/x.ts");
 	const edit = await b.edit("@cargo/x.ts", "x", "y");
@@ -185,9 +186,34 @@ test("locks bind across worktrees: a lock is the repository's, not a checkout's"
 	const a = await session(main);
 	const b = await session(lane);
 	assert.ok(!(await a.tool({ action: "claim", paths: ["@cargo"] })).isError);
-	const refused = await b.tool({ action: "claim", paths: ["@cargo"] });
-	assert.ok(refused.isError, refused.text);
-	assert.match(refused.text, /@cargo is held by alpha/);
+	const waits = await b.tool({ action: "claim", paths: ["@cargo"] });
+	assert.match(waits.text, /^queued for @cargo, held by alpha/);
+	assert.deepEqual(published(b)?.claims, [], "the lock in the other checkout is the same lock");
+});
+
+test("queue: claiming a held lock waits in line without being asked to, says it is not held, and explains the line once", async () => {
+	const proj = makeProject("p-lock-queue-default");
+	const a = await session(proj);
+	const b = await session(proj);
+	await a.tool({ action: "claim", paths: ["@cargo", "@port"], message: "release build" });
+	// Nearly every refusal of a held lock was followed by the same claim with queue: true.
+	const first = await b.tool({ action: "claim", paths: ["@cargo"] });
+	assert.ok(!first.isError, first.text);
+	assert.match(first.text, /^queued for @cargo, held by alpha since just now \(idle\) — release build\. Not yours yet\. You get it, and are woken, when it frees, so there is nothing to poll\. Leave the line with telecom\(\{ action: "release", paths: \["@cargo"\] \}\)\.$/);
+	assert.deepEqual(first.details.queued, ["@cargo"]);
+	assert.equal(first.details.refused, undefined);
+	assert.deepEqual(published(b)?.claims, []);
+	assert.deepEqual(published(b)?.queued?.map((q) => q.pattern), ["@cargo"]);
+	const second = await b.tool({ action: "claim", paths: ["@port"] });
+	assert.match(second.text, /^queued for @port, held by alpha since just now \(idle\) — release build\. Not yours yet\. You are woken when it is\.$/);
+	// What is free is claimed in the same call, and only the held lock is waited for.
+	const c = await session(proj);
+	const mixed = await c.tool({ action: "claim", paths: ["@db", "@cargo"] });
+	assert.match(mixed.text, /^claimed @db: yours until you release it/);
+	assert.match(mixed.text, /\nqueued for @cargo, held by alpha[^\n]*; ahead of you: bravo\. Not yours yet\./);
+	await a.tool({ action: "release", paths: ["@cargo"] });
+	await eventually(() => assert.equal(lockMessages(b).length, 1));
+	await eventually(() => assert.deepEqual(published(b)?.claims.map((cl) => cl.pattern), ["@cargo"]));
 });
 
 test("queue: a release hands the lock to the first in line and wakes it; the rest stay in line; a holder leaving hands it on", async () => {
@@ -198,15 +224,15 @@ test("queue: a release hands the lock to the first in line and wakes it; the res
 	await a.tool({ action: "claim", paths: ["@cargo"], message: "release build" });
 	const qb = await b.tool({ action: "claim", paths: ["@cargo"], queue: true });
 	assert.ok(!qb.isError, qb.text);
-	assert.match(qb.text, /^queued for @cargo, held by alpha since just now \(idle\) — release build\. You get it, and are woken, when it frees/);
+	assert.match(qb.text, /^queued for @cargo, held by alpha since just now \(idle\) — release build\. Not yours yet\. You get it, and are woken, when it frees/);
 	assert.deepEqual(qb.details.queued, ["@cargo"]);
 	const qc = await c.tool({ action: "claim", paths: ["@cargo"], queue: true });
 	assert.match(qc.text, /ahead of you: bravo/);
 	assert.match((await a.tool({ action: "board" })).text, /Locks[^\n]*\n {2}@cargo — you \(queue: bravo, charlie\)/);
 	assert.match((await c.tool({ action: "board" })).text, /@cargo — alpha \(queue: bravo, you\)/);
-	// Claiming it directly is no way round the line.
+	// Claiming it without waiting is no way round the line.
 	const d = await session(proj);
-	assert.match((await d.tool({ action: "claim", paths: ["@cargo"] })).text, /@cargo is held by alpha/);
+	assert.match((await d.tool({ action: "claim", paths: ["@cargo"], queue: false })).text, /@cargo is held by alpha/);
 
 	const released = await a.tool({ action: "release" });
 	assert.match(released.text, /released @cargo — told bravo, charlie, who had been waiting/);
@@ -227,6 +253,21 @@ test("queue: a release hands the lock to the first in line and wakes it; the res
 	// departure, names bravo. Never alpha, who held it before bravo and is still here: on a loaded
 	// machine charlie may read alpha's old release event only after bravo took the lock and left.
 	assert.match(lockMessages(c)[0]?.content ?? "", /@cargo is yours now \(bravo (left|released it)\)/);
+});
+
+test("queue: a holder claiming its lock again while others are in line renews it; it is not told the lock is the first waiter's", async () => {
+	const proj = makeProject("p-lock-renew-queued");
+	const a = await session(proj);
+	const b = await session(proj);
+	await a.tool({ action: "claim", paths: ["@cargo"], message: "release build" });
+	const since = published(a)?.claims[0]?.since;
+	await b.tool({ action: "claim", paths: ["@cargo"] });
+	const again = await a.tool({ action: "claim", paths: ["@Cargo"] });
+	assert.ok(!again.isError, again.text);
+	assert.match(again.text, /^renewed @cargo: yours for another \d+ min\.$/);
+	assert.equal(published(a)?.claims[0]?.since, since, "the same hold");
+	assert.equal(published(a)?.queued, undefined, "the holder is not in its own line");
+	assert.deepEqual(published(b)?.queued?.map((q) => q.pattern), ["@cargo"]);
 });
 
 test("queue: a slow waiter that reads an old release and the newest in one drain names who freed it last", async () => {
@@ -653,8 +694,8 @@ test("status: a long task is kept whole for peers and is not reported back as a 
 	await session(proj);
 	const task = `Phase1 PASS: SBF/IDL/client/CU/SDK ${"evidence ".repeat(20)}`.trim();
 	const res = await a.tool({ action: "status", message: task });
-	assert.ok(res.text.includes(task), "peers see the whole task");
-	assert.doesNotMatch(res.text, /cut to/);
+	assert.equal(published(a)?.task, task, "peers see the whole task");
+	assert.equal(res.text, "status set", "and the agent is not told its own words again");
 });
 
 test("declared wait cycles are flagged on the board, and the declaring agent is told at once, as a fact", async () => {

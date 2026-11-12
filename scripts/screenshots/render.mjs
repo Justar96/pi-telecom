@@ -21,10 +21,26 @@ const GAP = 22;
 const MARGIN = 28;
 
 export function findChrome() {
-	const candidates = [process.env.CHROME, "/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser"];
+	const candidates = [
+		process.env.CHROME,
+		"/usr/bin/google-chrome",
+		"/usr/bin/chromium",
+		"/usr/bin/chromium-browser",
+		// WSL without a Linux browser: the Windows one works (`chromePath`).
+		"/mnt/c/Program Files/Google/Chrome/Application/chrome.exe",
+	];
 	const found = candidates.find((c) => c && existsSync(c));
 	if (!found) throw new Error("no Chrome/Chromium found; set CHROME=/path/to/chrome");
 	return found;
+}
+
+/**
+ * `path` as `chrome` reads it. A Windows Chrome started from WSL takes Windows paths: the Linux
+ * file system is `\\wsl.localhost\<distro>\…` to it, which `wslpath` gives.
+ */
+function chromePath(chrome, path) {
+	if (process.platform !== "linux" || !/\.exe$/i.test(chrome)) return path;
+	return execFileSync("wslpath", ["-w", path], { encoding: "utf8" }).trim();
 }
 
 /**
@@ -64,7 +80,7 @@ pre { margin: 0; padding: ${PAD}px; font: ${FONT_PX}px/${LINE_PX}px Term, "JetBr
 .l { height: ${LINE_PX}px; display: flex; }
 .l > span { display: block; height: ${LINE_PX}px; flex: none; }
 .w { display: inline-block; width: ${CHAR_PX * 2}px; text-align: center; line-height: ${LINE_PX}px;
-	font-family: "Noto Color Emoji", "Apple Color Emoji", sans-serif; font-size: ${FONT_PX - 1}px; }
+	font-family: "Noto Color Emoji", "Apple Color Emoji", "Segoe UI Emoji", sans-serif; font-size: ${FONT_PX - 1}px; }
 </style><body>${body}</body>`;
 	const dir = mkdtempSync(join(tmpdir(), "telecom-shot-"));
 	const file = join(dir, "page.html");
@@ -78,8 +94,9 @@ pre { margin: 0; padding: ${PAD}px; font: ${FONT_PX}px/${LINE_PX}px Term, "JetBr
 			"--default-background-color=00000000",
 			`--force-device-scale-factor=${scale}`,
 			`--window-size=${pageW},${pageH}`,
-			`--screenshot=${out}`,
-			`file://${file}`,
+			`--screenshot=${chromePath(chrome, resolve(out))}`,
+			// A Windows path is opened as a file as it is; a `file://` URL of it is not one.
+			chromePath(chrome, file) === file ? `file://${file}` : chromePath(chrome, file),
 		],
 		{ stdio: "ignore", timeout: 60_000 },
 	);

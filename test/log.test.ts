@@ -147,6 +147,8 @@ test("log: a late joiner reads what the team did before it arrived, and nothing 
 	const a = await session(proj);
 	const b = await session(proj);
 	const d = await session(other);
+	// A session joins the log with its first run.
+	for (const s of [a, b]) await s.prompt("go");
 	await a.tool({ action: "status", message: "migrating the db layer" });
 	await a.tool({ action: "claim", paths: ["src/db/**"], message: "schema change" });
 	assert.ok(!(await a.tool({ action: "broadcast", message: "User.id is now User.uid", paths: ["src/models/user.ts"] })).isError);
@@ -158,6 +160,7 @@ test("log: a late joiner reads what the team did before it arrived, and nothing 
 	await b.stop();
 
 	const c = await session(proj);
+	await c.prompt("go");
 	// Each session writes its file on its next tick, not at every event.
 	await eventually(async () => assert.match((await c.tool({ action: "log" })).text, /alpha broadcast/));
 	const log = await c.tool({ action: "log" });
@@ -266,9 +269,10 @@ test("log: a reload continues the log without a leave or a join; /telecom off an
 	const proj = makeProject("p-log-reload");
 	const a = await session(proj);
 	const b = await session(proj);
+	await a.prompt("go");
 	await a.tool({ action: "status", message: "refactor the core" });
 	await a.stop("reload");
-	const a2 = track(await new Session(proj, { id: a.id }).start("reload"));
+	const a2 = track(await new Session(proj, { id: a.id, ran: true }).start("reload"));
 	await a2.tool({ action: "status", message: "refactor the core, part two" });
 	await eventually(async () => assert.match((await b.tool({ action: "log" })).text, /alpha task: refactor the core, part two/));
 	const text = (await b.tool({ action: "log" })).text;
@@ -280,6 +284,22 @@ test("log: a reload continues the log without a leave or a join; /telecom off an
 	await eventually(async () => assert.match((await b.tool({ action: "log" })).text, /alpha left/));
 	await a2.command("on");
 	await eventually(async () => assert.equal((await b.tool({ action: "log" })).text.match(/alpha joined/g)?.length, 2));
+});
+
+test("log: a session nothing ran in is not history; it joins with its first run", async () => {
+	const proj = makeProject("p-log-window");
+	const a = await session(proj);
+	await a.prompt("go");
+	// The window every `pi` opens before its human resumes another session: here, then gone.
+	const opened = await session(proj);
+	await opened.stop();
+	const b = await session(proj);
+	await eventually(async () => assert.match((await a.tool({ action: "log" })).text, /alpha \(you\) joined/));
+	assert.doesNotMatch((await a.tool({ action: "log" })).text, /bravo (joined|left)/, "neither the window nor a session still unused");
+	await b.prompt("go");
+	await eventually(async () => assert.equal((await a.tool({ action: "log" })).text.match(/bravo joined/g)?.length, 1));
+	await b.stop();
+	await eventually(async () => assert.match((await a.tool({ action: "log" })).text, /bravo left/));
 });
 
 test("log: subagents' comings and goings are not history", async () => {
@@ -297,6 +317,7 @@ test("/telecom log: the human reads the same log", async () => {
 	const proj = makeProject("p-log-human");
 	const a = await session(proj);
 	const b = await session(proj);
+	for (const s of [a, b]) await s.prompt("go");
 	await b.command("broadcast freeze merges until the release is out");
 	await eventually(async () => assert.match((await a.command("log")).join("\n"), /bravo broadcast from its human: freeze merges until the release is out/));
 	assert.match((await a.command("log")).join("\n"), /^📡 Team log: 3 entries, oldest first\.\n.*alpha \(you\) joined/);

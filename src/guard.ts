@@ -16,8 +16,15 @@ import type { Runtime } from "./runtime.ts";
 import type { FileChangedData } from "./transport.ts";
 import { fileExists, setBounded } from "./util.ts";
 
-/** Own recent changes published in the presence record. */
+/** Own recent changes inside the repository published in the presence record. */
 const RECENT_CAP = 12;
+/**
+ * And outside it (shared notes, scratch scripts), counted apart: where a claim binds and where an
+ * agent is shown working are read from its recent edits in the repository (`Awareness.checkoutsOf`,
+ * `workingCheckout`), and a dozen notes written elsewhere pushed every one of those out. Together
+ * they stay under the wire's limit (transport.ts, `LIMITS.recent`).
+ */
+const RECENT_OUTSIDE_CAP = 8;
 /** Per-call bookkeeping kept between tool_call and tool_result; bounded in case a result never comes. */
 const CALL_MAP_CAP = 256;
 
@@ -146,7 +153,11 @@ export function registerGuard(rt: Runtime): Guard {
 		const me = rt.self;
 		if (!me || !rt.transport) return;
 		const now = Date.now();
-		me.recent = [{ path, op, at: now }, ...me.recent.filter((r) => r.path !== path)].slice(0, RECENT_CAP);
+		let inside = 0;
+		let outside = 0;
+		me.recent = [{ path, op, at: now }, ...me.recent.filter((r) => r.path !== path)].filter((r) =>
+			rt.awareness.placeOf(r.path, me) ? ++inside <= RECENT_CAP : ++outside <= RECENT_OUTSIDE_CAP,
+		);
 		// Working inside a claim keeps it alive. Claims are written against the checkout this agent
 		// started in, but it may edit a worktree of its own: the same repository path there counts.
 		// A claim naming one checkout is kept alive only by edits there.

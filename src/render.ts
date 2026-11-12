@@ -14,6 +14,9 @@
  *   so the human reads the message itself first.
  * - Long bodies fold until the message is expanded, the team brief folds to one line, wrapped
  *   lines hang under their bullet, and a change notice's excerpt is coloured like pi's own diffs.
+ * - What an agent wrote to another (a message, an ask, an answer, a broadcast) is Markdown, as
+ *   models write it, and is shown the way pi shows an assistant's: `**bold**` bold, `code` in the
+ *   code colour, bullets, headings, quotes and code blocks (`proseStyler`).
  */
 import type { ExtensionAPI, Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
 import { type Component, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
@@ -117,6 +120,88 @@ export function dimCalls(paint: Paint, text: string, base: (text: string) => str
 	return restyle(text, TOOL_CALL, (call) => paint.fg("dim", call), base);
 }
 
+// ------------------------------------------------------------------ what agents write to each other
+
+/**
+ * Inline Markdown: a code span, a link, or bold (which may hold code spans). Bold must open at a
+ * word's start and close at a word's end, and never after `/`: claim patterns (`src/**`, `**\/x`)
+ * are everywhere in telecom, and two of them in one sentence are not emphasis.
+ */
+const INLINE = /`([^`\n]+)`|\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)|(?<![\w/*\\])\*\*(?=[^\s*])((?:`[^`\n]+`|[^`\n])+?)(?<=[^\s*])\*\*(?![\w*/])/g;
+/** A code span alone: what bold text may hold. */
+const CODE_SPAN = /`([^`\n]+)`/g;
+/** The lines of a fenced code block open and close with this. */
+const FENCE = /^\s*(?:```|~~~)/;
+
+/** What each Markdown colour falls back to: colours telecom's panels use everywhere else. */
+const MD_FALLBACK = {
+	mdCode: "accent",
+	mdLink: "syntaxKeyword",
+	mdCodeBlock: "toolDiffAdded",
+	mdHeading: "warning",
+	mdListBullet: "muted",
+	mdQuote: "muted",
+	mdQuoteBorder: "muted",
+} as const satisfies Record<string, ThemeColor>;
+
+/**
+ * `text` in one of the theme's Markdown colours. Another host's theme, or a custom one, may not
+ * define them, and a renderer that throws loses the whole message: then the colour's stand-in.
+ */
+function md(paint: Paint, color: keyof typeof MD_FALLBACK, text: string): string {
+	try {
+		return paint.fg(color, text);
+	} catch {
+		return paint.fg(MD_FALLBACK[color], text);
+	}
+}
+
+/** One line of prose with its inline Markdown drawn and the rest through `base` (callsigns, calls). */
+function inlineProse(paint: Paint, text: string, base: (text: string, bold: boolean) => string): string {
+	let out = "";
+	let last = 0;
+	for (const match of text.matchAll(INLINE)) {
+		const at = match.index ?? 0;
+		if (at > last) out += base(text.slice(last, at), false);
+		const [, code, label, url, strong] = match;
+		if (code !== undefined) out += md(paint, "mdCode", code);
+		else if (label !== undefined) out += `${md(paint, "mdLink", label)}${paint.fg("dim", ` (${url})`)}`;
+		else if (strong !== undefined) out += restyle(strong, CODE_SPAN, (span) => paint.bold(md(paint, "mdCode", span.slice(1, -1))), (t) => base(t, true));
+		last = at + match[0].length;
+	}
+	if (last < text.length) out += base(text.slice(last), false);
+	return out;
+}
+
+/**
+ * Styles the lines of a text one agent wrote to another, in order (it remembers whether it is
+ * inside a code block): one styled line per line given, so folding counts the same lines.
+ * Display only, and only for such texts: telecom's own notices are full of claim patterns and
+ * diff excerpts, which are not Markdown.
+ */
+export function proseStyler(paint: Paint, callsigns: readonly string[]): (line: string) => string {
+	const base = (text: string, bold: boolean) =>
+		dimCalls(paint, text, (t) => paintCallsigns(paint, t, callsigns, (x) => (bold ? paint.bold(plainText(paint, x)) : plainText(paint, x))));
+	const inline = (text: string) => inlineProse(paint, text, base);
+	let fenced = false;
+	return (line) => {
+		if (FENCE.test(line)) {
+			fenced = !fenced;
+			return paint.fg("dim", line);
+		}
+		if (fenced) return md(paint, "mdCodeBlock", line);
+		const heading = /^(\s*)#{1,6}\s+(.*)$/.exec(line);
+		if (heading) return `${heading[1]}${paint.bold(md(paint, "mdHeading", (heading[2] ?? "").replace(/\*\*|`/g, "")))}`;
+		const bullet = /^(\s*)[-*+] (.*)$/.exec(line);
+		if (bullet) return `${bullet[1]}${md(paint, "mdListBullet", "•")} ${inline(bullet[2] ?? "")}`;
+		const numbered = /^(\s*)(\d{1,3}[.)]) (.*)$/.exec(line);
+		if (numbered) return `${numbered[1]}${md(paint, "mdListBullet", numbered[2] ?? "")} ${inline(numbered[3] ?? "")}`;
+		const quote = /^(\s*)> ?(.*)$/.exec(line);
+		if (quote) return `${quote[1]}${md(paint, "mdQuoteBorder", "│")} ${md(paint, "mdQuote", (quote[2] ?? "").replace(/\*\*|`/g, ""))}`;
+		return inline(line);
+	};
+}
+
 /** `text` with each match of the global `pattern` through `onMatch`, and the runs between through `base`. */
 function restyle(text: string, pattern: RegExp, onMatch: (match: string) => string, base: (text: string) => string): string {
 	let out = "";
@@ -156,7 +241,7 @@ export class HangingText implements Component {
 				continue;
 			}
 			const plain = line.replace(/\x1b\[[0-9;]*m/g, "");
-			const hang = Math.min(/^\s*(?:[•\-*●○◌✓✗⚠?] )?/.exec(plain)?.[0].length ?? 0, Math.floor(width / 2));
+			const hang = Math.min(/^\s*(?:[•\-*●○◌✓✗⚠?│] |\d{1,3}[.)] )?/.exec(plain)?.[0].length ?? 0, Math.floor(width / 2));
 			const [first = "", ...rest] = wrapTextWithAnsi(line, Math.max(1, width));
 			lines.push(first);
 			if (rest.length === 0) continue;
@@ -389,8 +474,15 @@ function styleHeader(paint: Paint, first: string, color: ThemeColor, callsigns: 
 	return after ? `${head}${paintCallsigns(paint, after, callsigns, (t) => paint.fg(color, t))}` : head;
 }
 
+/** Messages whose body an agent (or its human) wrote: Markdown. The rest is telecom's own text. */
+const PROSE_TYPES: ReadonlySet<string> = new Set([MESSAGE_TYPES.message, MESSAGE_TYPES.ask, MESSAGE_TYPES.reply, MESSAGE_TYPES.broadcast]);
+
 function styleBody(paint: Paint, customType: string, lines: readonly string[], callsigns: readonly string[]): string[] {
 	if (customType === MESSAGE_TYPES.brief) return styleBoard(paint, lines.join("\n"), callsigns).split("\n");
+	if (PROSE_TYPES.has(customType)) {
+		const prose = proseStyler(paint, callsigns);
+		return lines.map((line) => (isHint(line) ? paint.fg("dim", line) : prose(line)));
+	}
 	return lines.map((line) => {
 		const diff = DIFF_LINE.exec(line);
 		if (customType === MESSAGE_TYPES.change && diff) {

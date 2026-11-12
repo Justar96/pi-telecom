@@ -161,7 +161,11 @@ export function registerCommand(rt: Runtime, life: Lifecycle, inbound: Inbound):
 					return;
 				}
 				me.callsign = wanted;
-				rt.persistCallsign();
+				if (me.formerly === wanted) delete me.formerly;
+				// A word its human gave it is not held only for now: no resumed session takes it.
+				rt.settleIn(me);
+				rt.persistCallsign(true);
+				rt.nameSession();
 				rt.publish();
 				// Peers' briefs say who we are; ours should restate the team under the new name.
 				rt.requestFullBrief();

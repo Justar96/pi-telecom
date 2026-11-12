@@ -22,6 +22,14 @@ import { clip, plural } from "./util.ts";
  */
 const NEW_DIRECTION_WORDS = 10;
 /**
+ * A task set on purpose this recently is not replaced by a prompt of any length. An agent's
+ * status often carries what the whole team works from (an order of work, who waits for what),
+ * and its human's next long message, a follow-up or a correction, typos included, replaced it in
+ * every teammate's brief minutes later. The agent sets its status again when its work changes;
+ * past this long without one, a long prompt is the better account of what it does.
+ */
+const EXPLICIT_TASK_HOLD_MS = 30 * 60_000;
+/**
  * How a short prompt that carries on the standing task starts: an acknowledgement ("go ahead",
  * "yes B is good", "lgtm") or a wrap-up step of the same work ("commit and merge", "push it").
  * Teammates read "commit and merge" as the task otherwise. Only these: "fix parser bug" is short
@@ -31,11 +39,13 @@ const CARRY_ON = /^(?:ok(?:ay)?|k|yes|yeah|yep|yup|ya|sure|go|continue|proceed|c
 
 export function registerTurns(rt: Runtime, inbound: Inbound): void {
 	/** A prompt becomes the task unless it only answers or asks the agent something: one word
-	 *  ("continue", "yes"), a short follow-up while a task set on purpose stands, or, while any
-	 *  task stands, a short question ("you tested ?") or a short go-ahead (`CARRY_ON`). */
+	 *  ("continue", "yes"), a short follow-up while a task set on purpose stands (any prompt, while
+	 *  that task is recent: `EXPLICIT_TASK_HOLD_MS`), or, while any task stands, a short question
+	 *  ("you tested ?") or a short go-ahead (`CARRY_ON`). */
 	function taskFromPrompt(me: Presence, prompt: string): void {
 		const words = prompt.trim().split(/\s+/).length;
-		if (words < 2 || (rt.taskExplicit && words < NEW_DIRECTION_WORDS)) return;
+		const recent = me.task !== undefined && Date.now() - (me.taskAt ?? 0) < EXPLICIT_TASK_HOLD_MS;
+		if (words < 2 || (rt.taskExplicit && (recent || words < NEW_DIRECTION_WORDS))) return;
 		const first = taskLine(prompt).trim();
 		if (me.task && words < NEW_DIRECTION_WORDS && (first.endsWith("?") || CARRY_ON.test(first))) return;
 		rt.setTask(me, first, false);
@@ -111,6 +121,8 @@ export function registerTurns(rt: Runtime, inbound: Inbound): void {
 		// always: it has no boundary to add them at, so they arrive as a wake-up).
 		rt.deliverDeferred();
 		inbound.flushNotices(true);
+		rt.nameSession();
+		rt.persistTask();
 		rt.publish();
 		rt.updateStatus();
 	}

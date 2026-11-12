@@ -9,7 +9,7 @@ import { afterEach, test } from "node:test";
 import { findProjectRoot, findRepo } from "../src/project.ts";
 import { openTransport, processStartTicks, WIRE_VERSION } from "../src/transport.ts";
 import { escapeRegExp } from "../src/util.ts";
-import { eventually, makeProject, makeWorktree, NOTICE_WAIT_MS, PLAIN_THEME, SCRATCH, Session, session, sleep, stopSessions, track } from "./harness.ts";
+import { eventually, makeProject, makeWorktree, NOTICE_WAIT_MS, PLAIN_THEME, SCRATCH, Session, session, sleep, stopSessions, track, withEnv } from "./harness.ts";
 
 // Per test: every live session ticks and reads every presence record, so sessions left over
 // from earlier tests slow later ones until they time out (Windows file I/O especially).
@@ -498,6 +498,156 @@ test("callsign is kept across a resume when still free", async () => {
 	assert.equal((await resumed.tool({ action: "board" })).details.callsign, "kilo");
 });
 
+test("callsign: a resumed session takes its word back from a session nothing has run in", async () => {
+	const proj = makeProject("p-resume-back");
+	const first = await session(proj);
+	await first.prompt("go");
+	const entries = [...first.entries];
+	await first.stop();
+	// The window another `pi` opened before its human resumed there: it took the first free word.
+	const opened = await session(proj);
+	assert.equal((await opened.tool({ action: "board" })).details.callsign, "alpha");
+	const resumed = new Session(proj, { id: first.id, ran: true });
+	resumed.entries.push(...entries);
+	track(await resumed.start("resume"));
+	assert.equal((await resumed.tool({ action: "board" })).details.callsign, "alpha", "the team knows it by that word");
+	await eventually(async () => assert.equal((await opened.tool({ action: "board" })).details.callsign, "bravo"));
+	assert.ok(opened.notified.some((n) => /callsign alpha was taken; you are now bravo/.test(n)), opened.notified.join(" | "));
+	assert.equal(recordOf(resumed)?.formerly, undefined);
+	assert.equal(recordOf(opened)?.formerly, undefined, "nobody knew the window by a word");
+	// From its first run on, a session keeps its word like any other.
+	assert.equal(recordOf(opened)?.provisional, true);
+	await opened.prompt("go");
+	assert.equal(recordOf(opened)?.provisional, false);
+	// So does one its human named, though nothing ran in it; also once it reconnects.
+	const named = await session(proj);
+	await named.command("name ops");
+	assert.equal(recordOf(named)?.provisional, false);
+	await named.command("off");
+	await named.command("on");
+	assert.equal(recordOf(named)?.callsign, "ops");
+	assert.equal(recordOf(named)?.provisional, false);
+});
+
+test("callsign: a resumed session whose word a working session holds is renamed, and says what it was called", async () => {
+	const proj = makeProject("p-resume-renamed");
+	const first = await session(proj);
+	await first.prompt("go");
+	const entries = [...first.entries];
+	await first.stop();
+	const working = await session(proj);
+	await working.prompt("go");
+	const resumed = new Session(proj, { id: first.id, ran: true });
+	resumed.entries.push(...entries);
+	track(await resumed.start("resume"));
+	assert.equal((await resumed.tool({ action: "board" })).details.callsign, "bravo");
+	assert.equal((await working.tool({ action: "board" })).details.callsign, "alpha", "a session at work is never renamed by a resume");
+	assert.ok(resumed.notified.some((n) => /this session was alpha; a session at work holds that callsign now, so it is bravo/.test(n)), resumed.notified.join(" | "));
+	// What teammates read before names it "alpha", which is another agent now.
+	await eventually(async () => assert.match((await working.tool({ action: "board" })).text, /• bravo \(was alpha\) \[/));
+	const brief = await resumed.prompt("carry on with the parser work");
+	assert.match(brief?.message?.content ?? "", /you are "bravo" \(you were "alpha" before; that name may be another agent's now\)\./);
+	await eventually(async () => assert.match((await working.tool({ action: "log" })).text, /bravo joined \(was alpha\)/));
+	// Over a reload it still says so.
+	await resumed.stop("reload");
+	const reloaded = new Session(proj, { id: first.id, ran: true });
+	reloaded.entries.push(...resumed.entries);
+	track(await reloaded.start("reload"));
+	assert.equal(recordOf(reloaded)?.formerly, "alpha");
+	// A fork copies its parent's entries: the word in them was never its own.
+	const fork = new Session(proj, { ran: true });
+	fork.entries.push(...entries);
+	track(await fork.start());
+	assert.equal(recordOf(fork)?.callsign, "charlie");
+	assert.equal(recordOf(fork)?.formerly, undefined);
+});
+
+test("task: a restart keeps the task, its age and whether it was set on purpose; a fork starts without it", async (t) => {
+	const proj = makeProject("p-task-resume");
+	const a = await session(proj);
+	const b = await session(proj);
+	await a.prompt("go on with the importer");
+	await a.tool({ action: "status", message: "holding @cargo for the epoch batch; bravo next" });
+	await a.settle();
+	const tasks = (s: Session) => s.entries.filter((e) => e.customType === "telecom-task");
+	assert.deepEqual(tasks(a).map((e) => (e.data as { task: string; explicit?: boolean }).explicit), [true], "written once, when the run ended");
+	// A run that changes nothing writes nothing: every write is an entry in the session file.
+	await a.prompt("continue");
+	await a.settle();
+	assert.equal(tasks(a).length, 1);
+	const setAt = recordOf(a)?.taskAt;
+	const entries = [...a.entries];
+	await a.stop();
+	// The process died (no reload handoff): runs that teammates' messages start set no task, so
+	// the session stood on the board without one for as long as that lasted.
+	const resumed = new Session(proj, { id: a.id, ran: true });
+	resumed.entries.push(...entries);
+	track(await resumed.start("resume"));
+	assert.equal(recordOf(resumed)?.task, "holding @cargo for the epoch batch; bravo next");
+	assert.equal(recordOf(resumed)?.taskAt, setAt, "with the time it was set: the board says how old it is");
+	await eventually(async () => assert.match((await b.tool({ action: "board" })).text, /task: holding @cargo for the epoch batch; bravo next/));
+	await resumed.prompt("ok and remind me what the plan for the release was");
+	assert.equal(recordOf(resumed)?.task, "holding @cargo for the epoch batch; bravo next", "still a task set on purpose");
+	await resumed.settle();
+	assert.equal(tasks(resumed).length, 1, "what the session file holds is not written to it again");
+	assert.doesNotMatch((await b.tool({ action: "log" })).text, /(task: holding @cargo[^\n]*\n[^]*){2}/, "a task restored is not a task set again");
+	// Days later a new direction from its human replaces it.
+	const real = Date.now;
+	t.mock.method(Date, "now", () => real() + 31 * 60_000);
+	await resumed.prompt("drop that and port the importer to streaming reads so large files never sit in memory");
+	assert.match(recordOf(resumed)?.task ?? "", /^drop that and port the importer/);
+	// A fork copies its parent's entries: what the parent did is not what the fork was started for.
+	const fork = new Session(proj, { ran: true });
+	fork.entries.push(...entries);
+	track(await fork.start());
+	assert.equal(recordOf(fork)?.task, undefined);
+});
+
+test("session name: a session is named after its callsign and task for /resume; a name its human gave stays", async (t) => {
+	const proj = makeProject("p-session-name");
+	const a = await session(proj);
+	const b = await session(proj, { name: "release desk" });
+	await a.prompt("go");
+	await a.settle();
+	assert.equal(a.sessionName, undefined, "a bare callsign says less than the first message pi shows");
+	await a.prompt("fix the flaky upload test in the importer");
+	await a.settle();
+	assert.equal(a.sessionName, "📡 alpha · fix the flaky upload test in the importer");
+	// It follows the task and the callsign.
+	await a.prompt("go");
+	await a.tool({ action: "status", message: "port the importer to streaming reads, so a big file never sits in memory at once" });
+	await a.settle();
+	assert.equal(a.sessionName, "📡 alpha · port the importer to streaming reads, so a big file never s…");
+	await a.command("name ops");
+	assert.equal(a.sessionName, "📡 ops · port the importer to streaming reads, so a big file never s…");
+	// It repeats what the board says already: peers are not shown it as the session's name.
+	assert.equal(recordOf(a)?.name, undefined);
+	assert.doesNotMatch((await b.tool({ action: "board" })).text, /"📡/);
+	// A name its human gave is the session's name, to peers too.
+	await b.prompt("review the release notes before they go out");
+	await b.settle();
+	assert.equal(b.sessionName, "release desk");
+	assert.equal(recordOf(b)?.name, "release desk");
+	// After a restart the task is gone until the next one is set: the name keeps the one it had,
+	// under the callsign the session has now.
+	// (A session last run on a telecom that did not keep the task in the session file.)
+	const entries = a.entries.filter((e) => e.customType !== "telecom-task");
+	await a.stop();
+	const resumed = new Session(proj, { id: a.id, ran: true });
+	resumed.entries.push(...entries);
+	resumed.sessionName = "📡 kilo · port the importer to streaming reads";
+	track(await resumed.start("resume"));
+	await resumed.prompt("go");
+	await resumed.settle();
+	assert.equal(resumed.sessionName, "📡 ops · port the importer to streaming reads");
+	// And it can be turned off.
+	withEnv(t, "PI_TELECOM_SESSION_NAME", "off");
+	const c = await session(proj);
+	await c.prompt("write the tests for the parser");
+	await c.settle();
+	assert.equal(c.sessionName, undefined);
+});
+
 test("an aborted ask is withdrawn from the peer's to-do list", async () => {
 	const proj = makeProject("p-withdraw");
 	const a = await session(proj);
@@ -747,7 +897,7 @@ test("ids: agents started together get distinct ids on the board, and those ids 
 	assert.equal(c.sentOf("telecom-message").length, 0);
 });
 
-test("status: a task set on purpose outlives short replies to the agent; a new direction replaces it", async () => {
+test("status: a task set on purpose outlives short replies to the agent, and any prompt while it is recent; a new direction replaces it later", async (t) => {
 	const proj = makeProject("p-sticky-task");
 	const a = await session(proj);
 	const taskOf = async () => (await a.tool({ action: "status" })).text;
@@ -758,8 +908,16 @@ test("status: a task set on purpose outlives short replies to the agent; a new d
 	await a.tool({ action: "status", message: "upload test fixed; reviewing bravo's api" });
 	for (const reply of ["yes B is good", "both enabled", "follow best practice and how enterprise using"]) await a.prompt(reply);
 	assert.match(await taskOf(), /reviewing bravo's api/, "short follow-ups keep a task the agent set");
+	// A status set minutes ago is what the team works from: its human's next long message (a
+	// follow-up, a correction) is not the task, and the agent sets a new status when its work changes.
+	await a.prompt("ok but before that can you check why the importer test was slow yesterday on my laptop");
+	assert.match(await taskOf(), /reviewing bravo's api/, "a long prompt keeps a status set just now");
+	const real = Date.now;
+	t.mock.method(Date, "now", () => real() + 31 * 60_000);
+	await a.prompt("yes B is good");
+	assert.match(await taskOf(), /reviewing bravo's api/, "a short reply keeps it however old it is");
 	await a.prompt("drop the review and port the importer to streaming reads so large files never sit in memory");
-	assert.match(await taskOf(), /port the importer to streaming reads/, "a new direction replaces it");
+	assert.match(await taskOf(), /port the importer to streaming reads/, "a new direction replaces a status that old");
 });
 
 // ---------------------------------------------------------------- lanes: worktrees of one repository
@@ -1419,6 +1577,29 @@ test("claims: a path in your own worktree is claimed as the repository path ther
 	await a.read(team);
 	await a.edit(team, "plan", "plan v2");
 	assert.match((await b.write(team, "mine\n")).blocked ?? "", /alpha edited .*TEAM\.md/);
+});
+
+test("lanes: notes written outside the repository do not push a worktree out of where a claim binds", async () => {
+	const proj = makeProject("p-lane-notes");
+	const wt = makeWorktree(proj, "wa", "lane-a");
+	mkdirSync(join(wt, "src"), { recursive: true });
+	writeFileSync(join(wt, "src", "x.ts"), "x\n");
+	const notes = join(SCRATCH, "p-lane-notes-evidence");
+	const a = await session(proj);
+	const b = await session(proj);
+	await a.tool({ action: "claim", paths: ["src/x.ts"], message: "parser" });
+	await a.read(join(wt, "src", "x.ts"));
+	assert.equal((await a.edit(join(wt, "src", "x.ts"), "x", "A")).blocked, undefined);
+	// More notes than a record keeps recent edits: each used to take a slot from the worktree's.
+	for (let i = 0; i < 14; i++) await a.write(join(notes, `note-${i}.md`), "n\n");
+	const recent = recordOf(a)?.recent ?? [];
+	assert.ok(recent.some((r) => r.path.endsWith(join("src", "x.ts"))), "the edit in the repository is still published");
+	assert.equal(recent.filter((r) => r.path.includes("p-lane-notes-evidence")).length, 8, "notes have slots of their own");
+	assert.match(recent[0]?.path ?? "", /note-13\.md$/, "newest first");
+	// So the claim still binds in the worktree its owner edited: one copy, and bravo is held back.
+	await b.read(join(wt, "src", "x.ts"));
+	const held = await b.edit(join(wt, "src", "x.ts"), "A", "B");
+	assert.match(held.blocked ?? "", /inside alpha's claim "src\/x\.ts"/);
 });
 
 test("claims: edits in the worktree an agent works in keep its claims alive", async () => {

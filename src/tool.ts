@@ -23,6 +23,7 @@ import {
 	moreLines,
 	paintCallsigns,
 	plainText,
+	proseStyler,
 	styleBoard,
 	telecomPanel,
 } from "./render.ts";
@@ -57,9 +58,9 @@ const TOOL_PARAMETERS = Type.Object({
 	interrupt: Type.Optional(Type.Boolean({ description: "send: false holds it until the recipient's current run ends (progress updates, FYIs); default true." })),
 	timeoutSec: Type.Optional(Type.Number({ description: "ask: seconds to wait (default 300; with wait false, 1800)." })),
 	wait: Type.Optional(Type.Boolean({ description: "ask: false returns at once; the answer arrives later as a message." })),
-	queue: Type.Optional(Type.Boolean({ description: "claim: wait in line for a held @lock; you get it, and are woken, when it frees." })),
+	queue: Type.Optional(Type.Boolean({ description: "claim: false refuses a held @lock instead of waiting in line for it (default: wait; you get it, and are woken, when it frees)." })),
 	pid: Type.Optional(
-		Type.Integer({ description: "claim: keep these claims while this process runs (a background build or test); released when it exits." }),
+		Type.Integer({ description: "claim: keep these claims while this process runs (a background build or test); released when it exits. For the next job, claim again with its pid." }),
 	),
 	waitingFor: Type.Optional(
 		Type.Array(Type.String(), {
@@ -120,7 +121,7 @@ export const TOOL_SPEC = {
 		"Message peers only for real coordination (requests, handoffs, shared-interface changes) — no acknowledgements; each message costs the recipient a turn.",
 		"Broadcast only what every agent must act on, with `paths` when it is about files. Keep `status` to one line naming your task; `send` results and requests to whoever needs them, and progress updates and FYIs with `interrupt: false`.",
 		"To hear when a peer's long job ends, ask with `wait: false` (the answer arrives as a message and wakes you), not a long `timeoutSec` or a polling loop.",
-		'Take turns on a shared resource (build, test runner, port) with a lock claim such as "@cargo" (queue: true waits in line), and say whom you wait for with status waitingFor, instead of negotiating leases in messages.',
+		'Take turns on a shared resource (build, test runner, port) with a lock claim such as "@cargo" (a held one puts you in line, and you are woken when it is yours), and say whom you wait for with status waitingFor, instead of negotiating leases in messages.',
 	],
 	parameters: TOOL_PARAMETERS,
 	// Hints for permission extensions: telecom only talks to local pi sessions and edits nothing.
@@ -138,8 +139,11 @@ export const TOOL_SPEC = {
 		const context = renderContext<ToolParams>(last, theme as unknown as { expanded?: unknown });
 		const header = callHeader(args, theme);
 		const message = args.message?.trim() ?? "";
-		// A claim's message is its reason; everywhere else it is what the peer reads.
-		const paint = (t: string) => (args.action === "claim" ? theme.fg("muted", t) : paintCallsigns(theme, t, mentioned(args)));
+		// A claim's message is its reason. What goes to a peer is Markdown, drawn as the peer's
+		// transcript draws it; a status is a plain line.
+		const prose = PROSE_ACTIONS.has(args.action ?? "") ? proseStyler(theme, mentioned(args)) : null;
+		const paint = (t: string) =>
+			args.action === "claim" ? theme.fg("muted", t) : prose ? t.split("\n").map(prose).join("\n") : paintCallsigns(theme, t, mentioned(args));
 		// Folded: the header and the start of the message share one row. Expanded: all of it.
 		const text = !message
 			? header
@@ -218,6 +222,9 @@ function edgeColor(args: Partial<ToolParams> | undefined, failed: boolean): Them
 	return to ? agentColor(to) : "accent";
 }
 
+/** Actions whose `message` another agent reads. */
+const PROSE_ACTIONS: ReadonlySet<string> = new Set(["send", "ask", "reply", "broadcast"]);
+
 /** `📡 send → bravo`, `📡 claim src/auth/**`, `📡 broadcast → the team · about src/db`. */
 function callHeader(args: Partial<ToolParams>, theme: Theme): string {
 	const action = args.action ?? "…";
@@ -277,14 +284,15 @@ interface Row {
 function claimRow(line: string, theme: Theme, say: (t: string) => string, muted: (t: string) => string): Row[] {
 	const tick = theme.fg("success", "✓");
 	const warn = theme.fg("warning", "⚠");
-	// "claimed src/x — why. Peers editing there …" / "claimed @cargo — why: yours until …" /
-	// "renewed @cargo: yours for …" / "queued for @cargo, held by bravo …. You get it …".
-	const made = /^(claimed|renewed|queued for) (.*?)(?:(?: — .*?)?(?:\. Peers editing| ?: yours|, held by|\. You get it|; ahead of you)(.*))$/.exec(line);
+	// "claimed src/x — why." (the first in a context goes on: " Peers editing there …") /
+	// "claimed @cargo — why: yours until …" / "renewed @cargo: yours for …" /
+	// "queued for @cargo, held by bravo …. Not yours yet. …": what was claimed ends at the first of these.
+	const made = /^(claimed|renewed|queued for) (.*?)(?= — |: yours|, held by|, free, but|; ahead of you|\.(?: |$))/.exec(line);
 	if (made) {
-		const [, verb = "", what = "", tail = ""] = made;
+		const [, verb = "", what = ""] = made;
 		const rows: Row[] = [{ text: `${verb === "queued for" ? theme.fg("accent", "◷") : tick} ${say(`${verb} ${what}`)}` }];
 		// A lane overlap is news for the human too.
-		const [, note] = splitOnce(tail, " Note: ");
+		const [, note] = splitOnce(line, " Note: ");
 		if (note !== undefined) rows.push({ text: `${warn} ${theme.fg("warning", note.replace(/ Your checkouts are separate.*$/, ""))}` });
 		rows.push({ text: muted(line), quiet: true });
 		return rows;
@@ -335,9 +343,11 @@ function resultLines(
 				const [what, handle] = splitOnce(first, " — handle ");
 				return [{ text: `${tick} ${say(what)}${handle ? theme.fg("dim", ` · ${handle}`) : ""}` }, ...quiet(rest)];
 			}
-			// "alpha answered:\n\n<the answer>": the answer is what the human wants to read.
+			// "alpha answered:\n\n<the answer>": the answer is what the human wants to read, and
+			// the peer wrote it as Markdown.
 			const answer = rest.join("\n").replace(/^\n+/, "").split("\n");
-			return [{ text: `${tick} ${say(first.replace(/:$/, ""))}` }, ...answer.map((l) => (isHint(l) ? { text: theme.fg("dim", l), quiet: true } : { text: say(l) }))];
+			const prose = proseStyler(theme, names);
+			return [{ text: `${tick} ${say(first.replace(/:$/, ""))}` }, ...answer.map((l) => (isHint(l) ? { text: theme.fg("dim", l), quiet: true } : { text: prose(l) }))];
 		}
 		case "claim":
 			return text.split("\n").flatMap((l) => claimRow(l, theme, say, muted));
@@ -350,9 +360,10 @@ function resultLines(
 			return [{ text: `${tick} ${shown}${detail === undefined ? "" : theme.fg("muted", ` · ${detail}`)}` }, ...quiet(rest)];
 		}
 		case "status": {
-			// "status set — peers now see alpha: task · waiting for …. You are woken …": the task.
-			const [, after = first] = splitOnce(first, " — ");
-			const [task, waits] = splitOnce(after, " · ");
+			// "status set · waiting for bravo. You are woken …": the task itself is in the call above
+			// (a task past the cap is shown as peers see it, "status set — peers see: …").
+			const [head, waits] = splitOnce(first, " · ");
+			const [task] = splitOnce(head, " — ");
 			const waitShort = waits?.replace(/\. You are woken.*$/, "");
 			return [
 				{ text: `${tick} ${say(task)}${waitShort ? theme.fg("warning", ` · ${waitShort}`) : ""}` },

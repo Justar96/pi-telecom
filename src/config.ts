@@ -25,6 +25,8 @@ export interface TelecomConfig {
 	disabled: boolean;
 	/** Claim time-to-live without activity, in milliseconds. */
 	claimTtlMs: number;
+	/** Name the pi session after its callsign and task (`Runtime.nameSession`). On unless turned off. */
+	sessionName: boolean;
 	/** How often the inbox loop runs, in milliseconds. Tests shorten it; users have no reason to. */
 	tickMs: number;
 	/** How often the heartbeat (claim expiry, the sweep) runs, in milliseconds. Tests shorten it too. */
@@ -39,6 +41,7 @@ export const ENV = {
 	callsign: "PI_TELECOM_CALLSIGN",
 	disable: "PI_TELECOM_DISABLE",
 	claimTtl: "PI_TELECOM_CLAIM_TTL_MIN",
+	sessionName: "PI_TELECOM_SESSION_NAME",
 	tickMs: "PI_TELECOM_TICK_MS",
 	heartbeatMs: "PI_TELECOM_HEARTBEAT_MS",
 } as const;
@@ -67,6 +70,11 @@ function truthy(raw: string | undefined): boolean {
 	return /^(1|true|yes|on)$/i.test(raw?.trim() ?? "");
 }
 
+/** For a setting that is on by default: only an explicit "no" turns it off. */
+function falsy(raw: string | undefined): boolean {
+	return /^(0|false|no|off)$/i.test(raw?.trim() ?? "");
+}
+
 export function readConfig(env: NodeJS.ProcessEnv = process.env): TelecomConfig {
 	const guardRaw = env[ENV.guard]?.trim().toLowerCase();
 	const guard: GuardMode =
@@ -79,6 +87,7 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): TelecomConfig 
 		callsign: callsign && CALLSIGN_PATTERN.test(callsign) ? callsign : undefined,
 		disabled: truthy(env[ENV.disable]),
 		claimTtlMs: positive(env[ENV.claimTtl], DEFAULT_CLAIM_TTL_MIN) * 60_000,
+		sessionName: !falsy(env[ENV.sessionName]),
 		tickMs: positive(env[ENV.tickMs], DEFAULT_TICK_MS),
 		heartbeatMs: positive(env[ENV.heartbeatMs], DEFAULT_HEARTBEAT_MS),
 	};

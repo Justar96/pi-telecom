@@ -201,6 +201,31 @@ test("waits: a wait cycle is pointed out once, not on every status that keeps it
 	assert.match(again.text, /waiting for alpha/);
 });
 
+test("results explain how a claim, a lock and a wait work once per context, and again after a compaction", async () => {
+	const proj = makeProject("p-flow-explained-once");
+	const a = await session(proj);
+	const b = await session(proj);
+	const first = await a.tool({ action: "claim", paths: ["src/a.ts"], message: "the parser" });
+	assert.match(first.text, /^claimed src\/a\.ts — the parser\. Peers editing there are held back and you are told\. Release with telecom\(\{ action: "release" \}\) when done; idle claims expire after \d+ min\.$/);
+	// Said on every call, these sentences were most of what `claim` and `status` returned in a day.
+	assert.equal((await a.tool({ action: "claim", paths: ["src/b.ts"], message: "the lexer" })).text, "claimed src/b.ts — the lexer.");
+	assert.equal((await a.tool({ action: "claim", paths: ["src/c.ts"] })).text, "claimed src/c.ts.");
+	assert.match((await a.tool({ action: "claim", paths: ["@cargo"] })).text, /^claimed @cargo: yours until you release it — telecom\(\{ action: "release", paths: \["@cargo"\] \}\) — and others who claim it wait in line\. It stays yours while you are working;/);
+	assert.equal((await a.tool({ action: "claim", paths: ["@port"], message: "the dev server" })).text, "claimed @port — the dev server: yours until you release it.");
+	// Each agent has its own context.
+	assert.match((await b.tool({ action: "claim", paths: ["docs/a.md"] })).text, /Peers editing there are held back/);
+	// Who waits for this agent is said every time; the call to end the wait once per wait.
+	await b.tool({ action: "status", message: "waiting for the parser", waitingFor: ["alpha"] });
+	const told = await a.tool({ action: "status", message: "parser half done" });
+	assert.equal(told.text, 'status set\nbravo waits for you. If this is what it needs, tell it: telecom({ action: "send", to: "bravo", message: "…", unblocks: true }).');
+	assert.equal((await a.tool({ action: "status", message: "parser nearly done" })).text, "status set\nbravo waits for you.");
+	// A compaction may have dropped all of it from the context.
+	await a.fire("session_compact", {});
+	assert.match((await a.tool({ action: "claim", paths: ["src/d.ts"] })).text, /^claimed src\/d\.ts\. Peers editing there are held back/);
+	assert.match((await a.tool({ action: "claim", paths: ["@db"] })).text, /^claimed @db: yours until you release it — telecom/);
+	assert.match((await a.tool({ action: "status", message: "parser done" })).text, /bravo waits for you\. If this is what it needs, tell it:/);
+});
+
 test("claim: a path claim long after the task was set shows the task peers see, once", async (t) => {
 	const proj = makeProject("p-flow-stale-task");
 	const a = await session(proj);
@@ -220,7 +245,8 @@ test("status and messages: a leading own callsign is dropped; peers already see 
 	const a = await session(proj);
 	const b = await session(proj);
 	const set = await a.tool({ action: "status", message: "alpha: B2 done, standby" });
-	assert.match(set.text, /peers now see alpha: B2 done, standby$/);
+	assert.equal(set.text, "status set");
+	assert.equal(published(a)?.task, "B2 done, standby");
 	await a.tool({ action: "send", to: "bravo", message: "alpha → bravo: the freeze is on" });
 	await eventually(() => assert.equal(b.sentOf("telecom-message").length, 1));
 	assert.match(b.sentOf("telecom-message")[0]?.content ?? "", /\*\*\n\nthe freeze is on\n/);

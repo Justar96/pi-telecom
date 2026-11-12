@@ -112,9 +112,9 @@ test("a pid that is not running does not turn the claim away: it is a normal cla
 	await a.tool({ action: "claim", paths: ["@cargo"], pid: live.pid });
 	await a.tool({ action: "claim", paths: ["@cargo"], pid: dead });
 	assert.equal(published(a)?.claims.find((c) => c.pattern === "@cargo")?.pid, undefined);
-	const refused = await session(proj).then((b) => b.tool({ action: "claim", paths: ["@cargo"], pid: dead }));
-	assert.ok(refused.isError, "a held lock is still refused, pid or not");
-	assert.doesNotMatch(refused.text, /is not running, so this is a normal claim/);
+	const waits = await session(proj).then((b) => b.tool({ action: "claim", paths: ["@cargo"], pid: dead }));
+	assert.match(waits.text, /^queued for @cargo, held by alpha/, "a held lock is still waited for, pid or not");
+	assert.doesNotMatch(waits.text, /is not running, so this is a normal claim/, "nothing was claimed, so no claim to describe");
 });
 
 test("a claim tied to a running process outlives its TTL while the owner is idle, and its release comes with the process's exit", async (t) => {
@@ -128,7 +128,7 @@ test("a claim tied to a running process outlives its TTL while the owner is idle
 	const claimed = await a.tool({ action: "claim", paths: ["@cargo", "src/**"], message: "the epoch batch", pid });
 	assert.ok(!claimed.isError, claimed.text);
 	assert.match(claimed.text, new RegExp(`kept while process ${pid} runs`));
-	assert.match(claimed.text, new RegExp(`It stays yours while process ${pid} runs, and is released when it exits`));
+	assert.match(claimed.text, new RegExp(`claimed @cargo — the epoch batch: yours while process ${pid} runs\\. When it exits, the lock is released: at once if you are idle`));
 	for (const c of published(a)?.claims ?? []) {
 		assert.equal(c.pid, pid, "every claim of the call carries the pid");
 		assert.equal(c.pidStart, processStartTicks(pid) ?? undefined, "with its start time, where the platform gives one");
@@ -165,6 +165,39 @@ test("a claim for a process that exits is logged as exactly that, and a lock goe
 	await eventually(async () => assert.match(await logOf(a), new RegExp(`released @cargo: process ${pid} exited`)));
 	assert.equal(published(a)?.claims.length, 0);
 	assert.equal(published(b)?.claims[0]?.pattern, "@cargo");
+});
+
+test("a busy holder keeps its lock a while after its process exits, so the next job's claim keeps it; without one it goes to the line", async (t) => {
+	withEnv(t, "PI_TELECOM_CLAIM_TTL_MIN", "0.05"); // 3 s, and so is the time a lock is kept after an exit
+	withEnv(t, "PI_TELECOM_HEARTBEAT_MS", "40");
+	const proj = makeProject("p-pid-sequence");
+	const a = await session(proj);
+	const b = await session(proj);
+	const one = await startJob();
+	const two = await startJob();
+	// A holder running jobs in a row lost the lock between each to whoever was in line.
+	await a.prompt("build, then test, then build the next crate");
+	await a.tool({ action: "claim", paths: ["@cargo", "src/**"], message: "the build", pid: one.pid });
+	await b.tool({ action: "claim", paths: ["@cargo"] });
+	await endJob(one);
+	const told = () => a.sentOf("telecom-claim").filter((m) => /stays yours/.test(m.content));
+	await eventually(() => assert.equal(told().length, 1), 5_000);
+	assert.match(told()[0]?.content ?? "", new RegExp(`^\\*\\*📡 1 claim released\\*\\*\\n\\nProcess ${one.pid} exited, so src/\\*\\* is released\\. Claim again if you still need it\\. @cargo stays yours for 3 s more, for a next job: claim it again with that job's pid to keep it\\. Done with it\\? Release now, since others may be in line: telecom\\(\\{ action: "release", paths: \\["@cargo"\\] \\}\\)\\.$`));
+	assert.equal(told()[0]?.options, undefined, "passive: steered into the run it is in");
+	assert.deepEqual(published(a)?.claims.map((c) => [c.pattern, c.pid]), [["@cargo", undefined]], "the path claim went with its process; the lock stays");
+	assert.equal(lockMessages(b).length, 0, "the line waits");
+	const next = await a.tool({ action: "claim", paths: ["@cargo"], pid: two.pid });
+	assert.match(next.text, new RegExp(`^renewed @cargo: yours while process ${two.pid} runs\\.$`));
+	assert.equal(published(a)?.claims[0]?.pid, two.pid);
+	// The second job ends, and no third is claimed for: the lock goes to the line.
+	await endJob(two);
+	await eventually(() => assert.equal(lockMessages(b).length, 1), 10_000);
+	assert.equal(published(a)?.claims.length, 0);
+	const log = await logOf(a);
+	assert.match(log, new RegExp(`released @cargo: process ${two.pid} exited`));
+	assert.doesNotMatch(log, new RegExp(`released @cargo: process ${one.pid} exited`), "the first job's exit released only its path claim");
+	await eventually(() => assert.ok(a.sentOf("telecom-claim").some((m) => new RegExp(`Process ${two.pid} exited, so @cargo is released`).test(m.content))));
+	assert.equal(told().length, 2, "each exit was told once");
 });
 
 test("a claim made again without a pid keeps the one it had; with one, replaces it", async () => {

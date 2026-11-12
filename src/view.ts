@@ -175,6 +175,8 @@ export function widgetLines(snap: TeamSnapshot, paint: Paint, width: number, pla
 		const name = pad(`${depth ? paint.fg("dim", "└ ") : ""}${callsignText(paint, truncateToWidth(p.callsign, nameWidth - depth * 2, "…"))}`, nameWidth);
 		const extras: string[] = [];
 		if (p.id === self.id) extras.push(paint.fg("accent", "you"));
+		// Renamed on its way back (its word was in use): the human knew this session by the old one.
+		if (p.formerly) extras.push(`${paint.fg("muted", "was")} ${callsignText(paint, p.formerly)}`);
 		const claims = liveClaims(p, now);
 		if (claims.length > 0) extras.push(paint.fg("muted", `claims ${claims[0]?.pattern}${claims.length > 1 ? ` +${claims.length - 1}` : ""}`));
 		// Another checkout, where the agent works as the board says it (not where it started): named

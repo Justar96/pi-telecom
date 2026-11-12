@@ -350,6 +350,49 @@ try {
 	const onOffset = worker.records.length;
 	await worker.command("/telecom");
 	check("/telecom on reconnects and stays on after a real /reload", Boolean(await worker.waitFor(isNotify(/You are /), 10_000, onOffset).catch(() => null)));
+
+	// 10. A resume after a restart. Every `pi` opens a new session first, which takes the first
+	// free callsign; the session its human then resumes takes its own word back from it, where it
+	// used to be renamed (and with it, one by one, the whole team).
+	const resumeProject = join(scratch, "resume");
+	mkdirSync(resumeProject);
+	const resumeSession = ["--session-dir", join(scratch, "sessions-resume"), "--session-id", "66666666-7777-4888-8999-aaaaaaaaaaaa"];
+	const sessionNameOf = async (agent) => {
+		const id = agent.send({ type: "get_state" });
+		return (await agent.waitFor((r) => r.type === "response" && r.id === id, 10_000).catch(() => null))?.data?.sessionName;
+	};
+	const worked = startPi("worked", { cwd: resumeProject, env, args: taskArgs, noTelecom: true, session: resumeSession, unnamed: true });
+	extra.push(worked);
+	await worked.waitFor(isStatus(/📡 alpha/), 30_000);
+	const workedOffset = worked.records.length;
+	await worked.command("tidy the changelog before the release");
+	await worked.waitFor(settled, 15_000, workedOffset);
+	const autoName = await sessionNameOf(worked);
+	check("a session its human did not name is named after its callsign and task, for /resume", autoName === "📡 alpha · tidy the changelog before the release", String(autoName));
+	await worked.stop();
+	const opened = startPi("opened", { cwd: resumeProject, env });
+	extra.push(opened);
+	const tookWord = await opened.waitFor(isStatus(/📡 alpha/), 30_000).catch(() => null);
+	const resumed = startPi("resumed", { cwd: resumeProject, env, args: taskArgs, noTelecom: true, session: resumeSession, unnamed: true });
+	extra.push(resumed);
+	await resumed.waitFor(isStatus(/📡/), 30_000);
+	await resumed.command("/telecom");
+	const resumedBoard = await resumed.waitFor(isNotify(/You are /), 10_000).catch(() => null);
+	check(
+		"a resumed session takes its callsign back from a new session nothing has run in",
+		Boolean(tookWord && resumedBoard && /You are alpha\./.test(resumedBoard.message)),
+		resumedBoard?.message ?? resumed.notifies().slice(-1)[0],
+	);
+	const moved = await opened.waitFor(isNotify(/callsign alpha was taken; you are now bravo/), 10_000).catch(() => null);
+	check("the new session moves to the next free callsign and tells its human", Boolean(moved), opened.notifies().slice(-1)[0]);
+	// Nothing has run in the resumed session since the restart: its task comes from its session file.
+	const taskOffset = opened.records.length;
+	await opened.command("/telecom");
+	const taskSeen = await opened.waitFor(isNotify(/task: tidy the changelog before the release/), 10_000, taskOffset).catch(() => null);
+	check("the resumed session still has the task it had before the restart, on its teammate's board", Boolean(taskSeen), opened.notifies().slice(-1)[0]);
+	const keptName = await sessionNameOf(resumed);
+	check("the resumed session still carries that name", keptName === "📡 alpha · tidy the changelog before the release", String(keptName));
+	check("a name its human gave a session is left alone", (await sessionNameOf(leader)) === "task-leader");
 } catch (error) {
 	if (error.message !== "setup") {
 		console.error(error);

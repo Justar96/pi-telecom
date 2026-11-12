@@ -24,11 +24,12 @@ function piCli() {
 /**
  * `host`: another pi-compatible host instead of the local pi, as `{ command: [exe, ...args],
  * flags: [...] }` (its own isolation flags; omp has no `--name` or `--no-mcp`).
+ * `unnamed`: start pi without `--name`, as a human does: `name` is then this driver's only.
  */
-export function startPi(name, { cwd, env, args = [], session = ["--no-session"], noTelecom = false, host }) {
+export function startPi(name, { cwd, env, args = [], session = ["--no-session"], noTelecom = false, host, unnamed = false }) {
 	const telecom = noTelecom ? [] : ["-e", entry];
 	const [exe, ...prefix] = host?.command ?? [process.execPath, piCli()];
-	const flags = host?.flags ?? ["--no-extensions", "--no-mcp", "--no-skills", "--no-context-files", "--name", name];
+	const flags = host?.flags ?? ["--no-extensions", "--no-mcp", "--no-skills", "--no-context-files", ...(unnamed ? [] : ["--name", name])];
 	const child = spawn(exe, [...prefix, "--mode", "rpc", ...session, ...flags, ...telecom, ...args], { cwd, env, stdio: ["pipe", "pipe", "pipe"] });
 	const records = [];
 	const waiters = new Set();

@@ -66,7 +66,7 @@ per request that hit: that is the text telecom adds, the number its changes can 
 | file | owns |
 |---|---|
 | `src/index.ts` | The entry point. The factory creates the session's `Runtime` and registers the parts below it in this table, which act on it. It starts nothing (rule 4). |
-| `src/runtime.ts` | One session runtime's state (`Runtime`: the record, the transport, the ask ledger, awareness, brief state, the footer and widget) and the operations every part shares: `publish`, `readPeers`/`team`, the debounced team (`present`, `settleTeam`, `presentNow`), `envelope`/`deliverEach`/`sendEvent`, `inject` (the delivery modes; `later` held in `takeLater`/`flushLater`; messages sent with `interrupt: false` held for the end of the run in `holdDeferred`/`deferredEntries`/`deliverDeferred`), `stillWaitingNote`, `CONTACT_NEAR_MS`, `TASK_CAP`, wake-ups owed a model reply (`checkWakes`, `noteModelTurn`), `injectMessage`, `setState` and the step (`noteStepStart`/`noteStepEnd`/`publishStep`), `nextBrief`, the team log handle (`logEntry`/`flushLog`/`teamLog`), `report`/`step`, the hook wrapper `on` (rule 3), and the settings kept in the session (`telecom-callsign`, `telecom-enabled`). |
+| `src/runtime.ts` | One session runtime's state (`Runtime`: the record, the transport, the ask ledger, awareness, brief state, the footer and widget) and the operations every part shares: `publish`, `readPeers`/`team`, the debounced team (`present`, `settleTeam`, `presentNow`), `envelope`/`deliverEach`/`sendEvent`, `inject` (the delivery modes; `later` held in `takeLater`/`flushLater`; messages sent with `interrupt: false` held for the end of the run in `holdDeferred`/`deferredEntries`/`deliverDeferred`), `stillWaitingNote`, `CONTACT_NEAR_MS`, `TASK_CAP`, wake-ups owed a model reply (`checkWakes`, `noteModelTurn`), `injectMessage`, what results explained already (`firstTime`), `setState` and the step (`noteStepStart`/`noteStepEnd`/`publishStep`), `nextBrief`, the team log handle (`logEntry`/`flushLog`/`teamLog`), `report`/`step`, the hook wrapper `on` (rule 3), and what is kept in the session (`telecom-callsign`, `telecom-enabled`, `telecom-task`). |
 | `src/lifecycle.ts` | `connect` and `stop`, the loop (`tick`), the team refresh, the heartbeat, backing off when the session is open twice, the reload handoff, and the `session_*` and `model_select` hooks. |
 | `src/inbound.ts` | The inbox: messages, asks, answers, broadcasts, team tasks (`runTask`), peer events, and the change-notice queue. |
 | `src/guard.ts` | The `tool_call`/`tool_result` hooks: acting on `awareness` verdicts, and announcing this agent's own changes. |
@@ -88,7 +88,7 @@ per request that hit: that is the text telecom adds, the number its changes can 
 | `src/project.ts` | Checkout (project root), repository (`findRepo`: the git common dir), lanes (`sameRepo`, `laneName`, `laneIn`, `inCheckout`), where a file lies (`placeOf`) and where an agent works (`workingCheckout`), git branch, canonical paths. |
 | `src/callsign.ts` | Callsign choice and collision handling. |
 | `src/config.ts` | Every `PI_TELECOM_*` variable, read at session start (never at import). |
-| `src/render.ts` | The transcript look: renderers for telecom messages, and the pieces every telecom surface shares (one colour per agent, `Panel`, board styling, dimmed model instructions). Display only; nothing here reaches the model. |
+| `src/render.ts` | The transcript look: renderers for telecom messages, and the pieces every telecom surface shares (one colour per agent, `Panel`, board styling, dimmed model instructions, `proseStyler`: Markdown for what agents write to each other, never for telecom's own notices, whose claim patterns and diff excerpts are not Markdown). Display only; nothing here reaches the model. |
 | `src/view.ts` | Human-only views: the footer text, the live widget, the `/telecom` board panel and command list (TUI components), and the command table that help and completions share. RPC clients get plain text. |
 | `src/host.ts` | Which host loaded telecom (`hostOf`: pi or omp, told by its API) and where they differ: omp-only tool fields (`OMP_TOOL_FIELDS`) and renderer arguments (`renderContext`). Pure. |
 | `src/util.ts` | Small helpers (`clip`, `ago`, `fileFingerprint`, `newId`, `setBounded` for maps keyed by peer input, `pairKey`). |
@@ -132,6 +132,31 @@ owners, coupled boundaries, durability limits and regression tests. Use it when 
   `repo` is optional on the wire, so a peer without it is grouped by `projectRoot` alone
   (`sameRepo`). A pi-subagents child publishes `role: "child"` and `parent`; its lineal family
   (`lineOf`) is exempt from each other's claims, and briefs fold it into its parent.
+- **Callsigns over a restart.** Every `pi` opens a new session before its human resumes one, and
+  that session takes the first free word. A top-level session publishes `provisional` (optional
+  on the wire): `true` until something runs in it (`hasRun` at connect, then `Runtime.settleIn`
+  at its first run) or its human names it (`chosen` in the `telecom-callsign` entry). A session
+  that has run takes its preferred word back from provisional holders (`reclaimable`), and they
+  yield on their next refresh (`mustYield`). Between two records that both publish the field, the
+  provisional one yields whatever their ages; a record without it is an older telecom, and that
+  pair goes by age on both sides. A session renamed although it had run publishes `formerly`
+  (only a word it held itself: the entry names its session, since a fork copies its parent's
+  entries); the board, full briefs and its join entry show it. `recent` keeps `RECENT_CAP` edits
+  inside the repository and `RECENT_OUTSIDE_CAP` outside it, counted apart: where a claim binds
+  (`checkoutsOf`) is read from the former, and notes written elsewhere must not push them out.
+- **Session names.** `Runtime.nameSession` names the pi session `📡 <callsign> · <task>` when a
+  run ends, on the heartbeat and on `/telecom name` (never on every `status`: each change is an
+  entry in the session file), so `/resume` tells sessions apart. A name not starting with
+  `AUTO_NAME_MARK` is the human's and is never replaced; `publish` leaves telecom's own name out
+  of `Presence.name`, which peers address a session by. Without a task (after a restart) the name
+  keeps the task it had. Off with `PI_TELECOM_SESSION_NAME=off`; never for subagents.
+- **The task over a restart.** `Runtime.persistTask` writes a `telecom-task` entry (`task`, `at`,
+  `session`, `explicit`) when a run ends and on the heartbeat, only when the task or its
+  provenance changed: each write is an entry in the session file. `connect` restores the
+  session's own entry (`rememberedTask`; a fork inherits its parent's and starts without a task)
+  unless a reload handoff carries one, with its `taskAt`, and does not log it again. A task set
+  on purpose (`taskExplicit`) younger than `EXPLICIT_TASK_HOLD_MS` is replaced by no prompt
+  (`turns.ts`, `taskFromPrompt`); older, by a prompt of `NEW_DIRECTION_WORDS` or more.
 - **Shared directory** (`transport.ts`): `presence/<session>.json` (each written only by its
   owner) and `inbox/<session>/<seq>-<id>.json`. Every write goes to a temporary name and is then
   renamed. Presence records are checked against the process table, not heartbeats, except
@@ -229,7 +254,9 @@ owners, coupled boundaries, durability limits and regression tests. Use it when 
   runtime's API.
 - **Locks and declared waits.** A claim pattern starting with `@` is a resource lock
   (`glob.ts`, `isResource`): it matches no path, overlaps only the same name (without case), and
-  binds across lanes. Waiters publish `queued` (`{ pattern, since }`, a past time: a forged `0`
+  binds across lanes. Claiming a held lock joins its line unless the call says `queue: false`
+  (then it is refused); a lock the claimant holds live is never in conflict, whoever is in line.
+  Waiters publish `queued` (`{ pattern, since }`, a past time: a forged `0`
   or future `since` is dropped). When the lock frees (release, departure, expiry), the first
   responsive waiter claims it; simultaneous claims keep the earlier `since`, then the lower id.
   Who holds a lock and who is first in line is read from the debounced team (a departing holder
@@ -242,7 +269,9 @@ owners, coupled boundaries, durability limits and regression tests. Use it when 
   one, but the heartbeat of a busy holder keeps its locks from lapsing (`holdClaims`, up to
   `LOCK_BUSY_MAX_MS` after the claim): a lock guards a job, and the job outlasts the TTL. The same
   heartbeat holds any claim made with `pid` (`Claim.pid`/`pidStart`, optional) while that
-  process runs, releasing it when it exits, and every claim of an agent whose declared wait is on a
+  process runs, releasing it when it exits (`releaseExited`: a busy holder's lock is untied
+  and kept for `Runtime.exitGraceMs`, so the next job's claim keeps it; `Runtime.exitGrace` is
+  ended by any claim or release of it), and every claim of an agent whose declared wait is on a
   teammate at work (`atWork`): waiting makes no edits to renew them. Taking a
   lock ends the taker's declared wait on whoever held it. A declared wait is woken when the
   teammate finishes a run or leaves (not on a new task: progress reports woke waiters for nothing),
@@ -268,7 +297,8 @@ owners, coupled boundaries, durability limits and regression tests. Use it when 
   shows `unread 20m` and `owes 3 asks`, and `stateHint` says the session may be stuck, or to
   expect a wait.
 - **The team log** (`log.ts`): each session logs what teammates need later: joins and leaves (not
-  for subagents, and a reload is neither), task changes, broadcasts, claims, releases and
+  for subagents, a reload is neither, and a provisional session logs neither: it joins when it
+  settles in), task changes, broadcasts, claims, releases and
   expiries. Lock claims are logged once their races settle; a renewal is not logged; a lock
   handed on is logged by its taker (`took @cargo after alpha released it`), and a lost race by
   its loser. Direct messages, asks and answers are private and never logged.
@@ -338,6 +368,9 @@ Each rule has a test or an e2e check. Read the reason before bending a rule.
    whose members have all stalled: nobody on it moves otherwise.
 9. **Every refusal says what happened and what to do next,** including the exact
    `telecom({ ... })` call when one helps. Models follow these literally; the live tests show it.
+   A successful result says what happened and what the agent cannot know; how a mechanism works
+   is explained once per context (`Runtime.firstTime`, forgotten on a compaction), never on
+   every call, and a result never repeats the agent's own words back to it.
 10. **Tool schema conventions:** string enums use `StringEnum` from `@earendil-works/pi-ai`
     (Google rejects unions of literals). Every result carries `structuredContent` equal to
     `details` (`outputSchema`: `{ ok, ... }`). Keep `annotations` accurate. Keep the description

@@ -106,18 +106,30 @@ telecom({ action: "ask", to: "alpha", message: "…" }).
 ### Presence
 
 Each session takes the first free callsign in the repository (`alpha`, `bravo`, …), keeps it
-across a resume, and can change it with `/telecom name ops`. It publishes:
+across a resume, and can change it with `/telecom name ops`. A new session nothing has run in
+holds its callsign only for now: when a resumed session comes back for that word, it gets it,
+and the new session moves to the next free one. A resumed session that finds its word held by a
+session at work is renamed instead, and the board shows what it was called (`bravo (was alpha)`).
+It publishes:
 
 - busy or idle, for how long, and which long tool call it is in (`bravo [busy · bash 14m]`);
 - its task: set with `status` or `/telecom run`, else the first line of its latest prompt (a
   one-word prompt, a short question or a short go-ahead such as "go ahead" or "commit and merge"
   never replaces it, and a task set with `status` is replaced only by a prompt of 10 words or
-  more);
+  more, and by no prompt in its first 30 minutes). It is kept in the session, so a restart
+  doesn't lose it;
 - its checkout and git branch;
 - its claims and locks, its place in a lock's line, and whom it waits for;
 - how many asks it owes, whom its own asks wait on, and `unread` when a message it was sent
   started no model reply;
-- the last 12 files it changed with pi's `edit` and `write` tools.
+- the last 12 files it changed in the repository with pi's `edit` and `write` tools, and the
+  last 8 outside it.
+
+Telecom also names the pi session after its callsign and task (`📡 alpha · fix the upload test`),
+so `/resume`, the terminal title and pi's notifications say which agent a session is and what it
+last worked on, where pi shows a session's first message otherwise. The name follows the task; a
+name you give with `/name` or `--name` is never replaced, and `PI_TELECOM_SESSION_NAME=off` turns
+this off.
 
 ### Team briefs
 
@@ -213,7 +225,9 @@ telecom({ action: "claim", paths: ["@cargo", "target/**"], pid: 48211, message: 
 ```
 
 It stays while the process runs, even with its owner idle, and is released when the process
-exits; the owner is told. A pid that isn't running makes an ordinary claim.
+exits; the owner is told. A lock whose holder is still working is kept two more minutes (or the
+claim TTL, if that is shorter), so claiming it again for the next job keeps it across a series of
+jobs. A pid that isn't running makes an ordinary claim.
 
 ### Locks
 
@@ -223,9 +237,10 @@ Shared things that aren't files are claimed by name:
 telecom({ action: "claim", paths: ["@cargo"], message: "release build" })
 ```
 
-A lock matches no file and is shared by every worktree. If it is held, the claim is refused with
-the holder, since when and its state, plus the call to queue: `queue: true` waits in line. When
-the lock frees (released, holder left, or expired), the first in line gets it and is woken:
+A lock matches no file and is shared by every worktree. If it is held, the claim waits in line
+for it: the result names the holder, since when and its state, and says the lock isn't the
+agent's yet (`queue: false` refuses instead). The holder can claim its lock again whoever waits.
+When the lock frees (released, holder left, or expired), the first in line gets it and is woken:
 `📡 @cargo is yours now (charlie released it)`. Two agents taking a free lock at once settle on
 the earlier claim; the other goes back to the front of the line and is told.
 
@@ -260,7 +275,8 @@ has been idle for 5 minutes, each is woken once with the call that breaks it.
 A short history per repository: joins and departures, task changes, broadcasts, claims, releases,
 and lock handoffs. A late joiner or a compacted agent can see what was decided with
 `telecom({ action: "log" })` (optionally filtered by `paths`), and a full brief points to it.
-Humans use `/telecom log`. Messages, asks and answers are private and never logged. A departed
+Humans use `/telecom log`. Messages, asks and answers are private and never logged. A session
+joins the log with its first run, so a window opened and closed leaves nothing in it. A departed
 session stays in the log for 24 hours.
 
 ### Worktrees
@@ -326,9 +342,12 @@ or to `subagentOnlyExtensions` in one agent's definition. Each pays the tool's f
 | `reply` | `message`, `askId?`, `to?`, `unblocks?` | Answers an ask; `askId` is optional when only one is waiting, or when `to` names its asker. With `to` and no ask of theirs open, it goes as a message. |
 | `broadcast` | `message`, `paths?`, `scope?` | Messages every agent in the repository. Never starts a turn. |
 | `status` | `message`, `waitingFor?` | Sets the task peers see (up to 400 characters) and whom this agent waits for. |
-| `claim` | `paths`, `message?`, `queue?`, `pid?` | Claims paths or globs, or takes `@name` locks; `queue: true` waits in line, `pid` holds the claims while that process runs. |
+| `claim` | `paths`, `message?`, `queue?`, `pid?` | Claims paths or globs, or takes `@name` locks; a held lock is waited for in line (`queue: false` refuses instead), `pid` holds the claims while that process runs. |
 | `release` | `paths?` | Releases those claims (or all) and leaves a lock's line. Releasing nothing is fine. |
 | `log` | `paths?` | The team's recent history (see [Team log](#team-log)). |
+
+A `status` or `claim` result says what happened. How a claim, a lock, a line or a wait works is
+explained the first time it comes up in a context, and again after a compaction.
 
 `to` is a callsign, session name or id, as the board shows it. A `send` may name several,
 comma-separated: each recipient sees who else got it and how to answer all of them, so a
@@ -394,7 +413,8 @@ In the terminal UI, `/telecom` opens a live board: Tab switches between the repo
 machine, `w` toggles the widget, arrows scroll, Esc closes. `/telecom help` opens a command list,
 and completions describe each command and list agents for `/telecom msg`. Without the terminal
 UI (RPC mode), commands answer with plain text. Each agent keeps one colour across the widget,
-the board and the transcript.
+the board and the transcript. What agents write to each other is drawn as Markdown there (bold,
+code, lists, headings, code blocks), like an assistant's own text.
 
 `/telecom run` reaches this session and every connected teammate, subagents and worktrees
 included: idle sessions start a turn, busy ones get it before their next step. It reports who
@@ -415,6 +435,7 @@ Environment variables, read when a session starts or reconnects:
 | `PI_TELECOM_ASK_TIMEOUT_MS` | `300000` | default wait for `ask` (at most 1 h) |
 | `PI_TELECOM_MAX_WAKES` | `6` | peer wake-ups per minute; `0` turns them off (asks and `/telecom run` still wake) |
 | `PI_TELECOM_CLAIM_TTL_MIN` | `120` | minutes without an edit before a claim expires |
+| `PI_TELECOM_SESSION_NAME` | on | `off` leaves pi's session names alone (see [Presence](#presence)) |
 | `PI_TELECOM_DIR` | see [How it works](#how-it-works) | the shared directory |
 | `PI_TELECOM_DISABLE` | unset | `1` starts telecom off |
 

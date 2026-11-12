@@ -37,7 +37,22 @@ import { type BoardPanel, offStatus, statusText, type TeamSnapshot, TeamWidget, 
 /** What the human and the model hear while this session is turned off. */
 export const OFF_TEXT = "telecom is off in this session. Run /telecom on to reconnect.";
 const CALLSIGN_ENTRY = "telecom-callsign";
+/** How a session name telecom gave starts (`Runtime.nameSession`): one its human gave never does. */
+export const AUTO_NAME_MARK = "📡 ";
+/** Between the callsign and the task in such a name. */
+const AUTO_NAME_SEP = " · ";
+/** How much of the task such a name carries: the `/resume` list gives a name one line. */
+const AUTO_NAME_TASK = 60;
 const ENABLED_ENTRY = "telecom-enabled";
+const TASK_ENTRY = "telecom-task";
+/**
+ * How long a busy agent keeps a lock after the process it was claimed for exited. A holder that
+ * runs several jobs in a row (build, then test, then the next crate) lost the lock between each
+ * to whoever was in line, so teams stopped queueing and handed locks back by message. This long,
+ * a next job's claim keeps it; without one it is released as before. An idle holder cannot claim
+ * again, and its lock is released at once.
+ */
+const EXIT_GRACE_MS = 2 * 60_000;
 /** RPC clients get the widget as plain lines of at most this many columns. */
 const PLAIN_WIDGET_COLUMNS = 100;
 /** Consecutive failed presence writes before the human is warned; one is a passing file lock. */
@@ -153,6 +168,13 @@ export class Runtime {
 	briefState: BriefState | null = null;
 	/** The current task was set on purpose, so only a new direction from a prompt replaces it. */
 	taskExplicit = false;
+	/** The task last written to the session (`persistTask`), as `explicit\u0000task`. */
+	private taskPersisted = "";
+	/** What tool results explained in full once already in this context (`firstTime`). */
+	private readonly explained = new Set<string>();
+	/** Locks kept a while after the process they were claimed for exited (`lifecycle.ts`,
+	 *  `releaseExited`): lock → when it is released unless claimed again, and that process. */
+	readonly exitGrace = new Map<string, { until: number; pid: number }>();
 	readonly awareness = new Awareness();
 	readonly ledger = createAskLedger();
 	/** This session's part of the team log, and the reader of everyone's (`log.ts`). */
@@ -251,8 +273,10 @@ export class Runtime {
 	publish(): void {
 		if (!this.transport || !this.self) return;
 		this.self.heartbeatAt = Date.now();
+		// A name telecom gave the session (`nameSession`) repeats its callsign and task: only one
+		// its human gave is a name peers address it by.
 		const name = this.pi.getSessionName();
-		if (name) this.self.name = name;
+		if (name && !name.startsWith(AUTO_NAME_MARK)) this.self.name = name;
 		else delete this.self.name;
 		const owed = this.ledger.inbound().length;
 		if (owed > 0) this.self.asksOwed = owed;
@@ -352,6 +376,18 @@ export class Runtime {
 		if (me.state !== state || me.stateSince === undefined) me.stateSince = Date.now();
 		me.state = state;
 		if (state === "idle") this.endSteps();
+		else this.settleIn(me);
+	}
+
+	/**
+	 * The session is in use (its first run, or its human named it): from here on it keeps its
+	 * callsign like any other, and is in the team's history. Until now it was a window somebody
+	 * opened (`Presence.provisional`). The caller publishes.
+	 */
+	settleIn(me: Presence): void {
+		if (!me.provisional) return;
+		me.provisional = false;
+		this.logEntry("join", "joined");
 	}
 
 	/** A tool call started. Only noted: the tick publishes it once it runs long (`publishStep`). */
@@ -429,6 +465,17 @@ export class Runtime {
 		return Math.round(this.cfg.claimTtlMs / 60_000);
 	}
 
+	/** `EXIT_GRACE_MS`, never longer than a claim lasts: a short TTL asks for locks to move sooner. */
+	exitGraceMs(): number {
+		return Math.min(EXIT_GRACE_MS, this.cfg.claimTtlMs);
+	}
+
+	/** That time in words: "2 min", "40 s". */
+	exitGraceText(): string {
+		const ms = this.exitGraceMs();
+		return ms >= 60_000 ? `${Math.round(ms / 60_000)} min` : `${Math.max(1, Math.round(ms / 1000))} s`;
+	}
+
 	boardText(scope: BoardScope, peers: readonly Presence[] = this.readPeers()): string {
 		if (!this.self) return "telecom is not connected in this session.";
 		return renderBoard({ self: this.self, peers, scope, inboundAsks: this.ledger.inbound() });
@@ -440,6 +487,7 @@ export class Runtime {
 	 *  `why`, when the agent did not ask for it, goes in the log line. */
 	releaseClaims(me: Presence, patterns: readonly string[], why?: string): string[] {
 		me.claims = me.claims.filter((c) => !patterns.includes(c.pattern));
+		for (const pattern of patterns) this.exitGrace.delete(pattern);
 		this.publish();
 		this.logEntry("release", `released ${patterns.join(", ")}${why ? `: ${why}` : ""}`, patterns);
 		const told = this.tellReleased(me, patterns);
@@ -724,6 +772,8 @@ export class Runtime {
 	/** The context was compacted: a reminder of an unanswered wake-up repeats its text in full. */
 	noteCompaction(): void {
 		this.compactions++;
+		// What a result explained may be gone with the summary: it is explained again, once.
+		this.explained.clear();
 		if (this.unread) this.unread.compacted = true;
 	}
 
@@ -781,13 +831,74 @@ export class Runtime {
 	// ------------------------------------------------------------------ settings kept in the session
 
 	/** Remember this session's callsign on its active branch, for a resume. */
-	persistCallsign(): void {
+	persistCallsign(chosen = false): void {
 		if (!this.self) return;
 		try {
-			this.pi.appendEntry(CALLSIGN_ENTRY, { callsign: this.self.callsign });
+			// With the session that held it: a fork copies its parent's entries, and the word in them
+			// was never the fork's own (`rememberedCallsign`). `chosen`: its human gave it this word.
+			this.pi.appendEntry(CALLSIGN_ENTRY, { callsign: this.self.callsign, session: this.self.id, ...(chosen ? { chosen: true } : {}) });
 		} catch {
 			/* not persisted; a resume will just pick a fresh word */
 		}
+	}
+
+	/**
+	 * Name the pi session after this agent and its task, so its human can tell sessions apart in
+	 * `/resume`, the terminal title and pi's notifications: pi shows a session's first message
+	 * otherwise, which says what it started as days ago, not who it is on the team or what it does
+	 * now. Never over a name its human gave (`AUTO_NAME_MARK` tells them apart), and only once
+	 * there is a task: a bare callsign says less than the first message. After a restart the task
+	 * is gone until the next one is set, so the name keeps the one it had, under the callsign the
+	 * session has now. Called when a run ends and from the heartbeat, not on every `status`: each
+	 * change is an entry in the session file. Not for subagents, whose host names them.
+	 */
+	nameSession(): void {
+		const me = this.self;
+		if (!me || !this.cfg.sessionName || me.role === "child" || typeof this.pi.setSessionName !== "function") return;
+		this.step("session name", () => {
+			const current = this.pi.getSessionName();
+			if (current && !current.startsWith(AUTO_NAME_MARK)) return;
+			const sep = current?.indexOf(AUTO_NAME_SEP) ?? -1;
+			const task = me.task ?? (current && sep !== -1 ? current.slice(sep + AUTO_NAME_SEP.length) : undefined);
+			if (!task) return;
+			const name = `${AUTO_NAME_MARK}${me.callsign}${AUTO_NAME_SEP}${clip(task, AUTO_NAME_TASK)}`;
+			if (name !== current) this.pi.setSessionName(name);
+		});
+	}
+
+	/**
+	 * Remember the task on the session's active branch, so a restart does not lose it: only a
+	 * `/reload` carried it over, and a resumed session whose runs teammates' messages started (no
+	 * prompt of its human's, no `status`) stood on the board with no task for as long as that
+	 * lasted, whatever it held. Called when a run ends and from the heartbeat, and written only
+	 * when the task changed: each write is an entry in the session file. Not for subagents, which
+	 * are not resumed.
+	 */
+	persistTask(): void {
+		const me = this.self;
+		if (!me?.task || me.role === "child") return;
+		const key = `${this.taskExplicit}\u0000${me.task}`;
+		if (key === this.taskPersisted) return;
+		this.taskPersisted = key;
+		this.step("task", () =>
+			this.pi.appendEntry(TASK_ENTRY, { task: me.task, at: me.taskAt ?? Date.now(), session: me.id, ...(this.taskExplicit ? { explicit: true } : {}) }),
+		);
+	}
+
+	/** The task the session file already holds (`rememberedTask`), when this session starts with it. */
+	notePersistedTask(task: string, explicit: boolean): void {
+		this.taskPersisted = `${explicit}\u0000${task}`;
+	}
+
+	/**
+	 * Is this the first time `key` comes up in this context? Results explain how a claim, a lock or
+	 * a wait works; said on every call, the same sentences were most of what `status` and `claim`
+	 * returned over a day. Once is enough until a compaction may have dropped it.
+	 */
+	firstTime(key: string): boolean {
+		if (this.explained.has(key)) return false;
+		this.explained.add(key);
+		return true;
 	}
 
 	/** Remember the human's `/telecom on|off` on the active branch: it outlives reloads. */
@@ -942,9 +1053,32 @@ function lastEntry<T>(ctx: ExtensionContext, type: string, read: (data: Record<s
 	return last;
 }
 
-/** The callsign this session last used on its active branch, if any. */
-export function rememberedCallsign(ctx: ExtensionContext): string | undefined {
-	return lastEntry(ctx, CALLSIGN_ENTRY, ({ callsign }) => (typeof callsign === "string" && CALLSIGN_PATTERN.test(callsign) ? callsign : undefined));
+/**
+ * The callsign last used on this session's active branch, if any, and whether session `id` itself
+ * held it (`own`): a fork inherits its parent's entries, and an entry from an older telecom does
+ * not say whose it was. `chosen`: its human gave it that word (`/telecom name`).
+ */
+export function rememberedCallsign(ctx: ExtensionContext, id: string): { callsign: string; own: boolean; chosen: boolean } | undefined {
+	return lastEntry(ctx, CALLSIGN_ENTRY, ({ callsign, session, chosen }) =>
+		typeof callsign === "string" && CALLSIGN_PATTERN.test(callsign) ? { callsign, own: session === id, chosen: session === id && chosen === true } : undefined,
+	);
+}
+
+/**
+ * The task session `id` last had on its active branch. Only its own: a fork copies its parent's
+ * entries, and what the parent was doing is not what the fork was started for.
+ */
+export function rememberedTask(ctx: ExtensionContext, id: string): { task: string; at: number; explicit: boolean } | undefined {
+	return lastEntry(ctx, TASK_ENTRY, ({ task, at, session, explicit }) =>
+		session === id && typeof task === "string" && task.trim() && typeof at === "number" && Number.isFinite(at) && at > 0
+			? { task: clip(task, TASK_CAP), at, explicit: explicit === true }
+			: undefined,
+	);
+}
+
+/** Has anything run in this session (on its active branch)? A new session has no message yet. */
+export function hasRun(ctx: ExtensionContext): boolean {
+	return ctx.sessionManager.getBranch().some((entry) => entry.type === "message");
 }
 
 /** A command overrides the environment for this session's active branch, including reloads. */
