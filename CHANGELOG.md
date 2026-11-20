@@ -6,6 +6,8 @@ All notable changes to `@justar_96/pi-telecom`. The format follows
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-20
+
 ### Changed
 
 - **An ask never blocks.** `ask` returns at once, and the answer arrives as a message that wakes
@@ -601,7 +603,8 @@ First release.
   presence repairs itself.
 - Prompt cache unaffected: 84.4 % hit rate with and without telecom on Claude Sonnet 5.5.
 
-[Unreleased]: https://github.com/Justar96/pi-telecom/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/Justar96/pi-telecom/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/Justar96/pi-telecom/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/Justar96/pi-telecom/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/Justar96/pi-telecom/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/Justar96/pi-telecom/compare/v0.5.2...v0.6.0
