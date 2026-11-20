@@ -1,7 +1,7 @@
 /**
- * waits — declared waits that outlive a status and end by themselves (a message that says so,
- * `unblocks`, or the agent getting to work after hearing), who waits on an agent (board, brief),
- * and wait cycles told once they stall.
+ * waits — declared waits that outlive a status and work, and end only when a message says so
+ * (`unblocks`) or the agent clears them; who waits on an agent (board, brief), and wait cycles
+ * told once they stall.
  */
 import assert from "node:assert/strict";
 import { afterEach, type TestContext, test } from "node:test";
@@ -70,7 +70,8 @@ test("status: a status without waitingFor keeps the wait, the same set keeps its
 
 // ---------------------------------------------------------------- unblocks
 
-test("waits end by themselves: an FYI leaves the wait, and so does reading it; editing after hearing, or a message that unblocks, ends it", async () => {
+test("waits end only when told: an FYI, reading it and work after it leave the wait; a message that unblocks, or [], ends it", async (t) => {
+	const time = clock(t);
 	const proj = makeProject("p-waits-unblocks");
 	const a = await session(proj);
 	const b = await session(proj);
@@ -79,102 +80,57 @@ test("waits end by themselves: an FYI leaves the wait, and so does reading it; e
 	await b.tool({ action: "send", to: "alpha", message: "fyi: the schema moved to v3" });
 	await eventually(() => assert.equal(messagesFrom(a, "bravo").length, 1));
 	const fyi = messagesFrom(a, "bravo")[0]?.content ?? "";
-	assert.match(fyi, /\(Still waiting for bravo, charlie: the wait on bravo ends when you get to work, or now with telecom\(\{ action: "status", waitingFor: \["charlie"\] \}\)\.\)$/);
+	assert.match(fyi, /\(Still waiting for bravo, charlie\. If this is what you waited for from bravo, drop the wait: telecom\(\{ action: "status", waitingFor: \["charlie"\] \}\)\.\)$/);
 	await b.tool({ action: "send", to: "alpha", message: "fyi: and the client too" });
 	await eventually(() => assert.equal(messagesFrom(a, "bravo").length, 2));
 	assert.doesNotMatch(messagesFrom(a, "bravo")[1]?.content ?? "", /Still waiting/, "said once per wait, not on every message");
-	await sleep(150); // several team refreshes
-	assert.deepEqual(published(a)?.blockedOn, [b.id, c.id], "an FYI does not end the wait, and reading it is not work");
-	await c.tool({ action: "send", to: "alpha", message: "tests are green", unblocks: true });
-	await eventually(() => assert.deepEqual(published(a)?.blockedOn, [b.id]));
-	const done = messagesFrom(a, "charlie")[0]?.content ?? "";
-	assert.doesNotMatch(done, /Still waiting/, "the wait it ended is not mentioned");
-	// Once the agent changes a file after hearing from bravo, the wait on bravo is over: no hand-clearing.
+	// Work after hearing is no sign the wait is over: an edit, a claim on files, a long command.
 	await a.write("notes.md", "starting on the work");
-	await eventually(() => assert.equal(published(a)?.blockedOn, undefined));
-	assert.equal(published(a)?.blockedSince, undefined);
-	// Waiting again after hearing (declaring it) is the agent saying it still waits: editing then ends nothing.
-	await a.tool({ action: "status", message: "waiting for bravo's go-ahead", waitingFor: ["bravo"] });
-	await b.tool({ action: "send", to: "alpha", message: "not yet" });
-	await eventually(() => assert.equal(messagesFrom(a, "bravo").length, 3));
-	assert.match(messagesFrom(a, "bravo")[2]?.content ?? "", /waitingFor: \[\] \}\)\.\)$/, "a new wait is told again");
-	await a.tool({ action: "status", message: "still waiting for bravo", waitingFor: ["bravo"] });
-	await a.write("notes.md", "unrelated work");
-	await sleep(150);
-	assert.deepEqual(published(a)?.blockedOn, [b.id], "a wait declared after the message outlives an edit");
-	await b.tool({ action: "send", to: "alpha", message: "all done", unblocks: true });
-	await eventually(() => assert.equal(published(a)?.blockedOn, undefined));
-});
-
-test("waits end on work that is not an edit: a long command or a new claim on files; not a lock, nor a long telecom call", async (t) => {
-	const proj = makeProject("p-waits-work");
-	const time = clock(t);
-	const a = await session(proj);
-	const b = await session(proj);
-	await a.tool({ action: "status", message: "waiting for bravo's go-ahead", waitingFor: ["bravo"] });
-	await b.tool({ action: "send", to: "alpha", message: "go ahead" });
-	await eventually(() => assert.equal(messagesFrom(a, "bravo").length, 1));
+	await a.tool({ action: "claim", paths: ["src/**"] });
 	await a.prompt("run the gate");
-	// A long telecom call is a blocking ask, not work.
-	await a.fire("tool_call", { toolName: "telecom", toolCallId: "ask-1", input: { action: "ask", to: "bravo", message: "sure?" } });
-	time.jump(20_000);
-	await eventually(() => assert.equal(published(a)?.step?.tool, "telecom"));
-	await sleep(150); // several team refreshes
-	assert.deepEqual(published(a)?.blockedOn, [b.id], "waiting in an ask is still waiting");
-	await a.fire("tool_execution_end", { toolName: "telecom", toolCallId: "ask-1", result: {}, isError: false });
-	await eventually(() => assert.equal(published(a)?.step, undefined));
-	// A gate run after hearing is the work the go-ahead started, though nothing was edited.
 	await a.fire("tool_call", { toolName: "bash", toolCallId: "gate-1", input: { command: "cargo nextest run" } });
 	time.jump(20_000);
-	await eventually(() => assert.equal(published(a)?.blockedOn, undefined));
+	await eventually(() => assert.equal(published(a)?.step?.tool, "bash"));
+	await sleep(150); // several team refreshes
+	assert.deepEqual(published(a)?.blockedOn, [b.id, c.id], "only the agent, or a message that says so, ends a wait");
+	assert.ok(!a.sentOf("telecom-message").some((m) => /Your wait on/.test(m.content)), "nothing is guessed, so nothing is told");
 	await a.fire("tool_execution_end", { toolName: "bash", toolCallId: "gate-1", result: {}, isError: false });
-
-	// Claims after hearing: a lock may be handed over while the agent waits for something else;
-	// a claim on files is the work starting.
-	await a.tool({ action: "status", message: "waiting for bravo's review", waitingFor: ["bravo"] });
-	await b.tool({ action: "send", to: "alpha", message: "fyi: reviewing now" });
-	await eventually(() => assert.equal(messagesFrom(a, "bravo").length, 2));
-	await a.tool({ action: "claim", paths: ["@cargo"] });
-	await sleep(150);
-	assert.deepEqual(published(a)?.blockedOn, [b.id], "a lock is not the work starting");
-	await a.tool({ action: "claim", paths: ["src/**"] });
-	await eventually(() => assert.equal(published(a)?.blockedOn, undefined));
+	await c.tool({ action: "send", to: "alpha", message: "tests are green", unblocks: true });
+	await eventually(() => assert.deepEqual(published(a)?.blockedOn, [b.id]));
+	assert.doesNotMatch(messagesFrom(a, "charlie")[0]?.content ?? "", /Still waiting/, "the wait it ended is not mentioned");
+	await a.tool({ action: "status", waitingFor: [] });
+	assert.equal(published(a)?.blockedOn, undefined);
+	assert.equal(published(a)?.blockedSince, undefined);
 });
 
-test("unblocks: a held message, an ask's answer and a late answer go the same way", async () => {
+test("unblocks: an answer leaves the wait with a line, once per wait, unless it says it unblocks", async () => {
 	const proj = makeProject("p-waits-answers");
 	const a = await session(proj);
 	const b = await session(proj);
 	await a.tool({ action: "status", message: "waiting for bravo's review", waitingFor: ["bravo"] });
 	const askId = () => /askId: "([^"]+)"/.exec(b.sentOf("telecom-ask").at(-1)?.content ?? "")?.[1] ?? "";
-	// A blocking ask: the message bravo sends first is held with it, and the result ends with the line.
-	const pending = a.tool({ action: "ask", to: "bravo", message: "is the review done?" });
+	await a.tool({ action: "ask", to: "bravo", message: "is the review done?" });
 	await eventually(() => assert.equal(b.sentOf("telecom-ask").length, 1));
-	await b.tool({ action: "send", to: "alpha", message: "still looking" });
 	await b.tool({ action: "reply", askId: askId(), message: "not yet" });
-	const result = await pending;
-	assert.match(result.text, /still looking/);
-	assert.match(result.text, /\(Still waiting for bravo: the wait on bravo ends when you get to work, or now with telecom\(\{ action: "status", waitingFor: \[\] \}\)\.\)$/);
+	await eventually(() => assert.equal(a.sentOf("telecom-reply").length, 1));
+	assert.match(a.sentOf("telecom-reply")[0]?.content ?? "", /not yet\n\n\(Still waiting for bravo\. If this is what you waited for from bravo, drop the wait: telecom\(\{ action: "status", waitingFor: \[\] \}\)\.\)$/);
 	assert.deepEqual(published(a)?.blockedOn, [b.id]);
-	assert.equal(messagesFrom(a, "bravo").length, 0, "the held message is shown once, in the result");
-	// An answer to a `wait: false` ask arrives as a message. The line was said once for this wait
-	// already; declared again, it is said again.
-	await a.tool({ action: "ask", to: "bravo", message: "tell me when it is", wait: false });
+	await a.tool({ action: "ask", to: "bravo", message: "tell me when it is" });
 	await eventually(() => assert.equal(b.sentOf("telecom-ask").length, 2));
 	await b.tool({ action: "reply", askId: askId(), message: "almost" });
-	await eventually(() => assert.equal(a.sentOf("telecom-reply").length, 1));
-	assert.doesNotMatch(a.sentOf("telecom-reply")[0]?.content ?? "", /Still waiting/, "once per wait");
+	await eventually(() => assert.equal(a.sentOf("telecom-reply").length, 2));
+	assert.doesNotMatch(a.sentOf("telecom-reply")[1]?.content ?? "", /Still waiting/, "once per wait");
+	// Declared again, it is said again.
 	await a.tool({ action: "status", waitingFor: [] });
 	await new Promise((r) => setTimeout(r, 2));
 	await a.tool({ action: "status", message: "waiting for bravo's review", waitingFor: ["bravo"] });
-	await a.tool({ action: "ask", to: "bravo", message: "and the docs?", wait: false });
+	await a.tool({ action: "ask", to: "bravo", message: "and the docs?" });
 	await eventually(() => assert.equal(b.sentOf("telecom-ask").length, 3));
 	await b.tool({ action: "reply", askId: askId(), message: "almost too" });
-	await eventually(() => assert.equal(a.sentOf("telecom-reply").length, 2));
-	assert.match(a.sentOf("telecom-reply")[1]?.content ?? "", /almost too\n\n\(Still waiting for bravo:/);
-	assert.deepEqual(published(a)?.blockedOn, [b.id]);
+	await eventually(() => assert.equal(a.sentOf("telecom-reply").length, 3));
+	assert.match(a.sentOf("telecom-reply")[2]?.content ?? "", /almost too\n\n\(Still waiting for bravo\./);
 	// An answer that says it unblocks ends the wait.
-	await a.tool({ action: "ask", to: "bravo", message: "and now?", wait: false });
+	await a.tool({ action: "ask", to: "bravo", message: "and now?" });
 	await eventually(() => assert.equal(b.sentOf("telecom-ask").length, 4));
 	await b.tool({ action: "reply", askId: askId(), message: "done", unblocks: true });
 	await eventually(() => assert.equal(published(a)?.blockedOn, undefined));

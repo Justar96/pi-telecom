@@ -4,20 +4,21 @@
  *
  * This COSTS model calls (a handful of short turns). It proves the parts only a model run
  * reaches: real `read`/`edit`/`write` tool events flowing through the guard, a change notice
- * produced by a real edit, and a full ask → wake → reply round trip between two agents.
+ * produced by a real edit, and a full ask → wake → reply → answer-wakes-the-asker round trip.
  *
- *   TELECOM_LIVE_MODEL=<provider>/claude-opus-5-5 node scripts/e2e-live.mjs
- *   (or gpt-6.1-sol — the models are listed in scripts/lab-models.mjs; `npm run e2e:matrix` runs both)
+ *   TELECOM_LIVE_MODEL=<provider>/claude-sonnet-5-5 node scripts/e2e-live.mjs
+ *   (the models are listed in scripts/lab-models.mjs; `npm run e2e:matrix` runs them all)
  *
  * Only this extension is loaded. A model whose provider is itself an extension needs that
  * extension too: TELECOM_LIVE_EXTENSIONS=/path/to/provider/index.ts (comma-separated).
  *
- * Exit 0 = pass, 1 = a check failed, 2 = no model configured.
+ * Exit 0 = pass, 1 = a check failed, 2 = no model configured, or the provider could not serve it
+ * (quota, credentials, overload): that says nothing about telecom, and is never a pass.
  */
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { isStatus, startPi } from "./rpc-driver.mjs";
+import { assertServed, isStatus, ModelUnavailable, startPi } from "./rpc-driver.mjs";
 
 const model = process.env.TELECOM_LIVE_MODEL;
 if (!model) {
@@ -36,6 +37,8 @@ const extra = (process.env.TELECOM_LIVE_EXTENSIONS ?? "").split(",").map((p) => 
 const args = ["--model", model, "--tools", "read,edit,write,telecom", ...extra.flatMap((p) => ["-e", p])];
 
 let failures = 0;
+/** Why the provider could not serve the model, when it could not (`ModelUnavailable`). */
+let unavailable = null;
 function check(name, ok, detail = "") {
 	console.log(`${ok ? "✔" : "✖"} ${name}${ok || !detail ? "" : `\n    ${String(detail).slice(0, 1200)}`}`);
 	if (!ok) failures++;
@@ -79,7 +82,9 @@ async function run(agent, prompt, timeoutMs = 180_000) {
 	const start = await agent.waitFor((r) => r.type === "agent_start" && agent.records.indexOf(r) >= from, timeoutMs);
 	const startAt = agent.records.indexOf(start);
 	await agent.waitFor((r) => r.type === "agent_settled" && agent.records.indexOf(r) > startAt, timeoutMs);
-	return agent.records.slice(from);
+	const records = agent.records.slice(from);
+	assertServed(records);
+	return records;
 }
 
 /** A tool call's arguments: only `tool_execution_start` carries them, so look the call up there. */
@@ -163,15 +168,20 @@ try {
 	check(`safety: ${csA}'s change survived (ALPHA kept)`, /ALPHA/.test(finalText), finalText);
 	check("task: B finished the change on top of it (gamma added)", /gamma/.test(finalText), `${finalText}\n    ${describe(r3)}`);
 
-	// 4. A asks B a question; B is woken by the ask, answers with telecom reply; A's call returns it.
+	// 4. A asks B a question; the ask returns at once; B is woken by it, answers with telecom
+	//    reply; the answer reaches A as a reply message.
+	const before4 = a.records.length;
 	const r4 = await run(
 		a,
-		`Use the telecom tool: action "ask", to "${csB}", message "Quick check: what is 6 times 7? Reply with only the number." Then tell me the answer you received.`,
+		`Use the telecom tool: action "ask", to "${csB}", message "Quick check: what is 6 times 7? Reply with only the number." Do nothing else.`,
 		180_000,
 	);
 	const asks = toolEnds(r4, "telecom");
-	const answered = asks.find((t) => !t.isError && /answered:/.test(textOf(t.result?.content)));
-	check(`A's ask returned ${csB}'s answer`, Boolean(answered) && /42/.test(textOf(answered.result.content)), JSON.stringify(asks.map((t) => textOf(t.result?.content))));
+	check(`A asked ${csB} with the telecom tool`, asks.some((t) => !t.isError && /^asked /.test(textOf(t.result?.content))), JSON.stringify(asks.map((t) => textOf(t.result?.content))));
+	const answer = await a
+		.waitFor((r) => r.type === "message_end" && r.message?.customType === "telecom-reply", 180_000, before4)
+		.catch(() => null);
+	check(`${csB}'s answer reached A as a reply`, Boolean(answer) && /42/.test(textOf(answer?.message?.content)), textOf(answer?.message?.content));
 	const replied = toolEnds(b.records, "telecom").some((t) => !t.isError && /replied to/.test(textOf(t.result?.content)));
 	check(`${csB} was woken by the ask and replied with the telecom tool`, replied);
 
@@ -239,12 +249,19 @@ try {
 		quiet && extraRuns[0] + extraRuns[1] <= 4,
 	);
 } catch (error) {
-	console.error(error);
-	failures++;
+	if (error instanceof ModelUnavailable) unavailable = error.message;
+	else {
+		console.error(error);
+		failures++;
+	}
 } finally {
 	await Promise.all([a, b].map((p) => p.stop()));
 	rmSync(scratch, { recursive: true, force: true });
 	clearInterval(keepAlive);
+}
+if (unavailable && failures === 0) {
+	console.log(`\n${model} could not be served, so the scenario stopped: ${unavailable}`);
+	process.exit(2);
 }
 console.log(failures === 0 ? "\nall live checks passed" : `\n${failures} live check(s) failed`);
 process.exit(failures === 0 ? 0 : 1);

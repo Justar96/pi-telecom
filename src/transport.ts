@@ -38,7 +38,6 @@ import { isAbsolute, join } from "node:path";
 import { CALLSIGN_PATTERN } from "./callsign.ts";
 import { ENV } from "./config.ts";
 import { isResourceName } from "./glob.ts";
-import { WAITS_CAP } from "./ledger.ts";
 import { clip, messageOf, shortId } from "./util.ts";
 
 export const WIRE_VERSION = 1;
@@ -167,15 +166,15 @@ export interface Presence {
 	role: "main" | "child";
 	/** For a child: the session that started it. */
 	parent?: string;
-	/** Sessions this one is blocked on in an `ask`, for finding wait cycles. Always published
-	 *  (empty when not waiting); a record without it comes from an older telecom. */
+	/** Sessions an older telecom is blocked on in an `ask`. This version never blocks and always
+	 *  publishes it empty, which tells an older peer its ask cannot close a wait cycle here. */
 	waitingOn?: string[];
 	/** When the oldest of those asks started. */
 	waitingSince?: number;
 	/**
 	 * Teammates this agent declared it waits for (`status` with `waitingFor`), by session id. Kept
-	 * apart from `waitingOn`: a declared wait blocks no tool call, so it is no edge of the ask
-	 * graph (`closesCycle`). Absent when it waits for no one, and on an older telecom.
+	 * apart from `waitingOn`, which older telecoms read as their ask graph. Absent when it waits for
+	 * no one, and on an older telecom.
 	 */
 	blockedOn?: string[];
 	/** When the current set of `blockedOn` was declared (a re-declared set keeps it): the board's
@@ -234,8 +233,8 @@ export interface Envelope {
 	/** An explicit human request to run a task; bypasses the automatic peer wake limit. */
 	triggerTurn?: boolean;
 	/**
-	 * For `ask`: the asker is not waiting (`wait: false`), so the ask closes no wait cycle and the
-	 * reply reaches it as a message. Older peers ignore it and treat the ask as a blocking one.
+	 * For `ask`: the asker is not waiting, and the reply reaches it as a message. Every ask from
+	 * this version carries it; older peers ignore it and show the ask as a blocking one.
 	 */
 	async?: true;
 	/**
@@ -468,6 +467,12 @@ function num(value: unknown): value is number {
  * clipped, and lists are capped. A malformed or oversized record cannot inject text or bloat a
  * prompt; it is trimmed or skipped.
  */
+/**
+ * At most this many waits a record lists (`Presence.waitingOn`). This version always publishes
+ * none, since it never blocks; older ones list their blocking asks, which the board still shows.
+ */
+const WAITS_CAP = 8;
+
 const LIMITS = {
 	name: 60,
 	task: 400,

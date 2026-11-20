@@ -50,7 +50,9 @@ test("deferred: a busy recipient holds it, and reads it with the run's last step
 	);
 	assert.equal(settled.entries[0].type, "custom_message");
 	assert.equal(settled.entries[0].customType, "telecom-message");
-	assert.match(settled.entries[0].content, /^\*\*📡 Message from alpha\*\*\n\nfirst report\n\n\(Reply only if needed: action "send", to "alpha"\.\)$/);
+	// How to reply was said once, with the first message (the fence); a held one does not repeat it.
+	assert.match(b.sentOf("telecom-message")[0]?.content ?? "", /\(Reply only if needed: action "send", to "alpha"\.\)$/);
+	assert.match(settled.entries[0].content, /^\*\*📡 Message from alpha\*\*\n\nfirst report$/);
 	assert.equal(settled.entries[0].details.fromCallsign, "alpha");
 	// Delivered once: nothing is left for the next settle or for agent_settled.
 	assert.equal(b.sentOf("telecom-message").length, 1);
@@ -79,7 +81,7 @@ test("deferred: it joins the reminder of an ask still owed in one continuation",
 	const a = await session(proj);
 	const b = await session(proj);
 	busy(b);
-	await a.tool({ action: "ask", to: "bravo", message: "which schema?", wait: false });
+	await a.tool({ action: "ask", to: "bravo", message: "which schema?" });
 	await eventually(() => assert.equal(b.sentOf("telecom-ask").length, 1));
 	await a.tool({ action: "send", to: "bravo", message: "a report", ...defer });
 	await fence(a, b, "plain fence");
@@ -132,21 +134,6 @@ test("deferred: over the cap the oldest is steered in at once, none is dropped",
 	const settled = await b.settle();
 	const rest = settled.entries.map((e: { content: string }) => e.content.match(/report (\d+)/)?.[1]);
 	assert.deepEqual(rest, Array.from({ length: total - 2 }, (_, i) => String(i + 3)));
-});
-
-test("deferred: a message from the peer a blocking ask waits on is held with that ask, not deferred", async () => {
-	const proj = makeProject("p-deferred-ask-hold");
-	const a = await session(proj);
-	const b = await session(proj);
-	busy(a);
-	const pending = a.tool({ action: "ask", to: "bravo", message: "may I continue?" });
-	await eventually(() => assert.equal(b.sentOf("telecom-ask").length, 1));
-	await b.tool({ action: "send", to: "alpha", message: "a note before the answer", ...defer });
-	const askId = b.sentOf("telecom-ask")[0]?.details.askId as string;
-	await b.tool({ action: "reply", askId, message: "yes" });
-	const result = await pending;
-	assert.match(result.text, /a note before the answer/);
-	assert.equal(await a.settle(), undefined, "the note was shown with the answer, and is not delivered again");
 });
 
 test("deferred: leaving hands what is held to pi's queue for the next run", async () => {

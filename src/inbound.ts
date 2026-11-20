@@ -6,11 +6,11 @@
 import { join, resolve, sep } from "node:path";
 import type { PeerChange } from "./awareness.ts";
 import { claimMatcher, claimsOverlap, isResource, laneRelativePattern, matchesClaim } from "./glob.ts";
-import { closesCycle, type HeldMessage, type InboundAsk } from "./ledger.ts";
+import type { InboundAsk } from "./ledger.ts";
 import { type PendingNotice, renderNotice } from "./notices.ts";
 import { displayPath, isWithin, laneIn, laneName, sameRepo } from "./project.ts";
 import { MESSAGE_TYPES } from "./render.ts";
-import { CONTACT_NEAR_MS, type MessageDetails, type Runtime, taskLine } from "./runtime.ts";
+import { CONTACT_NEAR_MS, type HeldMessage, type MessageDetails, type Runtime, taskLine } from "./runtime.ts";
 import { type Envelope, type FileChangedData, parseEvent, type Presence } from "./transport.ts";
 import { clip, pairKey, setBounded } from "./util.ts";
 import type { Waiting } from "./waiting.ts";
@@ -113,10 +113,6 @@ export function createInbound(rt: Runtime, waiting: Waiting): Inbound {
 					...(env.human ? { human: true as const } : {}),
 					...(env.group ? { group: env.group } : {}),
 				};
-				// While this agent is blocked in an ask to the sender, the answer comes back as that
-				// ask's tool result, which the model reads before anything steered in now. So the
-				// message waits with the ask, to be shown ahead of the answer it came before.
-				if (rt.ledger.hold(message)) return;
 				// A sender that said it can wait (`interrupt: false`) does not break into a run: it
 				// is read when the run ends (`turns.ts`). An idle agent gets it as any message.
 				if (env.defer && rt.isBusy()) {
@@ -144,15 +140,8 @@ export function createInbound(rt: Runtime, waiting: Waiting): Inbound {
 					...(env.async ? { async: true as const } : {}),
 				};
 				rt.ledger.noteInbound(ask);
-				// Stop waiting only when this ask closes a cycle (we, directly or through others,
-				// wait on the asker): then nobody on it could ever answer. Any other ask waits
-				// until our own wait ends. Unknown graph (an older peer on the way): interrupt.
-				// An async asker waits on nobody, so its ask closes no cycle.
-				const me = rt.self;
-				if (!env.async && me && rt.ledger.outboundCount() > 0 && closesCycle(env.from, { ...me, waitingOn: rt.ledger.waits().on }, rt.readPeers()) !== false) {
-					rt.ledger.interruptAll({ ...ask, reminded: false });
-				}
-				const waiting = env.async ? "they are not waiting; they get your reply when you send it" : "they are blocked until you reply";
+				// Only an older telecom blocks on an ask: this one never does (`ledger.ts`).
+				const waiting = env.async ? "they get your reply when you send it" : "they are blocked until you reply";
 				rt.inject(
 					MESSAGE_TYPES.ask,
 					`**📡 Ask from ${from}${human}** — ${waiting}\n\n${env.text}\n\nReply with telecom({ action: "reply", askId: "${env.id}", message: "<your answer>" }).`,
@@ -164,11 +153,10 @@ export function createInbound(rt: Runtime, waiting: Waiting): Inbound {
 			}
 			case "answer": {
 				const answerTo = env.answerTo ?? "";
-				if (rt.ledger.settle(answerTo, env.text, from, env.from)) return;
-				const late = rt.ledger.wasAbandoned(answerTo, env.from);
-				// An async ask never blocked, so its answer is not late: a reply to that ask, waking
-				// this agent like a late one.
-				const heading = late ? `${late.async ? "Reply" : "Late reply"} from ${from}** to your ask "${clip(late.text, 80)}"` : `Reply from ${from}**`;
+				// The answer to an ask of ours wakes this agent, as it asked; one to nothing it knows of
+				// (asked before a restart) is only information.
+				const late = rt.ledger.answered(answerTo, env.from);
+				const heading = late ? `Reply from ${from}** to your ask "${clip(late.text, 80)}"` : `Reply from ${from}**`;
 				rt.inject(
 					MESSAGE_TYPES.reply,
 					`**📡 ${heading}\n\n${env.text}${rt.stillWaitingNote(env.from)}`,

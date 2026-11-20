@@ -543,7 +543,7 @@ test("declared waits: status waitingFor shows on the board, refuses unknown name
 	const set = await a.tool({ action: "status", message: "wiring the cache", waitingFor: ["bravo", "@charlie", "bravo"] });
 	assert.ok(!set.isError, set.text);
 	assert.match(set.text, /waiting for bravo, charlie\. You are woken when one of them finishes a run/);
-	assert.match(set.text, /The wait ends by itself when one sends you a message that unblocks you, or you get to work after hearing from them; status keeps it/);
+	assert.match(set.text, /The wait lasts until one sends you a message that unblocks you, or you clear it with waitingFor: \[\]; status keeps it/);
 	assert.deepEqual(set.details.waitingFor, ["bravo", "charlie"]);
 	assert.deepEqual(published(a)?.blockedOn, [b.id, c.id]);
 	assert.deepEqual(published(a)?.waitingOn, [], "declared waits are not asks: the ask graph is untouched");
@@ -568,13 +568,41 @@ test("declared waits wake the waiter when the teammate finishes its run, and end
 	await eventually(() => assert.equal(a.sentOf("telecom-message").length, 1));
 	const woke = a.sentOf("telecom-message")[0];
 	assert.match(woke?.content ?? "", /📡 bravo finished its run \(task: run the full test suite\) — you were waiting for them/);
+	assert.match(woke?.content ?? "", /Carry on if this is what you were waiting for/, "what to do is said the first time");
 	assert.deepEqual(woke?.options, { triggerTurn: true });
 	assert.deepEqual(published(a)?.blockedOn, [b.id, c.id], "a finished run is news, not the end of the wait");
 	await c.tool({ action: "send", to: "alpha", message: "the schema is done", unblocks: true });
 	await eventually(() => assert.deepEqual(published(a)?.blockedOn, [b.id]));
+	// The second time, only the call that ends the wait: nothing ends a wait the agent forgets.
+	await b.prompt("run it again");
+	await sleep(150); // several team refreshes: alpha sees bravo busy
+	await b.settle();
+	await eventually(() => assert.equal(a.sentOf("telecom-message").filter((m) => /finished its run/.test(m.content)).length, 2));
+	const again = a.sentOf("telecom-message").filter((m) => /finished its run/.test(m.content))[1];
+	assert.match(again?.content ?? "", /— you were waiting for them\*\*\n\nIf that is what you waited for, end the wait: telecom\(\{ action: "status", waitingFor: \[\] \}\)\.$/);
 	await b.stop();
 	await eventually(() => assert.ok(a.sentOf("telecom-message").some((m) => /📡 bravo left — you were waiting for them/.test(m.content))));
+	const left = a.sentOf("telecom-message").find((m) => /bravo left/.test(m.content));
+	assert.match(left?.content ?? "", /\n\nWhoever left is off your waits\.$/, "and not again");
 	await eventually(() => assert.equal(published(a)?.blockedOn, undefined));
+});
+
+test("locks: how a handed-on lock works is said with the first one; later ones say only how to release", async () => {
+	const proj = makeProject("p-lock-hint-once");
+	const a = await session(proj);
+	const b = await session(proj);
+	for (let round = 1; round <= 2; round++) {
+		assert.equal((await a.tool({ action: "claim", paths: ["@cargo"] })).isError, false);
+		await b.tool({ action: "claim", paths: ["@cargo"] });
+		await a.tool({ action: "release" });
+		await eventually(() => assert.equal(lockMessages(b).length, round));
+		await eventually(() => assert.deepEqual(published(b)?.claims.map((cl) => cl.pattern), ["@cargo"]));
+		await b.tool({ action: "release" });
+		await eventually(() => assert.deepEqual(published(b)?.claims, []));
+	}
+	const [first, second] = lockMessages(b).map((m) => m.content);
+	assert.match(first ?? "", /You queued for it, so telecom claimed it for you\..*lapses/s);
+	assert.equal(second, `**📡 @cargo is yours now (alpha released it)**\n\nRelease when done: telecom({ action: "release", paths: ["@cargo"] }).`);
 });
 
 test("declared waits: a teammate's new task wakes no one; its status says who waits on it, and a message that says so ends the wait", async () => {
@@ -672,8 +700,8 @@ test("board: a teammate many depend on shows as one: the asks it owes, and who w
 	const a = await session(proj);
 	const b = await session(proj);
 	const c = await session(proj);
-	await b.tool({ action: "ask", to: "alpha", message: "which schema version?", wait: false });
-	await c.tool({ action: "ask", to: "alpha", message: "is the api frozen?", wait: false });
+	await b.tool({ action: "ask", to: "alpha", message: "which schema version?" });
+	await c.tool({ action: "ask", to: "alpha", message: "is the api frozen?" });
 	await b.tool({ action: "status", message: "waiting on the schema", waitingFor: ["alpha"] });
 	await eventually(() => assert.equal(published(a)?.asksOwed, 2));
 	await eventually(async () => {

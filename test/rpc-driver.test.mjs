@@ -4,7 +4,7 @@ import { EventEmitter } from "node:events";
 import { syncBuiltinESMExports } from "node:module";
 import { PassThrough } from "node:stream";
 import { test } from "node:test";
-import { startPi } from "../scripts/rpc-driver.mjs";
+import { assertServed, ModelUnavailable, startPi } from "../scripts/rpc-driver.mjs";
 
 function fixture(t) {
 	const child = Object.assign(new EventEmitter(), {
@@ -68,4 +68,12 @@ test("RPC driver: stop is idempotent and waits for the child's close", async (t)
 	assert.equal(stopping, pi.stop());
 	await stopping;
 	assert.equal(closed, true);
+});
+
+test("live scripts: a provider's own refusal stops a run as unavailable; any other model error is the run's", () => {
+	const ended = (stopReason, errorMessage) => [{ type: "message_end", message: { role: "assistant", stopReason, errorMessage } }];
+	assert.throws(() => assertServed(ended("error", "Resource has been exhausted (e.g. check quota).")), ModelUnavailable);
+	assert.throws(() => assertServed(ended("error", "All credentials for model x are temporarily unavailable")), ModelUnavailable);
+	assert.doesNotThrow(() => assertServed(ended("error", "Invalid JSON schema for tool telecom")), "a rejected schema is telecom's bug");
+	assert.doesNotThrow(() => assertServed(ended("stop")));
 });

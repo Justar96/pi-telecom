@@ -3,36 +3,42 @@
  * session state it acts on, already checked present. The static half (schema, model-facing text,
  * renderers) is `tool.ts`; it is fixed at registration (AGENTS.md, rule 1).
  */
-import { join, resolve } from "node:path";
-import type { AgentToolUpdateCallback } from "@earendil-works/pi-coding-agent";
+import { join } from "node:path";
 import { ownerOf, resolveTarget, stateHint, type Target, targetName } from "./address.ts";
 import { UNRESPONSIVE_MS } from "./awareness.ts";
 import { hostOf, OMP_TOOL_FIELDS } from "./host.ts";
 import { MAX_ASK_TIMEOUT_MS } from "./config.ts";
-import { blockedOnMe, isForegroundChild, lineOf, parentOf } from "./family.ts";
-import { absolutePattern, claimShown, claimsOverlap, coversCheckout, isResource, isResourceName, laneRelativePattern, resourceKey, sameResource } from "./glob.ts";
-import { type AskOutcome, closesCycle, type InboundAsk, waitedOn } from "./ledger.ts";
+import { blockedOnMe, lineOf, parentOf } from "./family.ts";
+import {
+	absolutePattern,
+	canonicalPattern,
+	claimShown,
+	claimsOverlap,
+	coversCheckout,
+	isOutsideClaim,
+	isResource,
+	isResourceName,
+	laneRelativePattern,
+	namesGlobLiterally,
+	outsidePattern,
+	resourceKey,
+	sameResource,
+} from "./glob.ts";
+import type { InboundAsk } from "./ledger.ts";
 import { broadcastText, entryTouches, LOG_SHOWN, renderLog } from "./log.ts";
 import { callsignsOf, holdsOf, lineFor } from "./locks.ts";
 import { displayPath, isWithin, laneIn, laneName, workingCheckout } from "./project.ts";
 import { OFF_TEXT, type Runtime } from "./runtime.ts";
 import { deliveryReport, fail, ok, TOOL_SPEC, type ToolAction, type ToolParams, type ToolResult } from "./tool.ts";
 import { BLOCKED_CAP, type Claim, type Envelope, GROUP_CAP, jobRuns, type Presence, QUEUED_CAP, readStartTicks, type Transport } from "./transport.ts";
-import { ago, clip, plural, setBounded, withoutSelfName } from "./util.ts";
+import { ago, clip, setBounded, withoutSelfName } from "./util.ts";
 import type { Waiting } from "./waiting.ts";
 
 const CLAIM_NOTE_CAP = 120;
 /** A lock holder's task, as a refused claim quotes it. */
 const HOLDER_TASK_CAP = 80;
-/**
- * How long an ask with `wait: false` stays open when no `timeoutSec` is given. Nothing blocks on
- * it, so it can outlast a blocking ask's default: it is meant for "tell me when your job is done",
- * and peers' jobs (a test suite, a build) run for tens of minutes. It is capped like any ask
- * (`MAX_ASK_TIMEOUT_MS`): a reply after the expiry still arrives, and wakes this agent, as a late
- * one, so a longer cap would only postpone the "did not answer" notice. The `timeoutSec`
- * description in `tool.ts` names this default (1800 s): keep the two in step.
- */
-const ASYNC_ASK_TIMEOUT_MS = 30 * 60_000;
+/** `~` or `~/…`: the home directory, never a folder of the checkout named `~`. */
+const HOME_RELATIVE = /^~(?:[\\/]|$)/;
 /** A claim pattern starting with `!`: claims have no exclusions, so it would match nothing. */
 const NEGATED = /^!/;
 /** Peers remembered by when this agent last ended their wait, or answered them (`unblockedAt`, `answeredAt`). */
@@ -55,8 +61,6 @@ interface ActionCall {
 	params: ToolParams;
 	/** `params.message`, trimmed. */
 	message: string;
-	signal: AbortSignal | undefined;
-	onUpdate: AgentToolUpdateCallback | undefined;
 }
 
 /** A claim pattern as stored, and the one checkout it binds in when the agent named one. */
@@ -88,24 +92,14 @@ function listAsks(asks: readonly InboundAsk[]): string {
 	return asks.map((a) => `${a.id} (${a.fromCallsign})`).join(", ");
 }
 
-/**
- * An answered ask's result. The peer's messages sent while the ask waited come first, oldest
- * first, and are marked as older than the answer: the model reads this result before anything
- * steered in, so a message shown after the answer would read as the newer instruction.
- */
-function answerText(asked: string, answer: AskOutcome & { ok: true }): string {
-	if (answer.held.length === 0) return `${asked}:\n\n${answer.text}`;
-	const from = answer.fromCallsign;
-	const count = answer.held.length;
-	const messages = answer.held.map(
-		(m, i) => `**Message ${count > 1 ? `${i + 1} of ${count} ` : ""}from ${m.fromCallsign}${m.human ? " (from their human)" : ""}** (sent before the answer):\n\n${m.text}`,
-	);
-	return `${asked}. Before answering, ${from} sent you ${plural(count, "message")}, shown first in the order sent; the answer, the newest, is last.\n\n${messages.join("\n\n")}\n\n**${from}'s answer** (newest):\n\n${answer.text}`;
+/** Why a claim outside the repository that overlaps a checkout of it was not made. */
+function coversRepoRefusal(wide: readonly string[]): string {
+	return `${wide.join(", ")} ${wide.length === 1 ? "overlaps" : "overlap"} a checkout of this repository, where claims are made inside it. Claim the paths you will change instead: inside a checkout relative to it, outside one by full path.`;
 }
 
-/** Why paths outside the repository were not claimed, and what to do instead. */
-function outsideRefusal(me: Presence, outside: readonly string[]): string {
-	return `${outside.join(", ")} ${outside.length === 1 ? "is" : "are"} outside this repository (${me.projectRoot} and its worktrees), and claims cover only its files. Peers who read a file there still hear when you change it, and the guard still stops a write over a change you have not read. To keep others out of one, tell them: telecom({ action: "broadcast", message: "editing …; please leave it to me until I say" }).`;
+/** Why a claim naming a real folder or file with glob syntax in its name was not made. */
+function literalGlobRefusal(literal: readonly string[]): string {
+	return `${literal.join(", ")}: a folder or file on the way has *, ?, [ or { in its name, which a claim reads as a pattern, so it would guard nothing. Claim a path above it whose names have none, or take a lock instead: telecom({ action: "claim", paths: ["@notes"] }).`;
 }
 
 /** Why lock names were refused, and how to write a lock (or a path that starts with `@`). */
@@ -180,8 +174,8 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 
 	/**
 	 * Set the task peers see, and whom this agent waits for (`waitingFor`, published as `blockedOn`).
-	 * Waits outlive a new status (progress reports were dropping waits their agents still had), and
-	 * end by themselves (`waiting.ts`): `waitingFor` replaces them, `[]` clears them.
+	 * Waits outlive a new status (progress reports were dropping waits their agents still had):
+	 * `waitingFor` replaces them, `[]` clears them, and a message marked `unblocks` ends one.
 	 */
 	function statusAction({ me, params, message }: ActionCall): ToolResult {
 		const declaring = params.waitingFor !== undefined;
@@ -228,7 +222,7 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 			? ids.length > 0
 				? ` · waiting for ${names.join(", ")}${
 						rt.firstTime("wait")
-							? ". You are woken when one of them finishes a run or leaves. The wait ends by itself when one sends you a message that unblocks you, or you get to work after hearing from them; status keeps it."
+							? ". You are woken when one of them finishes a run or leaves. The wait lasts until one sends you a message that unblocks you, or you clear it with waitingFor: []; status keeps it."
 							: ""
 					}`
 				: waited
@@ -260,7 +254,13 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 		}
 		if (!message) return { ok: false, reason: `"${params.action}" needs a \`message\`` };
 		const peers = rt.readPeers();
-		return params.to?.trim() ? resolveTarget(params.to, me, peers) : ownerOf(paths, params.action, me, peers);
+		if (params.to?.trim()) return resolveTarget(params.to, me, peers);
+		// A path outside the repository as claims store it, so a claim there is found.
+		const asClaimed = paths.map((p) => {
+			const scoped = claimPattern(me, p);
+			return isOutsideClaim(scoped.pattern, me.projectRoot) ? scoped.pattern : p;
+		});
+		return ownerOf(asClaimed, params.action, me, peers);
 	}
 
 	/**
@@ -327,117 +327,45 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 		return ok(`sent to ${shown.join("; ")}. Each sees who else got it.${missed}`, { reached, failed });
 	}
 
-	async function askAction(call: ActionCall): Promise<ToolResult> {
-		if (call.signal?.aborted) return fail("the ask was abandoned: the tool call was aborted");
+	/**
+	 * Deliver an ask and return: nothing waits on the answer (`ledger.ts`). It arrives as a reply
+	 * message, which wakes this agent; if none comes within the timeout, it is told, passively.
+	 */
+	function askAction(call: ActionCall): ToolResult {
 		const target = messageTarget(call);
 		if (!target.ok) return fail(target.reason);
-		const { me, net, message, signal, onUpdate } = call;
+		const { me, net, params, message } = call;
 		const peer = target.peer;
 		const peers = rt.readPeers();
 		if (blockedOnMe(me, peer, peers)) {
 			// The parent (or a foreground ancestor further up) is inside its `subagent` tool call,
-			// waiting for this very run: an ask could only reach it after this run ends, so waiting
-			// for the answer would deadlock.
+			// waiting for this very run: it reads the ask only after this run ends, when the answer
+			// can no longer help it.
 			const parent = parentOf(me, peers);
 			const who = parent?.id === peer.id ? "your parent session" : "above you in a chain of foreground subagents";
 			return fail(
 				`${peer.callsign} is ${who}, and it is blocked waiting for your run to end, so it cannot read an ask until you finish. Decide yourself and state the assumption in your final answer, or end your run with the question. If you have pi-subagents' contact_supervisor tool, it reaches ${parent?.callsign ?? "your parent"} mid-run: contact_supervisor({ reason: "need_decision", message: "…" }).`,
 			);
 		}
-		if (call.params.wait === false) return askWithoutWaiting(call, target);
-		const deadlock = foregroundDeadlock(me, peer, peers);
-		if (deadlock) return fail(deadlock);
-		const requested = call.params.timeoutSec && call.params.timeoutSec > 0 ? call.params.timeoutSec * 1000 : rt.cfg.askTimeoutMs;
+		const requested = params.timeoutSec && params.timeoutSec > 0 ? params.timeoutSec * 1000 : rt.cfg.askTimeoutMs;
 		const timeoutMs = Math.min(requested, MAX_ASK_TIMEOUT_MS);
 		const capped = cappedNote(requested, timeoutMs);
-		const env = rt.envelope(peer.id, "ask", message);
-		// Wait before delivering, so an answer that arrives at once has an ask to settle.
-		const waiting = rt.ledger.awaitAnswer(env.id, { to: peer.id, toCallsign: peer.callsign, text: message }, timeoutMs, signal);
-		// Published before the ask is delivered, so the peer sees the wait when the ask arrives.
-		rt.publishWaits();
-		const sent = net.deliver(env);
-		if (!sent.ok) {
-			rt.ledger.abandon(env.id, sent.reason);
-			await waiting;
-			if (rt.self === me) rt.publishWaits();
-			return fail(sent.reason);
-		}
-		rt.noteContact(peer.id);
-		onUpdate?.({
-			content: [{ type: "text", text: `waiting for ${targetName(target)} (${stateHint(peer, me, rt.peers, { blockingAsk: true })})${capped}…` }],
-			details: { waiting: peer.callsign },
-		});
-		const answer: AskOutcome = await waiting;
-		// This session may have disconnected (or reconnected as a new record) while it waited.
-		const connected = rt.self === me;
-		if (connected) rt.publishWaits();
-		if (answer.ok) {
-			const asked = target.via ? `${answer.fromCallsign} (it ${target.via}) answered` : `${answer.fromCallsign} answered`;
-			return ok(`${answerText(asked, answer)}${rt.stillWaitingNote(peer.id)}`, {
-				from: answer.fromCallsign,
-				askId: env.id,
-				...(answer.held.length > 0 ? { heldMessages: answer.held.map((m) => m.id) } : {}),
-			});
-		}
-		// No answer came: what the peer sent meanwhile is delivered as it would have been on arrival.
-		for (const held of answer.held) rt.injectMessage(held);
-		if (answer.interruptedBy) {
-			const by = answer.interruptedBy;
-			return ok(
-				`${answer.reason}\n\n${by.fromCallsign} asks: ${by.text}\n\nReply with telecom({ action: "reply", askId: "${by.id}", message: "…" }).`,
-				{ interrupted: true, askId: env.id, inboundAskId: by.id },
-			);
-		}
-		if (answer.aborted && connected && rt.readPeers().some((p) => p.id === peer.id)) {
-			// Nobody is waiting any more: take the question off the peer's to-do list.
-			rt.sendEvent(peer.id, { topic: "ask.withdrawn", data: { askId: env.id } }, `${me.callsign} withdrew an ask`);
-		}
-		return fail(answer.reason, { askId: env.id });
-	}
-
-	/**
-	 * `ask` with `wait: false`: deliver it and return. Nothing waits on the answer, so the ask is
-	 * not published in `waitingOn` (it closes no wait cycle, and nothing interrupts it); the answer
-	 * arrives as a reply message, which wakes this agent like a late answer does.
-	 */
-	function askWithoutWaiting({ me, net, params, message }: ActionCall, target: Target & { ok: true }): ToolResult {
-		const peer = target.peer;
-		const requested = params.timeoutSec && params.timeoutSec > 0 ? params.timeoutSec * 1000 : ASYNC_ASK_TIMEOUT_MS;
-		const timeoutMs = Math.min(requested, MAX_ASK_TIMEOUT_MS);
-		const capped = cappedNote(requested, timeoutMs);
+		// `async`: an older peer would otherwise read it as an ask whose sender is blocked.
 		const env = rt.envelope(peer.id, "ask", message, { async: true });
 		const sent = net.deliver(env);
 		if (!sent.ok) return fail(sent.reason);
 		// Tracked after delivery: an answer is drained on a later tick, never within this call.
-		rt.ledger.trackAsync(env.id, { to: peer.id, toCallsign: peer.callsign, text: message }, timeoutMs);
+		rt.ledger.track(env.id, { to: peer.id, toCallsign: peer.callsign, text: message }, timeoutMs);
 		rt.noteContact(peer.id);
-		return ok(
-			`asked ${targetName(target)} (${stateHint(peer, me, rt.peers)}) — handle ${env.id}\nYou are not waiting: carry on with other work. The answer arrives as a message and wakes you; if none comes within ${Math.round(timeoutMs / 1000)}s${capped}, you are told.`,
-			{ to: peer.callsign, askId: env.id, async: true },
-		);
-	}
-
-	/**
-	 * Why asking `peer` would deadlock, or null. A peer inside a foreground subagent run reads
-	 * nothing until that run ends. If the run waits, through any chain of asks, on this agent, the
-	 * ask would close a cycle that only this agent can break, by answering what waits on it.
-	 */
-	function foregroundDeadlock(me: Presence, peer: Presence, peers: readonly Presence[]): string | null {
-		const running = peers.find((c) => c.state === "busy" && isForegroundChild(c, peer));
-		if (!running) return null;
-		const asking = { ...me, waitingOn: [...new Set([...rt.ledger.waits().on, peer.id])] };
-		const graph = peers.map((p) => (p.id === me.id ? asking : p));
-		if (closesCycle(me.id, peer, graph) !== true) return null;
-		// The asks waiting on this agent from sessions on the cycle come first: answering one of
-		// those is what unblocks the run.
-		const cycle = waitedOn(peer, graph);
-		const owed = rt.ledger.inbound().sort((x, y) => Number(cycle.has(y.from)) - Number(cycle.has(x.from)));
-		const first = owed[0];
-		return `${peer.callsign} is inside its subagent ${running.callsign}'s run, which is waiting, directly or through others, on you, so ${peer.callsign} cannot read an ask until you unblock it: waiting for an answer would deadlock. ${
-			first
-				? `Answer what waits on you first: telecom({ action: "reply", askId: "${first.id}", message: "…" })${owed.length > 1 ? ` (all waiting: ${listAsks(owed)})` : ""}. Or decide yourself.`
-				: `Decide yourself, or leave the question for later: telecom({ action: "send", to: "${peer.callsign}", message: "…" }).`
-		}`;
+		// How an ask works is said once per context; the handle and the peer's state every time.
+		// A capped timeout is said every time: it is about this call.
+		const seconds = Math.round(timeoutMs / 1000);
+		const how = rt.firstTime("ask")
+			? `\nCarry on with other work: the answer arrives as a message and wakes you; if none comes within ${seconds}s${capped}, you are told.`
+			: capped
+				? `\nOpen for ${seconds}s${capped}.`
+				: "";
+		return ok(`asked ${targetName(target)} (${stateHint(peer, me, rt.peers)}) — handle ${env.id}${how}`, { to: peer.callsign, askId: env.id });
 	}
 
 	function replyAction(call: ActionCall): ToolResult {
@@ -540,12 +468,19 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 			for (const theirs of peer.claims) {
 				if (theirs.expiresAt <= now) continue;
 				const pattern = laneRelativePattern(theirs.pattern, theirs.checkout ?? peer.projectRoot);
-				if (pattern === null) continue;
 				const where = theirs.checkout ? [theirs.checkout] : [...theirsIn];
 				for (const mine of patterns) {
 					const relative = laneRelativePattern(mine.pattern, mine.checkout ?? me.projectRoot);
-					if (relative === null || !claimsOverlap(relative, pattern, me.projectRoot)) continue;
 					const what = `"${claimShown(mine)}" overlaps ${peer.callsign}'s claim "${claimShown(theirs)}"${theirs.note ? ` (${theirs.note})` : ""}`;
+					if (pattern === null || relative === null) {
+						// Outside the repository there is one copy, and no lanes: two claims there that
+						// overlap always conflict. An outside claim never overlaps one inside.
+						if (pattern === null && relative === null && claimsOverlap(mine.pattern, theirs.pattern, me.projectRoot)) {
+							conflicts.push({ mine: mine.pattern, scoped: true, relative: mine.pattern, owner: peer, theirs: theirs.pattern, what });
+						}
+						continue;
+					}
+					if (!claimsOverlap(relative, pattern, me.projectRoot)) continue;
 					const shared = where.some((c) => (mine.checkout ? c === mine.checkout : mineIn.has(c)));
 					// A whole worktree claimed in another checkout is that copy, not repository paths.
 					const wholeCopy = (c: Scoped) => c.checkout !== undefined && coversCheckout(c.pattern, c.checkout);
@@ -562,13 +497,29 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 	 * A claim pattern as it is stored: as given when it lies in the checkout this agent started in.
 	 * An absolute path into another worktree of the repository (agents often start in the main
 	 * checkout and work in one of their own) is stored relative to it, and binds in that checkout
-	 * only: the agent named the copy it works on. `null` outside the repository.
+	 * only: the agent named the copy it works on. A path outside the repository is stored absolute:
+	 * it has one copy, which the claim covers wherever its owner works (teams keep notes and
+	 * scripts beside the repository, and refusing claims there left them unguarded).
 	 */
-	function claimPattern(me: Presence, pattern: string): Scoped | null {
-		if (isWithin(absolutePattern(pattern, me.projectRoot), me.projectRoot)) return { pattern };
-		const path = resolve(me.projectRoot, pattern);
+	function claimPattern(me: Presence, pattern: string): Scoped {
+		// `~/x` is no path of the checkout, though it reads as a relative one.
+		if (!HOME_RELATIVE.test(pattern.trim()) && isWithin(absolutePattern(pattern, me.projectRoot), me.projectRoot)) return { pattern };
+		// Resolved as the guard resolves the paths it checks: a symlink or `~` names the same files.
+		const path = canonicalPattern(pattern, me.projectRoot);
 		const place = rt.awareness.placeOf(path, me);
-		return place ? { pattern: displayPath(path, place.checkout), checkout: place.checkout } : null;
+		if (!place) return { pattern: outsidePattern(path) };
+		const rel = displayPath(path, place.checkout);
+		return place.checkout === me.projectRoot ? { pattern: rel } : { pattern: rel, checkout: place.checkout };
+	}
+
+	/** Every checkout of the repository this agent knows to be in use: its own, and its teammates'. */
+	function knownCheckouts(me: Presence): Set<string> {
+		const all = new Set([me.projectRoot, ...rt.awareness.checkoutsOf(me)]);
+		for (const peer of rt.team(rt.readPeers())) {
+			all.add(peer.projectRoot);
+			for (const c of rt.awareness.checkoutsOf(peer)) all.add(c);
+		}
+		return all;
 	}
 
 	/**
@@ -692,7 +643,9 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 		const patterns: string[] = [];
 		/** Each path claim's checkout, when it names one. */
 		const scopes = new Map<string, string>();
-		const outside: string[] = [];
+		const wide: string[] = [];
+		const literal: string[] = [];
+		const checkouts = knownCheckouts(me);
 		const badNames: string[] = [];
 		const negated: string[] = [];
 		for (const raw of asked) {
@@ -707,7 +660,10 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 				continue;
 			}
 			const scoped = claimPattern(me, raw);
-			if (scoped === null) outside.push(raw);
+			const outside = isOutsideClaim(scoped.pattern, me.projectRoot);
+			// An outside claim over a checkout would hold back edits in it that its claims govern.
+			if (outside && [...checkouts].some((c) => claimsOverlap(scoped.pattern, c, me.projectRoot))) wide.push(raw);
+			else if (outside && namesGlobLiterally(scoped.pattern)) literal.push(raw);
 			else if (!patterns.includes(scoped.pattern)) {
 				patterns.push(scoped.pattern);
 				if (scoped.checkout) scopes.set(scoped.pattern, scoped.checkout);
@@ -717,15 +673,16 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 			const checkout = scopes.get(pattern);
 			return checkout ? { pattern, checkout } : { pattern };
 		};
-		// Like a held path below, a path outside the repository does not cost the ones inside it.
+		// Like a held path below, a refused pattern does not cost the others.
 		const away = [
-			outside.length > 0 ? outsideRefusal(me, outside) : "",
+			wide.length > 0 ? coversRepoRefusal(wide) : "",
+			literal.length > 0 ? literalGlobRefusal(literal) : "",
 			badNames.length > 0 ? badNameRefusal(badNames) : "",
 			negated.length > 0 ? negatedRefusal(negated) : "",
 		]
 			.filter(Boolean)
 			.join("\n");
-		if (patterns.length === 0) return fail(away, { refused: [...outside, ...badNames, ...negated] });
+		if (patterns.length === 0) return fail(away, { refused: [...wide, ...literal, ...badNames, ...negated] });
 		const now = Date.now();
 		/** The process a claim lasts for: this call's, else the one a live claim being made again already had. */
 		const tied = (prior?: Claim): Pick<Claim, "pid" | "pidStart"> => {
@@ -746,7 +703,7 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 		// A held lock is waited for unless the call says not to: nearly every refusal was followed
 		// by the same claim with `queue: true`, and agents that skipped it negotiated by message.
 		const line = params.queue !== false ? joinLines(me, busyLocks, lockHeld, now) : null;
-		const refused = [...held, ...(line ? line.full : busyLocks), ...outside, ...badNames, ...negated];
+		const refused = [...held, ...(line ? line.full : busyLocks), ...wide, ...literal, ...badNames, ...negated];
 		let refusal = "";
 		if (conflicts.length > 0) {
 			const owners = [...new Set(conflicts.map((c) => c.owner.callsign))];
@@ -873,7 +830,7 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 	function releaseAction({ me, params }: ActionCall): ToolResult {
 		// A path is released as it was claimed: an absolute one into a worktree names its relative
 		// pattern there.
-		const wanted = pathsOf(params).map((p) => (isResource(p) ? resourceKey(p) : (claimPattern(me, p)?.pattern ?? p)));
+		const wanted = pathsOf(params).map((p) => (isResource(p) ? resourceKey(p) : claimPattern(me, p).pattern));
 		const releasing = wanted.length === 0 ? me.claims : me.claims.filter((c) => wanted.includes(c.pattern));
 		// Releasing a lock this agent only waits for leaves the line.
 		const leaving = (me.queued ?? []).filter((q) => wanted.length === 0 || wanted.some((w) => sameResource(w, q.pattern)));
@@ -924,7 +881,7 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 		...TOOL_SPEC,
 		// omp offers extension tools only on discovery, and asks before running them, unless told.
 		...(hostOf(rt.pi) === "omp" ? OMP_TOOL_FIELDS : {}),
-		async execute(_toolCallId, params, signal, onUpdate) {
+		async execute(_toolCallId, params) {
 			if (!rt.enabled) return fail(OFF_TEXT);
 			if (!rt.self || !rt.transport) {
 				return fail(
@@ -936,7 +893,7 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 			// Schema validation should rule this out, but a model can still send anything.
 			if (!Object.hasOwn(actions, params.action)) return fail(`unknown action "${String(params.action)}"`);
 			const message = withoutSelfName(params.message?.trim() ?? "", rt.self.callsign);
-			return actions[params.action]({ me: rt.self, net: rt.transport, params, message, signal, onUpdate });
+			return actions[params.action]({ me: rt.self, net: rt.transport, params, message });
 		},
 	});
 }

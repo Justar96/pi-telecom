@@ -81,7 +81,7 @@ interface Handoff {
 	contesters: Array<[string, Array<[string, string]>]>;
 	/** Asks whose answer now arrives late: it must still wake the replacement runtime. */
 	abandonedAsks?: Array<[string, LateAsk]>;
-	/** Asks made with `wait: false` still open: the replacement still says when one goes unanswered. */
+	/** Asks still open: the replacement still says when one goes unanswered. */
 	asyncAsks?: Array<[string, AsyncAsk]>;
 	/** Places in line for locks, and declared waits: a reload must not lose them. */
 	queued?: QueueEntry[];
@@ -165,7 +165,7 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard, w
 		rt.step("log", () => rt.flushLog());
 		rt.step("asks", () => {
 			for (const ask of rt.ledger.expire(Date.now())) {
-				tellUnanswered(ask, `No reply within ${Math.round(ask.timeoutMs / 1000)}s. If one comes later, it still arrives as a message. Decide without it, or ask again: telecom({ action: "ask", to: "${ask.toCallsign}", message: "…", wait: false }).`);
+				tellUnanswered(ask, `No reply within ${Math.round(ask.timeoutMs / 1000)}s. If one comes later, it still arrives as a message. Decide without it, or ask again: telecom({ action: "ask", to: "${ask.toCallsign}", message: "…" }).`);
 			}
 		});
 		rt.step("wakes", () => rt.checkWakes());
@@ -236,7 +236,7 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard, w
 	}
 
 	/**
-	 * An ask made with `wait: false` ended without an answer. Nothing waits on it, so this is news,
+	 * An ask ended without an answer. Nothing waits on it, so this is news,
 	 * not a reason to start a turn: passive (AGENTS.md, rule 8).
 	 */
 	function tellUnanswered(ask: EndedAsync, why: string): void {
@@ -343,9 +343,12 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard, w
 			const one = locks.length === 1;
 			const text = [
 				freed.length > 0 ? exitedText(pid, freed) : "",
-				locks.length > 0
-					? `${locks.join(", ")} ${one ? "stays" : "stay"} yours for ${rt.exitGraceText()} more, for a next job: claim ${one ? "it" : "them"} again with that job's pid to keep ${one ? "it" : "them"}. Done with ${one ? "it" : "them"}? Release now, since others may be in line: telecom({ action: "release", paths: ${JSON.stringify(locks)} }).`
-					: "",
+				locks.length === 0
+					? ""
+					: // How the grace works is said once per context; after that, the two choices in a line.
+						rt.firstTime("exit-grace")
+						? `${locks.join(", ")} ${one ? "stays" : "stay"} yours for ${rt.exitGraceText()} more, for a next job: claim ${one ? "it" : "them"} again with that job's pid to keep ${one ? "it" : "them"}. Done with ${one ? "it" : "them"}? Release now, since others may be in line: telecom({ action: "release", paths: ${JSON.stringify(locks)} }).`
+						: `${locks.join(", ")} ${one ? "stays" : "stay"} yours for ${rt.exitGraceText()} more: claim again with the next job's pid, or release.`,
 			]
 				.filter(Boolean)
 				.join(" ");
@@ -457,7 +460,7 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard, w
 		rt.self = null;
 		// The log file is the other process's now, like the record: nothing pending is written.
 		rt.log.abandon();
-		rt.ledger.abandonAll(`telecom disconnected: ${reason}. Run /telecom on to reconnect before asking again.`);
+		rt.ledger.abandonAll();
 		// Held messages would wait for a run end that no longer reaches them (`rt.self` is gone).
 		rt.flushLater();
 		rt.unavailable = reason;
@@ -483,10 +486,9 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard, w
 			// peers never see this agent leave and nothing sent meanwhile is lost.
 			parkForReload();
 			rt.self = null;
-			rt.ledger.abandonAll("telecom reloaded while waiting; a later answer will arrive as a message in the new runtime");
 			return;
 		}
-		const waiting = rt.ledger.abandonAll("telecom disconnected while waiting. Run /telecom on to reconnect before asking again.");
+		const waiting = rt.ledger.abandonAll();
 		if (transport && me) {
 			for (const ask of waiting) {
 				rt.step("withdraw", () => rt.sendEvent(ask.to, { topic: "ask.withdrawn", data: { askId: ask.id } }, ""));

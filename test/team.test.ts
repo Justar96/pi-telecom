@@ -3,7 +3,7 @@
  * files on disk. Each scenario uses its own project directory so they cannot see each other.
  */
 import assert from "node:assert/strict";
-import { chmodSync, closeSync, constants, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, constants, mkdirSync, openSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
 import { findProjectRoot, findRepo } from "../src/project.ts";
@@ -56,126 +56,49 @@ test("send wakes the peer; broadcast is passive; status shows on the board", asy
 	assert.ok((await a.tool({ action: "send", to: "alpha", message: "me" })).isError, "self-target refused");
 });
 
-test("ask blocks until reply; reply infers the single outstanding ask", async () => {
+test("ask: the peer is woken; reply infers the single outstanding ask; the answer wakes the asker", async () => {
 	const proj = makeProject("p-ask");
 	const a = await session(proj);
 	const b = await session(proj);
-	const pending = a.tool({ action: "ask", to: "bravo", message: "which port does the dev server use?" });
+	const asked = await a.tool({ action: "ask", to: "bravo", message: "which port does the dev server use?" });
+	assert.ok(!asked.isError, asked.text);
 	await eventually(() => assert.equal(b.sentOf("telecom-ask").length, 1));
 	const ask = b.sentOf("telecom-ask")[0];
 	assert.deepEqual(ask?.options, { triggerTurn: true });
 	assert.match(b.status ?? "", /1 ask waiting/);
 	const reply = await b.tool({ action: "reply", message: "5173" });
 	assert.ok(!reply.isError, reply.text);
-	const answer = await pending;
-	assert.ok(!answer.isError);
-	assert.match(answer.text, /bravo answered:\n\n5173/);
+	await eventually(() => assert.equal(a.sentOf("telecom-reply").length, 1));
+	assert.match(a.sentOf("telecom-reply")[0]?.content ?? "", /Reply from bravo\*\* to your ask "which port does the dev server use\?"\n\n5173$/);
+	assert.equal(a.sentOf("telecom-reply")[0]?.options?.triggerTurn, true);
 });
 
-test("simultaneous asks do not deadlock: one side stops waiting, answers, and the other gets the answer", async () => {
+test("asks never block, so two agents asking each other at once both get their answers", async () => {
 	const proj = makeProject("p-deadlock");
 	const a = await session(proj);
 	const b = await session(proj);
-	const fromA = a.tool({ action: "ask", to: "bravo", message: "A asks" });
-	const fromB = b.tool({ action: "ask", to: "alpha", message: "B asks" });
-	const first = await Promise.race([
-		fromA.then((r) => ({ who: a, r, other: fromB })),
-		fromB.then((r) => ({ who: b, r, other: fromA })),
-	]);
-	assert.ok(first.r.details.interrupted, first.r.text);
-	const res = await first.who.tool({ action: "reply", askId: first.r.details.inboundAskId, message: "answer" });
-	assert.ok(!res.isError, res.text);
-	// The side that stopped waiting published it, so the other kept waiting and got its answer.
-	const other = await first.other;
-	assert.ok(!other.isError, other.text);
-	assert.match(other.text, /answered:\n\nanswer/);
-});
-
-test("three agents: an ask that closes no cycle waits its turn; the board shows who waits on whom", async () => {
-	const proj = makeProject("p-queue3");
-	const a = await session(proj);
-	const b = await session(proj);
-	const c = await session(proj);
-	await a.prompt("wire the cache");
-	let aDone = false;
-	const fromA = a.tool({ action: "ask", to: "bravo", message: "which cache key?" }).then((r) => {
-		aDone = true;
-		return r;
-	});
-	await eventually(() => assert.equal(b.sentOf("telecom-ask").length, 1));
-	const board = (await c.tool({ action: "board" })).text;
-	assert.match(board, /alpha \[busy, waiting on bravo \(asked [^)]*\)\]/);
-	const hint = await c.tool({ action: "send", to: "alpha", message: "fyi" });
-	assert.match(hint.text, /busy waiting on bravo .*it reads this when that wait ends/);
-	const fromC = c.tool({ action: "ask", to: "alpha", message: "can I take src/db?" });
-	await eventually(() => assert.equal(a.sentOf("telecom-ask").length, 1));
-	await new Promise((r) => setImmediate(r));
-	assert.equal(aDone, false, "bravo can still answer alpha: no cycle, so alpha keeps waiting");
-	assert.match((await b.tool({ action: "board" })).text, /alpha \[busy, waiting on you/);
-	await b.tool({ action: "reply", message: "the tenant id" });
-	assert.match((await fromA).text, /bravo answered:\n\nthe tenant id/);
-	await a.tool({ action: "reply", message: "yes, take it" });
-	assert.match((await fromC).text, /alpha answered:\n\nyes, take it/);
-	assert.doesNotMatch((await c.tool({ action: "board" })).text, /waiting on/, "waits are cleared when they end");
-});
-
-test("three agents: a wait cycle (alpha → bravo → charlie → alpha) is broken where it closes", async () => {
-	const proj = makeProject("p-cycle3");
-	const a = await session(proj);
-	const b = await session(proj);
-	const c = await session(proj);
-	const fromA = a.tool({ action: "ask", to: "bravo", message: "A?" });
-	await eventually(() => assert.equal(b.sentOf("telecom-ask").length, 1));
-	let bDone = false;
-	const fromB = b.tool({ action: "ask", to: "charlie", message: "B?" }).then((r) => {
-		bDone = true;
-		return r;
-	});
-	await eventually(() => assert.equal(c.sentOf("telecom-ask").length, 1));
-	let cDone = false;
-	const fromC = c.tool({ action: "ask", to: "alpha", message: "C?" }).then((r) => {
-		cDone = true;
-		return r;
-	});
-	const ra = await fromA;
-	assert.equal(ra.details.interrupted, true, ra.text);
-	assert.match(ra.text, /charlie asks: C\?/);
-	await new Promise((r) => setImmediate(r));
-	assert.equal(bDone || cDone, false, "only the agent where the cycle closed stopped waiting");
-	await a.tool({ action: "reply", askId: ra.details.inboundAskId, message: "from alpha" });
-	assert.match((await fromC).text, /alpha answered:\n\nfrom alpha/);
-	await c.tool({ action: "reply", message: "from charlie" });
-	assert.match((await fromB).text, /charlie answered:\n\nfrom charlie/);
-	// bravo now answers alpha's ask, which alpha stopped waiting on: it arrives as a late reply.
+	assert.ok(!(await a.tool({ action: "ask", to: "bravo", message: "A asks" })).isError);
+	assert.ok(!(await b.tool({ action: "ask", to: "alpha", message: "B asks" })).isError);
+	await eventually(() => assert.equal(a.sentOf("telecom-ask").length + b.sentOf("telecom-ask").length, 2));
+	await a.tool({ action: "reply", message: "from alpha" });
 	await b.tool({ action: "reply", message: "from bravo" });
-	await eventually(() => assert.match(a.sentOf("telecom-reply")[0]?.content ?? "", /Late reply from bravo/));
-});
-
-test("ask times out with a useful reason; a late answer still arrives", async () => {
-	const proj = makeProject("p-timeout");
-	const a = await session(proj);
-	const b = await session(proj);
-	const result = await a.tool({ action: "ask", to: "bravo", message: "slow question", timeoutSec: 0.1 });
-	assert.ok(result.isError);
-	assert.match(result.text, /did not answer within/);
-	await eventually(() => assert.equal(b.sentOf("telecom-ask").length, 1));
-	await b.tool({ action: "reply", message: "late answer" });
-	await eventually(() => assert.equal(a.sentOf("telecom-reply").length, 1));
-	assert.match(a.sentOf("telecom-reply")[0]?.content ?? "", /Late reply from bravo\*\* to your ask "slow question"/);
+	await eventually(() => assert.match(a.sentOf("telecom-reply")[0]?.content ?? "", /to your ask "A asks"\n\nfrom bravo$/));
+	await eventually(() => assert.match(b.sentOf("telecom-reply")[0]?.content ?? "", /to your ask "B asks"\n\nfrom alpha$/));
+	assert.deepEqual(a.sentOf("telecom-ask").length, 1);
 });
 
 test("an unanswered ask keeps the agent going until it replies (settle reminder, once)", async () => {
 	const proj = makeProject("p-remind");
 	const a = await session(proj);
 	const b = await session(proj);
-	const pending = a.tool({ action: "ask", to: "bravo", message: "need a decision", timeoutSec: 5 });
+	await a.tool({ action: "ask", to: "bravo", message: "need a decision" });
 	await eventually(() => assert.equal(b.sentOf("telecom-ask").length, 1));
 	const first = await b.settle();
 	assert.equal(first?.continue, true);
-	assert.match(first.entries[0].content, /still blocked on your reply/);
+	assert.match(first.entries[0].content, /1 ask still waiting for your reply\*\*\n {2}ask-\S+ from alpha: need a decision/);
 	assert.equal(await b.settle(), undefined, "reminded once, never loops");
 	await b.tool({ action: "reply", message: "go with option 2" });
-	assert.match((await pending).text, /option 2/);
+	await eventually(() => assert.match(a.sentOf("telecom-reply")[0]?.content ?? "", /option 2/));
 });
 
 test("a peer's edit to a file you read produces one coalesced change notice", async () => {
@@ -447,16 +370,14 @@ test("briefs: news held back while a peer was far is told once it is near again"
 	assert.ok(c && d);
 });
 
-test("leaving: presence removed; a blocked ask to the departed peer fails fast", async () => {
+test("leaving: presence removed; an open ask to the departed peer ends at once", async () => {
 	const proj = makeProject("p-leave");
 	const a = await session(proj);
 	const b = await session(proj);
-	const pending = a.tool({ action: "ask", to: "bravo", message: "still there?", timeoutSec: 30 });
+	await a.tool({ action: "ask", to: "bravo", message: "still there?", timeoutSec: 30 });
 	await eventually(() => assert.equal(b.sentOf("telecom-ask").length, 1));
 	await b.stop();
-	const res = await pending;
-	assert.ok(res.isError);
-	assert.match(res.text, /bravo's session ended before it answered/);
+	await eventually(() => assert.match(a.sentOf("telecom-reply")[0]?.content ?? "", /bravo did not answer your ask.*session ended before it answered/s));
 	assert.match((await a.tool({ action: "board" })).text, /No other agent is live/);
 });
 
@@ -648,26 +569,13 @@ test("session name: a session is named after its callsign and task for /resume; 
 	assert.equal(c.sessionName, undefined);
 });
 
-test("an aborted ask is withdrawn from the peer's to-do list", async () => {
-	const proj = makeProject("p-withdraw");
-	const a = await session(proj);
-	const b = await session(proj);
-	const controller = new AbortController();
-	const pending = a.tool({ action: "ask", to: "bravo", message: "never mind soon" }, controller.signal);
-	await eventually(() => assert.equal(b.sentOf("telecom-ask").length, 1));
-	controller.abort();
-	assert.ok((await pending).isError);
-	await eventually(() => assert.ok(b.sentOf("telecom-reply").some((m) => /withdrew their ask/.test(m.content))));
-	assert.equal(await b.settle(), undefined, "no reminder for a withdrawn ask");
-});
-
 test("durability: /reload keeps the line — no gap for peers, nothing lost, claims and asks restored", async () => {
 	const proj = makeProject("p-reload");
 	const a = await session(proj);
 	const b = await session(proj);
 	await a.tool({ action: "claim", paths: ["src/core"], message: "big refactor" });
 	await a.prompt("refactor the core");
-	const pending = b.tool({ action: "ask", to: "alpha", message: "can I touch src/core/x.ts?", timeoutSec: 10 });
+	await b.tool({ action: "ask", to: "alpha", message: "can I touch src/core/x.ts?", timeoutSec: 10 });
 	await eventually(() => assert.equal(a.sentOf("telecom-ask").length, 1));
 
 	await a.stop("reload");
@@ -687,7 +595,7 @@ test("durability: /reload keeps the line — no gap for peers, nothing lost, cla
 	// The inbound ask survived the reload and can still be answered.
 	const reply = await a2.tool({ action: "reply", message: "yes, go ahead" });
 	assert.ok(!reply.isError, reply.text);
-	assert.match((await pending).text, /yes, go ahead/);
+	await eventually(() => assert.match(b.sentOf("telecom-reply")[0]?.content ?? "", /yes, go ahead/));
 });
 
 test("durability: a redelivered envelope is handled once", async () => {
@@ -1315,38 +1223,13 @@ test("robustness: a directory planted in the inbox stops neither delivery nor as
 	const a = await session(proj);
 	const b = await session(proj);
 	mkdirSync(join(process.env.PI_TELECOM_DIR as string, "inbox", a.id, "0000-planted.json"), { recursive: true });
-	const res = await a.tool({ action: "ask", to: "bravo", message: "there?", timeoutSec: 0.2 });
-	assert.match(res.text, /did not answer within/);
+	await a.tool({ action: "ask", to: "bravo", message: "there?", timeoutSec: 0.2 });
+	await eventually(() => assert.ok(a.sentOf("telecom-reply").some((m) => /bravo did not answer your ask/.test(m.content))));
 	await b.tool({ action: "send", to: "alpha", message: "still reachable" });
 	await eventually(() => assert.ok(a.sentOf("telecom-message").some((m) => /still reachable/.test(m.content))));
 });
 
 // ---------------------------------------------------------------- audit regressions
-
-test("subagents: an ask that would close a wait cycle at a parent stuck in a subagent run is refused, with what to answer", async () => {
-	const proj = makeProject("p-cycle-fg");
-	const p = await session(proj);
-	const b = await session(proj);
-	const c = await session(proj);
-	const child = await session(proj, { parentSession: p.sessionFile() });
-	await p.prompt("delegate the schema");
-	await child.prompt("draft the schema");
-	// An older ask from off the cycle: answering it would unblock nothing.
-	const fromC = c.tool({ action: "ask", to: "bravo", message: "lunch?", timeoutSec: 5 });
-	await eventually(() => assert.equal(b.sentOf("telecom-ask").length, 1));
-	const fromChild = child.tool({ action: "ask", to: "bravo", message: "which ids?", timeoutSec: 5 });
-	await eventually(() => assert.equal(b.sentOf("telecom-ask").length, 2));
-	const askId = b.sentOf("telecom-ask")[1]?.details.id as string;
-	const started = Date.now();
-	const res = await b.tool({ action: "ask", to: "alpha", message: "what did you decide?", timeoutSec: 5 });
-	assert.ok(res.isError && Date.now() - started < 1_000, res.text);
-	assert.match(res.text, /alpha is inside its subagent alpha-1's run, which is waiting, directly or through others, on you/);
-	assert.match(res.text, new RegExp(`telecom\\(\\{ action: "reply", askId: "${askId}"`));
-	await b.tool({ action: "reply", askId, message: "uuids" });
-	assert.match((await fromChild).text, /uuids/);
-	await b.tool({ action: "reply", message: "sure" });
-	assert.match((await fromC).text, /sure/);
-});
 
 test("lanes: an edit that reaches into another checkout's real file is bound by its claims there, and its owner hears of it", async () => {
 	const proj = makeProject("p-lane-reach");
@@ -1391,12 +1274,12 @@ test("lanes: a change from a worktree peer that joined since the last team refre
 	t.removePresence(id);
 });
 
-test("durability: an ask that stopped waiting before a /reload still wakes the agent when its late answer comes", async () => {
+test("durability: an ask that expired before a /reload still wakes the agent when its late answer comes", async () => {
 	const proj = makeProject("p-reload-late");
 	const a = await session(proj);
 	const b = await session(proj);
-	const res = await a.tool({ action: "ask", to: "bravo", message: "slow one", timeoutSec: 0.1 });
-	assert.match(res.text, /did not answer within/);
+	await a.tool({ action: "ask", to: "bravo", message: "slow one", timeoutSec: 0.1 });
+	await eventually(() => assert.ok(a.sentOf("telecom-reply").some((m) => /did not answer your ask/.test(m.content))));
 	// On a loaded machine alpha's timeout can fire before bravo's tick drains the ask, and the
 	// rest of this test runs before bravo's next tick: wait until bravo holds the ask to answer.
 	await eventually(() => assert.equal(b.sentOf("telecom-ask").length, 1));
@@ -1406,7 +1289,7 @@ test("durability: an ask that stopped waiting before a /reload still wakes the a
 	await b.tool({ action: "reply", message: "late but here" });
 	await eventually(() => assert.equal(a2.sentOf("telecom-reply").length, 1));
 	const late = a2.sentOf("telecom-reply")[0];
-	assert.match(late?.content ?? "", /Late reply from bravo/);
+	assert.match(late?.content ?? "", /Reply from bravo\*\* to your ask "slow one"/);
 	assert.equal(late?.options?.triggerTurn, true, "a late answer wakes the agent, as it would without the reload");
 });
 
@@ -1488,10 +1371,11 @@ test("send/ask with paths reach whoever claims them, else whoever changed them l
 
 	await b.read("src/api/routes.ts");
 	await b.edit("src/api/routes.ts", "r", "R");
-	const pending = a.tool({ action: "ask", paths: ["src/api"], message: "is /users paginated?" });
+	const asked = await a.tool({ action: "ask", paths: ["src/api"], message: "is /users paginated?" });
+	assert.match(asked.text, /^asked bravo, which changed src\/api\/routes\.ts [^(]*\(/);
 	await eventually(() => assert.equal(b.sentOf("telecom-ask").length, 1));
 	await b.tool({ action: "reply", message: "yes, cursor-based" });
-	assert.match((await pending).text, /^bravo \(it changed src\/api\/routes\.ts [^)]*\) answered:\n\nyes, cursor-based/);
+	await eventually(() => assert.match(a.sentOf("telecom-reply")[0]?.content ?? "", /yes, cursor-based$/));
 
 	await b.tool({ action: "claim", paths: ["src/api/**"] });
 	const both = await a.tool({ action: "send", paths: ["src/api/x.ts", "src/db/x.ts"], message: "?" });
@@ -1547,7 +1431,7 @@ test(
 	},
 );
 
-test("claims: a path in your own worktree is claimed as the repository path there; one outside the repository is refused with what to do", async () => {
+test("claims: a path in your own worktree is claimed as the repository path there; one outside the repository binds for everyone", async () => {
 	const proj = makeProject("p-claim-paths");
 	const wt = makeWorktree(proj, "wa", "lane-a");
 	mkdirSync(join(wt, "src"), { recursive: true });
@@ -1560,23 +1444,118 @@ test("claims: a path in your own worktree is claimed as the repository path ther
 	const b = await session(proj);
 	const res = await a.tool({ action: "claim", paths: [join(wt, "src", "x.ts"), team], message: "parser" });
 	assert.ok(!res.isError, res.text);
-	assert.match(res.text, /^claimed src\/x\.ts \(in p-claim-paths-wa\) — parser\./, "stored as the repository path, in that worktree");
-	assert.match(res.text, /\nNot claimed: .*TEAM\.md is outside this repository .*telecom\(\{ action: "broadcast"/);
-	assert.deepEqual(res.details.refused, [team]);
+	assert.match(res.text, /^claimed src\/x\.ts \(in p-claim-paths-wa\), .*TEAM\.md — parser\./, "stored as the repository path, in that worktree; the outside one absolute");
+	assert.equal(res.details.refused, undefined);
 	// The claim binds in the worktree alpha works in.
 	await a.read(join(wt, "src", "x.ts"));
 	await a.edit(join(wt, "src", "x.ts"), "x", "A");
 	await b.read(join(wt, "src", "x.ts"));
 	assert.match((await b.edit(join(wt, "src", "x.ts"), "A", "B")).blocked ?? "", /inside alpha's claim "src\/x\.ts \(in p-claim-paths-wa\)"/);
 
-	const only = await a.tool({ action: "claim", paths: [team] });
-	assert.ok(only.isError);
-	assert.match(only.text, /outside this repository .*the guard still stops a write over a change you have not read/);
-	// …which holds for files outside the repository.
+	// Outside the repository there is one copy: the claim holds bravo back there, and bravo cannot claim it too.
 	await b.read(team);
-	await a.read(team);
-	await a.edit(team, "plan", "plan v2");
-	assert.match((await b.write(team, "mine\n")).blocked ?? "", /alpha edited .*TEAM\.md/);
+	assert.match((await b.edit(team, "plan", "mine")).blocked ?? "", /TEAM\.md is inside alpha's claim/);
+	const overlap = await b.tool({ action: "claim", paths: [notes] });
+	assert.ok(overlap.isError);
+	assert.match(overlap.text, /overlaps alpha's claim/);
+	// One that would cover the repository itself is refused.
+	const wide = await b.tool({ action: "claim", paths: [SCRATCH] });
+	assert.ok(wide.isError);
+	assert.match(wide.text, /overlaps a checkout of this repository/);
+	// Released as it was claimed.
+	assert.match((await a.tool({ action: "release", paths: [team] })).text, /released .*TEAM\.md/);
+});
+
+test("claims outside the repository: through a symlink or `~`, a claim guards the real file, and is released by either name", async (t) => {
+	const proj = makeProject("p-outside-canon");
+	const real = join(SCRATCH, "p-outside-canon-real");
+	mkdirSync(real, { recursive: true });
+	writeFileSync(join(real, "TEAM.md"), "plan\n");
+	const link = join(SCRATCH, "p-outside-canon-link");
+	symlinkSync(real, link);
+	const a = await session(proj);
+	const b = await session(proj);
+	const viaLink = await a.tool({ action: "claim", paths: [join(link, "TEAM.md")] });
+	assert.ok(!viaLink.isError, viaLink.text);
+	assert.match(viaLink.text, new RegExp(`^claimed ${escapeRegExp(join(real, "TEAM.md"))}`), "stored as the real path");
+	await b.read(join(link, "TEAM.md"));
+	assert.match((await b.edit(join(link, "TEAM.md"), "plan", "x")).blocked ?? "", /inside alpha's claim/);
+	assert.match((await a.tool({ action: "release", paths: [join(real, "TEAM.md")] })).text, /^released /);
+	// `~` is the home directory, not a folder of the checkout.
+	const home = join(SCRATCH, "p-outside-canon-home");
+	mkdirSync(join(home, "playground"), { recursive: true });
+	writeFileSync(join(home, "playground", "PLAN.md"), "plan\n");
+	withEnv(t, "HOME", home);
+	withEnv(t, "USERPROFILE", home);
+	const tilde = await a.tool({ action: "claim", paths: ["~/playground/PLAN.md"] });
+	assert.match(tilde.text, new RegExp(`^claimed ${escapeRegExp(join(home, "playground", "PLAN.md"))}`));
+	await b.read(join(home, "playground", "PLAN.md"));
+	assert.match((await b.edit(join(home, "playground", "PLAN.md"), "plan", "x")).blocked ?? "", /inside alpha's claim/);
+	assert.match((await a.tool({ action: "release", paths: ["~/playground/PLAN.md"] })).text, /^released /);
+});
+
+test("claims outside the repository: a real name with glob syntax, and a folder holding a checkout, are refused with what to do", async () => {
+	const proj = makeProject("p-outside-refuse");
+	const parent = join(SCRATCH, "p-outside-refuse-wts");
+	const wt = makeWorktree(proj, "wa", "lane-a", join(parent, "wa"));
+	mkdirSync(join(wt, "src"), { recursive: true });
+	writeFileSync(join(wt, "src", "x.ts"), "x\n");
+	const odd = join(SCRATCH, "p-outside-refuse notes [old]");
+	mkdirSync(odd, { recursive: true });
+	writeFileSync(join(odd, "TEAM.md"), "plan\n");
+	const a = await session(proj);
+	const b = await session(wt);
+	const literal = await a.tool({ action: "claim", paths: [join(odd, "TEAM.md")] });
+	assert.ok(literal.isError);
+	assert.match(literal.text, /has \*, \?, \[ or \{ in its name, which a claim reads as a pattern, so it would guard nothing/);
+	const wide = await a.tool({ action: "claim", paths: [parent] });
+	assert.ok(wide.isError, "it would hold back bravo's worktree");
+	assert.match(wide.text, /overlaps a checkout of this repository/);
+	await b.read(join(wt, "src", "x.ts"));
+	assert.equal((await b.edit(join(wt, "src", "x.ts"), "x", "y")).blocked, undefined);
+});
+
+test("claims outside the repository: one a peer publishes over a checkout (an older telecom's, or forged) holds back nothing in it", async () => {
+	const proj = makeProject("p-outside-forged");
+	writeFileSync(join(proj, "x.ts"), "x\n");
+	const a = await session(proj);
+	const net = openTransport(process.env.PI_TELECOM_DIR as string);
+	const id = "00000000-0000-4000-8000-00000forged";
+	const root = findProjectRoot(proj);
+	net.writePresence({
+		v: WIRE_VERSION, id, callsign: "zulu", pid: process.pid, ticks: processStartTicks(process.pid), cwd: SCRATCH,
+		projectRoot: root, repo: findRepo(root), role: "main", state: "busy", heartbeatAt: Date.now(), startedAt: Date.now(), recent: [],
+		claims: [{ pattern: "/", since: Date.now(), expiresAt: Date.now() + 60_000 }, { pattern: join(root, "x.ts"), since: Date.now(), expiresAt: Date.now() + 60_000 }],
+	});
+	{
+		await a.read("x.ts");
+		const blocked = (await a.edit("x.ts", "x", "y")).blocked ?? "";
+		// The claim on x.ts itself binds; the one on "/" is not why.
+		assert.match(blocked, /inside zulu's claim ".*x\.ts"/);
+		assert.doesNotMatch(blocked, /claim "\/"/);
+	}
+	net.removePresence(id);
+});
+
+test("addressing an outside path: the claimant in another checkout is found, else whoever changed it last", async () => {
+	const proj = makeProject("p-outside-owner");
+	const wt = makeWorktree(proj, "wa", "lane-a");
+	const notes = join(SCRATCH, "p-outside-owner-notes");
+	mkdirSync(notes, { recursive: true });
+	writeFileSync(join(notes, "TEAM.md"), "plan\n");
+	writeFileSync(join(notes, "LOG.md"), "log\n");
+	const a = await session(wt);
+	const b = await session(proj);
+	const c = await session(proj);
+	await a.tool({ action: "claim", paths: [join(notes, "TEAM.md")] });
+	const toClaimant = await b.tool({ action: "send", paths: [join(notes, "TEAM.md")], message: "may I edit it?" });
+	assert.ok(!toClaimant.isError, toClaimant.text);
+	assert.match(toClaimant.text, /^sent to alpha, which claims /);
+	await c.read(join(notes, "LOG.md"));
+	await c.edit(join(notes, "LOG.md"), "log", "log 2");
+	const toEditor = await b.tool({ action: "send", paths: [join(notes, "LOG.md")], message: "what changed?" });
+	assert.ok(!toEditor.isError, toEditor.text);
+	assert.match(toEditor.text, /^sent to charlie, which changed /);
 });
 
 test("lanes: notes written outside the repository do not push a worktree out of where a claim binds", async () => {

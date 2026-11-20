@@ -36,7 +36,7 @@ Windows separators converted at the boundary. Filesystem read errors must stay d
 malformed JSON: locked messages and presence files are retried on later ticks, not discarded.
 
 **Models.** Live tests, results and docs use exactly the models in `scripts/lab-models.mjs`:
-Claude Opus 5.5 and GPT-6.1 Sol. Don't name other models in docs or examples. When a lab ships a
+Claude Sonnet 5.5, GPT-6.1 Terra and Gemini 4 Neon. Don't name other models in docs or examples. When a lab ships a
 newer model, replace its entry there, re-run `e2e:matrix`, `e2e:cache` and `screenshots`, and
 update the README where it names them.
 
@@ -79,9 +79,9 @@ per request that hit: that is the text telecom adds, the number its changes can 
 | `src/transport.ts` | The wire: root directory, liveness (`readStartTicks`: unreadable `/proc` is unknown, not dead; `jobRuns` for a claim's process, a zombie counting as exited), debounced departures (`settleDepartures`) and leave marks (`markLeft`), presence records, envelopes, typed event payloads (`parseEvent`), `deliver`/`drain`, reload handoff, and **all validation of peer data**. |
 | `src/awareness.ts` | What this agent has seen (views), what peers changed, and the guard's verdicts (stale files, claims, lane overlaps). Pure decisions; the caller acts on them. |
 | `src/family.ts` | pi-subagents children: detecting a session's parent (`detectLineage`), its lineal family (`lineOf`), and foreground children (`isForegroundChild`). |
-| `src/ledger.ts` | Asks this agent is waiting on (blocking, with the messages held for them, and `wait: false` asks tracked apart), asks it owes an answer, and the wait-for graph (`closesCycle`). |
+| `src/ledger.ts` | Asks this agent sent that are still open (an ask never blocks), asks that ended unanswered (so a late answer still names them), and asks it owes an answer. |
 | `src/locks.ts` | Resource locks (`@name`) and declared waits as pure decisions: holders, the line (`queued`: earliest `since`, then lower id), races (`lostRaces`), declared-wait cycles, the board's lock lines. |
-| `src/waiting.ts` | Acting on locks and declared waits: a freed lock goes to the first live waiter (woken), a lost race sends the loser back to its place in line (told, passively, once it believed it held the lock), declared waits wake on a finished run or a departure, and end on `unblocks` or when the waiter gets to work after hearing from the teammate (`endHeardWaits`); a cycle is told once all its members stall, as a wake-up. |
+| `src/waiting.ts` | Acting on locks and declared waits: a freed lock goes to the first live waiter (woken), a lost race sends the loser back to its place in line (told, passively, once it believed it held the lock), declared waits wake on a finished run or a departure, and end on `unblocks`, a handed-on lock, a departure or `waitingFor: []`, never on a guess; a cycle is told once all its members stall, as a wake-up. |
 | `src/log.ts` | The team log: this session's own `log/<session>.jsonl` (kept in memory, rewritten whole on the tick, bounded to `LOG_CAP`), reading and validating every entry in this repository (`parseLogEntry`; departed sessions for `LOG_RETENTION_MS`), the sweep, and the log's text (`renderLog`, `LOG_HINT`). |
 | `src/board.ts` | Board text and team briefs (full, then only the changes; with many agents, only the relevant peers in full). |
 | `src/glob.ts` | Claim patterns: matching and overlap, and `@name` resource names (`isResource`, `resourceKey`), which match no path. |
@@ -106,7 +106,7 @@ transport, log`, `actions, command, turns → log → glob, project, transport, 
 board → locks → glob`, `waiting → locks, awareness, family, render, transport`, `address →
 board`, `transport, runtime → glob`, `view → board, render`, `address, board → awareness → glob → project`, `inbound,
 guard → notices`, `actions, tool, turns → host`, `tool → render → callsign`, `glob, render, tool → util`, `address, board, guard
-→ family → transport`, `transport → ledger → util`, and `transport → config → callsign →
+→ family → transport`, `ledger → util`, `tool → config`, and `transport → config → callsign →
 project`. `callsign.ts` imports only *types* from `transport.ts` (erased at load), which is what
 keeps that pair from forming a cycle. Keep it acyclic: an ESM import cycle can hand a module an
 uninitialized binding. A brace import whose names are all `type` (`import { type A }`) still loads
@@ -129,6 +129,12 @@ owners, coupled boundaries, durability limits and regression tests. Use it when 
   conflicts where both claims bind in one checkout. Guessing the scope from recent edits could
   guess wrong and stop guarding work, so a relative claim is never narrowed silently: the claim
   result and a refusal give the exact absolute-path call instead (`everywhereHint`, `scopeHint`).
+  A path outside the repository is claimed absolute, with no checkout (`isOutsideClaim`), resolved
+  as the guard resolves paths (`canonicalPattern`: `~`, symlinks). It has one copy, so it binds
+  for every teammate and only such claims cover it; overlapping outside claims conflict. One that
+  overlaps a known checkout, or names a real folder with glob syntax in it (`namesGlobLiterally`),
+  is refused. The guard never lets a peer's outside claim bind inside a checkout unless it lies
+  within it (an older telecom's absolute claim). Older peers ignore outside claims.
   `repo` is optional on the wire, so a peer without it is grouped by `projectRoot` alone
   (`sameRepo`). A pi-subagents child publishes `role: "child"` and `parent`; its lineal family
   (`lineOf`) is exempt from each other's claims, and briefs fold it into its parent.
@@ -200,8 +206,8 @@ owners, coupled boundaries, durability limits and regression tests. Use it when 
 - **Envelope kinds:** `message`, `broadcast`, `ask`, `answer`, and `event`. Event topics are
   `file.changed`, `claim.contested` (with `lane: true` when the edit was in another checkout and
   nothing was held back), `claim.released` (also sent to peers queued for a released lock) and
-  `ask.withdrawn`. An `ask` may carry optional `async: true` (sent with `wait: false`: the asker
-  is not waiting); older peers treat it as a blocking ask.
+  `ask.withdrawn`. An `ask` may carry optional `async: true` (the asker is not waiting); every
+  ask this version sends carries it. Older peers sent blocking asks without it, and still do.
   A human `message` may carry optional `triggerTurn: true` for an explicit `/telecom run` task.
   Older peers ignore this field and apply their usual wake limit. A `message` may carry optional
   `defer: true` (sent with `interrupt: false`), and a `message` or `answer` optional
@@ -213,9 +219,9 @@ owners, coupled boundaries, durability limits and regression tests. Use it when 
 
   | mode | used for | when busy | when idle |
   |---|---|---|---|
-  | `wake` | direct messages, late answers, answers to `wait: false` asks, a lock handed to a waiter, news of a teammate the agent declared it waits for (its run ended, it left, it stalled), a wait cycle whose members all stalled | steered in | starts a turn (wake-limited) |
+  | `wake` | direct messages, answers to this agent's asks, a lock handed to a waiter, news of a teammate the agent declared it waits for (its run ended, it left, it stalled), a wait cycle whose members all stalled | steered in | starts a turn (wake-limited) |
   | `wake-always` | asks and explicit human team tasks | steered in | starts a turn |
-  | `passive` | notices, broadcasts, claim news, claims released because their process exited, mid-run team updates (joins/departures), an expired `wait: false` ask | steered in | appended, no turn |
+  | `passive` | notices, broadcasts, claim news, claims released because their process exited, mid-run team updates (joins/departures), an ask that expired or whose peer left, an answer to no ask this agent knows | steered in | appended, no turn |
   | `later` | broadcasts about paths away from this agent's work | held by the runtime for the next run | held by the runtime for the next run |
   | deferred | a direct message sent with `interrupt: false` | held to the end of the run (`agent_before_settle` entries, `continue: true`), or `wake` at `agent_settled` | delivered as `wake` |
 
@@ -226,32 +232,20 @@ owners, coupled boundaries, durability limits and regression tests. Use it when 
   `WAKE_RETRY_BEATS`, publishes `unreadSince`, then tells the human once.
 
 - **Human commands.** `/telecom run <prompt>` targets this session and its repository team.
-  `/telecom off` stops the transport loop, releases claims and ends outbound waits; `/telecom on`
+  `/telecom off` stops the transport loop, releases claims and withdraws open asks; `/telecom on`
   reconnects. `telecom-enabled` custom entries persist the override on the active session branch.
   Tools and hooks stay registered with their static definitions, including while disconnected.
-- **Asks and the wait-for graph.** A session publishes `waitingOn` (the sessions its open asks
-  wait on, at most `WAITS_CAP`) before it delivers an ask and again when the wait ends. An
-  inbound ask interrupts this agent's own wait only when `closesCycle` says this agent already
-  waits, directly or through others, on the asker. A busy foreground subagent counts as an edge
-  from its parent. New sessions always publish `waitingOn`, possibly empty. A record without it
-  is an older telecom, and a list at the cap may have been cut: either way the graph is unknown
-  (`null`) and the ask interrupts, as it always did. Reaching the search depth limit also leaves
-  the graph unknown; a known cycle wins over an unknown branch. An asker whose record no longer waits on us
-  has stopped waiting, and closes no cycle. A peer inside a foreground subagent run cannot be
-  interrupted at all, so `askAction` refuses an ask that would close a cycle there, and names the
-  inbound ask to answer instead.
-  A message from the peer a blocking ask waits on is held with that ask (`AskLedger.hold`): the
-  answer comes back as the ask's tool result, which the model reads before anything steered in,
-  so a held message is shown in that result ahead of the answer. An ask that ends any other way
-  hands its held messages to another ask still waiting on the same peer, or else to
-  `rt.injectMessage`, in order. An ask with `wait: false` is tracked apart from waits: it is never
-  in `waitingOn`, closes no cycle, is not interrupted, and its answer arrives through the
-  late-answer path; when it expires or its peer leaves, the asker gets a `passive` notice. Over a
-  `/reload` it is parked with its deadline (`asyncOpen`/`restoreAsync`), so the replacement
-  runtime still sends that notice. A blocking ask can be open during a reload only when a host
-  or extension reloads mid-run (pi's `/reload` waits for the run to end); it ends inside
-  `session_shutdown`, and its held messages are delivered then, before pi invalidates the old
-  runtime's API.
+- **Asks never block.** `askAction` delivers the ask (`async: true`), tracks it in the ledger and
+  returns. The answer arrives as a `reply` message (`wake`), named by the ask's text; when the ask
+  expires (`timeoutSec`, default `PI_TELECOM_ASK_TIMEOUT_MS`) or its peer leaves, the asker gets
+  a `passive` notice, and a later answer still names the ask. Over a `/reload` open asks are
+  parked with their deadlines (`asyncOpen`/`restoreAsync`) and ended ones with them
+  (`lateCandidates`). Blocking asks, with their wait-for graph, cycle interrupts and messages held
+  for the answer, were removed: two in a thousand messages used them in a day of a nine-agent
+  team. The session publishes `waitingOn: []` always, so a peer on telecom 0.8 or older knows its
+  blocking ask closes no cycle here; such a peer's ask comes without `async` and reads "they are
+  blocked until you reply". An ask to a parent stuck in a foreground subagent run is still refused
+  (`blockedOnMe`): it reads nothing until the asking run ends.
 - **Locks and declared waits.** A claim pattern starting with `@` is a resource lock
   (`glob.ts`, `isResource`): it matches no path, overlaps only the same name (without case), and
   binds across lanes. Claiming a held lock joins its line unless the call says `queue: false`
@@ -276,23 +270,23 @@ owners, coupled boundaries, durability limits and regression tests. Use it when 
   lock ends the taker's declared wait on whoever held it. A declared wait is woken when the
   teammate finishes a run or leaves (not on a new task: progress reports woke waiters for nothing),
   and once per stall when the teammate has `unreadSince` or stays idle `STALE_WAIT_BEATS`. It is
-  declared once (`status` without `waitingFor` keeps it, `[]` clears it) and ends by itself: on
-  a message or answer with `unblocks`, or once the waiter has heard from the teammate and gets to
-  work (an edit, a new path claim, or a step other than `telecom` since then); the waiter is then
-  told, `passive`. A finished run that messaged the waiter (`lastHeard` after `busyFrom`) wakes
+  declared once (`status` without `waitingFor` keeps it, `[]` clears it) and ends on a message
+  or answer with `unblocks`, a lock handed over by the awaited holder, or the teammate leaving.
+  Never by a guess: ending a wait because the waiter "got to work" after a message ended real
+  waits. A finished run that messaged the waiter (`lastHeard` after `busyFrom`) wakes
   nothing more. `declare` names a closed cycle once per cycle (`cyclesTold`). The first message
   from the awaited teammate that leaves it in place carries `stillWaitingNote`, once per declared
   wait (again after a new declaration or a compaction). A cycle of declared waits is told only when
   every member has been idle `CYCLE_STALL_MS`, once per stall, as a `wake`: working agents
   resolve one by themselves. `blockedSince` (optional) dates the wait for the board's "Waiting
   on you". `blockedOn` (from `status` with
-  `waitingFor`) is separate from `waitingOn` and never feeds `closesCycle`. Older peers read
+  `waitingFor`) is separate from `waitingOn` (older telecoms' blocking asks). Older peers read
   `@cargo` as the path `<checkout>/@cargo`, which matches no real file.
 - **Live state.** A record carries `stateSince` (when it last went idle ↔ busy) and, while busy,
   `step` (`{ tool, since }`: the oldest tool call still running, published only once it has run
   `STEP_PUBLISH_AFTER_MS`, cleared at its end). Both are optional and display-only. The board and
   widget show `busy · bash 14m` and `idle 12m`; `stateHint` names a step older than
-  `LONG_STEP_MS` and points to `wait: false`. Briefs show the bare state: times are never brief
+  `LONG_STEP_MS`. Briefs show the bare state: times are never brief
   news. `unreadSince` (a wake-up no model turn answered) and `asksOwed` are optional too: the board
   shows `unread 20m` and `owes 3 asks`, and `stateHint` says the session may be stuck, or to
   expect a wait.
@@ -360,10 +354,10 @@ Each rule has a test or an e2e check. Read the reason before bending a rule.
    (or `parseLogEntry` in `log.ts`, built on transport's checks), which validate
    it, flatten it to one line, and cap it. A new event topic gets a case in `parseEvent` and a
    member in `TelecomEvent`; handlers never read `envelope.data` directly. Never put raw peer text into a model message without `clip`.
-8. **Information never wakes an idle agent.** Only direct messages, late answers and asks start
+8. **Information never wakes an idle agent.** Only direct messages, answers to this agent's asks and asks start
    turns, and `wake` respects `PI_TELECOM_MAX_WAKES`, counting only idle wake-ups. Explicit human
    tasks use `wake-always`. A new passive kind must use `passive`. A lock handed to a waiter, the
-   answer to a `wait: false` ask, and news about a teammate an agent declared it waits for use
+   answer to an ask, and news about a teammate an agent declared it waits for use
    `wake`: the agent asked for exactly that signal, like an ask's answer. So does a wait cycle
    whose members have all stalled: nobody on it moves otherwise.
 9. **Every refusal says what happened and what to do next,** including the exact

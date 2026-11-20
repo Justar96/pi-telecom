@@ -45,7 +45,7 @@ test("settlement: an owed-ask reminder preserves prior drafts and requests only 
 	const project = makeProject("p-boundary-ask-compose");
 	const sender = await session(project);
 	const recipient = await session(project);
-	await sender.tool({ action: "ask", to: recipient.id, message: "which schema?", wait: false });
+	await sender.tool({ action: "ask", to: recipient.id, message: "which schema?" });
 	await eventually(() => assert.equal(recipient.sentOf("telecom-ask").length, 1));
 
 	const entries = previousEntries();
@@ -67,7 +67,7 @@ test("settlement: new deferred messages and ask reminders make a completed assis
 	const recipient = await session(project);
 	recipient.ctx.isIdle = () => false;
 	await recipient.prompt("work on the schema migration");
-	await sender.tool({ action: "ask", to: recipient.id, message: "which schema?", wait: false });
+	await sender.tool({ action: "ask", to: recipient.id, message: "which schema?" });
 	await sender.tool({ action: "send", to: recipient.id, message: "deferred report", interrupt: false });
 	await sender.tool({ action: "send", to: recipient.id, message: "delivery fence" });
 	await eventually(() => assert.ok(recipient.sentOf("telecom-message").some((m) => m.content.includes("delivery fence"))));

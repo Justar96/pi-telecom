@@ -8,20 +8,18 @@ import { eventually, makeProject, makeWorktree, Session, session, stopSessions, 
 
 afterEach(stopSessions);
 
-test("reply: a failed delivery keeps the ask available for a shorter reply", async (t) => {
+test("reply: a failed delivery keeps the ask available for a shorter reply", async () => {
 	const proj = makeProject("p-reply-retry");
 	const a = await session(proj);
 	const b = await session(proj);
-	const controller = new AbortController();
-	t.after(() => controller.abort());
-	const pending = a.tool({ action: "ask", to: "bravo", message: "what changed?" }, controller.signal);
+	await a.tool({ action: "ask", to: "bravo", message: "what changed?" });
 	await eventually(() => assert.equal(b.sentOf("telecom-ask").length, 1));
 	const failed = await b.tool({ action: "reply", message: "x".repeat(TEXT_CAP + 1) });
 	assert.equal(failed.isError, true);
 	assert.match(failed.text, /exceeds/);
 	const retry = await b.tool({ action: "reply", message: "the cache key" });
 	assert.equal(retry.isError, false, retry.text);
-	assert.match((await pending).text, /bravo answered:\n\nthe cache key/);
+	await eventually(() => assert.match(a.sentOf("telecom-reply")[0]?.content ?? "", /Reply from bravo\*\* to your ask "what changed\?"\n\nthe cache key$/));
 });
 
 test("wake limit: steering messages into a busy session preserves its idle wake budget", async (t) => {
@@ -45,51 +43,60 @@ test("wake limit: steering messages into a busy session preserves its idle wake 
 	assert.match(b.sentOf("telecom-message")[4]?.content ?? "", /without starting a turn/);
 });
 
-test("ask: an already aborted call never sends a question or wakes a peer", async () => {
-	const proj = makeProject("p-pre-aborted");
+test("message: how to reply is said once per context, and again after a compaction", async () => {
+	const proj = makeProject("p-reply-hint-once");
 	const a = await session(proj);
 	const b = await session(proj);
-	const controller = new AbortController();
-	controller.abort();
-	const result = await a.tool({ action: "ask", to: "bravo", message: "cancelled" }, controller.signal);
-	assert.equal(result.isError, true);
-	assert.match(result.text, /aborted/);
-	await a.tool({ action: "broadcast", message: "after cancellation" });
-	await eventually(() => assert.equal(b.sentOf("telecom-broadcast").length, 1));
-	assert.equal(b.sentOf("telecom-ask").length, 0);
-	assert.equal(await b.settle(), undefined);
+	const hint = /\n\n\(Reply only if needed: action "send", to "alpha"\.\)$/;
+	await a.tool({ action: "send", to: "bravo", message: "one" });
+	await a.tool({ action: "send", to: "bravo", message: "two" });
+	await eventually(() => assert.equal(b.sentOf("telecom-message").length, 2));
+	const [first, second] = b.sentOf("telecom-message").map((m) => m.content);
+	assert.match(first ?? "", hint);
+	assert.equal(second, "**📡 Message from alpha**\n\ntwo");
+	await b.fire("session_compact", {});
+	await a.tool({ action: "send", to: "bravo", message: "three" });
+	await eventually(() => assert.equal(b.sentOf("telecom-message").length, 3));
+	assert.match(b.sentOf("telecom-message")[2]?.content ?? "", hint);
 });
 
-test("reply: only the addressed peer can settle a waiting ask", async (t) => {
+test("message: a message to several says once how to answer all of them, though a plain one said how to reply", async () => {
+	const proj = makeProject("p-reply-hint-group");
+	const a = await session(proj);
+	const b = await session(proj);
+	await session(proj);
+	await a.tool({ action: "send", to: "bravo", message: "one" });
+	await a.tool({ action: "send", to: "bravo, charlie", message: "two" });
+	await a.tool({ action: "send", to: "bravo, charlie", message: "three" });
+	await eventually(() => assert.equal(b.sentOf("telecom-message").length, 3));
+	const [, group, again] = b.sentOf("telecom-message").map((m) => m.content);
+	assert.match(group ?? "", /\(Reply only if needed: action "send", to "alpha", or "alpha, charlie" for all of them\.\)$/);
+	assert.equal(again, "**📡 Message from alpha — also to charlie**\n\nthree");
+});
+
+test("reply: only the addressed peer can answer an open ask", async () => {
 	const proj = makeProject("p-reply-sender");
 	const a = await session(proj);
 	const b = await session(proj);
 	const c = await session(proj);
-	const controller = new AbortController();
-	t.after(() => controller.abort());
-	let settled = false;
-	const pending = a.tool({ action: "ask", to: "bravo", message: "which key?" }, controller.signal).then((r) => {
-		settled = true;
-		return r;
-	});
+	await a.tool({ action: "ask", to: "bravo", message: "which key?" });
 	await eventually(() => assert.equal(b.sentOf("telecom-ask").length, 1));
 	const askId = b.sentOf("telecom-ask")[0]?.details.askId;
 	assert.equal((await c.tool({ action: "reply", to: a.id, askId, message: "from someone else" })).isError, false);
 	await c.tool({ action: "broadcast", message: "after the unrelated reply" });
 	await eventually(() => assert.equal(a.sentOf("telecom-broadcast").length, 1));
-	assert.equal(settled, false, "a third session must not consume bravo's answer slot");
+	const replies = () => a.sentOf("telecom-reply").map((m) => m.content);
+	assert.match(replies()[0] ?? "", /^\*\*📡 Reply from charlie\*\*\n\nfrom someone else$/, "a third session's answer names no ask of ours");
 	await b.tool({ action: "reply", message: "tenant id" });
-	assert.match((await pending).text, /bravo answered:\n\ntenant id/);
+	await eventually(() => assert.match(replies()[1] ?? "", /Reply from bravo\*\* to your ask "which key\?"\n\ntenant id$/));
 });
 
-test("withdrawal: only the asker can withdraw its question", async (t) => {
+test("withdrawal: only the asker can withdraw its question", async () => {
 	const proj = makeProject("p-withdraw-sender");
 	const a = await session(proj);
 	const b = await session(proj);
 	const c = await session(proj);
-	const controller = new AbortController();
-	t.after(() => controller.abort());
-	const pending = a.tool({ action: "ask", to: "bravo", message: "still needed" }, controller.signal);
+	await a.tool({ action: "ask", to: "bravo", message: "still needed" });
 	await eventually(() => assert.equal(b.sentOf("telecom-ask").length, 1));
 	const net = openTransport(process.env.PI_TELECOM_DIR as string);
 	assert.ok(net.deliver({
@@ -100,7 +107,7 @@ test("withdrawal: only the asker can withdraw its question", async (t) => {
 	await eventually(() => assert.equal(b.sentOf("telecom-broadcast").length, 1));
 	assert.equal(b.sentOf("telecom-reply").length, 0);
 	assert.equal((await b.tool({ action: "reply", message: "yes" })).isError, false);
-	assert.match((await pending).text, /bravo answered:\n\nyes/);
+	await eventually(() => assert.match(a.sentOf("telecom-reply")[0]?.content ?? "", /Reply from bravo\*\* to your ask "still needed"\n\nyes$/));
 });
 
 test("delivery: a misplaced envelope cannot wake the wrong recipient", async () => {
@@ -177,7 +184,7 @@ test("/telecom run: a failed peer inbox is reported while reachable sessions get
 	assert.equal(b.sentOf("telecom-message").length, 0);
 });
 
-test("/telecom off and on: claims are released, waits end, and this session reconnects once", async (t) => {
+test("/telecom off and on: claims are released, open asks withdrawn, and this session reconnects once", async () => {
 	const proj = makeProject("p-toggle");
 	writeFileSync(join(proj, "shared.ts"), "old\n");
 	const a = await session(proj);
@@ -185,12 +192,9 @@ test("/telecom off and on: claims are released, waits end, and this session reco
 	await a.tool({ action: "claim", paths: ["shared.ts"] });
 	assert.ok((await b.edit("shared.ts", "old", "new")).blocked);
 	await eventually(() => assert.equal(a.sentOf("telecom-claim").length, 1));
-	const controller = new AbortController();
-	t.after(() => controller.abort());
-	const pending = a.tool({ action: "ask", to: "bravo", message: "before disconnect" }, controller.signal);
+	await a.tool({ action: "ask", to: "bravo", message: "before disconnect" });
 	await eventually(() => assert.equal(b.sentOf("telecom-ask").length, 1));
 	assert.match((await a.command("off")).join("\n"), /is off.*\/telecom on/);
-	assert.match((await pending).text, /disconnected/);
 	await eventually(() => assert.ok(b.sentOf("telecom-claim").some((m) => /released shared\.ts/.test(m.content))));
 	await eventually(() => assert.ok(b.sentOf("telecom-reply").some((m) => /withdrew/.test(m.content))));
 	assert.match((await b.tool({ action: "board" })).text, /No other agent is live/);
@@ -228,18 +232,15 @@ test("/telecom off survives reload; on overrides a disabled environment and surv
 	assert.equal((await enabled.tool({ action: "board" })).isError, false);
 });
 
-test("reload: an open wait ends and only its intended peer's late answer wakes the replacement", async (t) => {
+test("reload: an open ask carries over, and only its intended peer's answer wakes the replacement", async () => {
 	const proj = makeProject("p-pending-reload");
 	const a = await session(proj);
 	const b = await session(proj);
 	const c = await session(proj);
-	const controller = new AbortController();
-	t.after(() => controller.abort());
-	const pending = a.tool({ action: "ask", to: "bravo", message: "finish after reload" }, controller.signal);
+	await a.tool({ action: "ask", to: "bravo", message: "finish after reload" });
 	await eventually(() => assert.equal(b.sentOf("telecom-ask").length, 1));
 	const askId = b.sentOf("telecom-ask")[0]?.details.askId;
 	await a.stop("reload");
-	assert.match((await pending).text, /reloaded/);
 	const replacement = new Session(proj, { id: a.id });
 	track(await replacement.start("reload"));
 	await c.tool({ action: "reply", to: a.id, askId, message: "unrelated" });
@@ -248,6 +249,6 @@ test("reload: an open wait ends and only its intended peer's late answer wakes t
 	await b.tool({ action: "reply", message: "the real answer" });
 	await eventually(() => assert.equal(replacement.sentOf("telecom-reply").length, 2));
 	const late = replacement.sentOf("telecom-reply")[1];
-	assert.match(late?.content ?? "", /Late reply from bravo.*finish after reload/s);
+	assert.match(late?.content ?? "", /Reply from bravo.*finish after reload/s);
 	assert.equal(late?.options?.triggerTurn, true);
 });

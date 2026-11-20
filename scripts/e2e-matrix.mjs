@@ -14,10 +14,11 @@
  *   TELECOM_LIVE_EXTENSIONS=...            passed through (provider extensions)
  *
  * Costs model calls (one live scenario per model). Exit 0 = every model passed every check,
- * 1 = something failed, 2 = no provider configured.
+ * 1 = something failed, 2 = no provider configured, or a model its provider could not serve
+ * (quota, credentials) and nothing failed.
  */
 import { spawn } from "node:child_process";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -31,8 +32,16 @@ if (!provider && explicit.length === 0) {
 	process.exit(2);
 }
 const onlyLabs = (process.env.TELECOM_MATRIX_LABS ?? "").split(",").map((l) => l.trim().toLowerCase()).filter(Boolean);
+/** An explicit `provider/id`, named as the lab list names it, else by the lab its id suggests. */
+function explicitTarget(model) {
+	const id = model.slice(model.indexOf("/") + 1);
+	const known = LAB_MODELS.find((m) => m.id === id);
+	if (known) return { lab: known.lab, name: known.name, model };
+	const lab = /^claude/i.test(id) ? "Anthropic" : /^(gpt|o\d)/i.test(id) ? "OpenAI" : /^gemini/i.test(id) ? "Google" : model.split("/")[0];
+	return { lab, name: id, model };
+}
 const targets = explicit.length
-	? explicit.map((model) => ({ lab: model.split("/")[0], name: model, model }))
+	? explicit.map(explicitTarget)
 	: LAB_MODELS.filter((m) => onlyLabs.length === 0 || onlyLabs.includes(m.lab.toLowerCase())).map((m) => ({
 			lab: m.lab,
 			name: m.name,
@@ -60,13 +69,15 @@ function runOne(target) {
 			const passed = (out.match(/^✔ /gm) ?? []).length;
 			const failed = out.split("\n").filter((l) => l.startsWith("✖ ")).map((l) => l.slice(2));
 			const minutes = ((Date.now() - started) / 60_000).toFixed(1);
-			console.log(`${code === 0 ? "✔" : "✖"} ${target.lab.padEnd(10)} ${target.name.padEnd(18)} ${passed}/${passed + failed.length} in ${minutes} min`);
+			console.log(`${code === 0 ? "✔" : code === 2 ? "⚠" : "✖"} ${target.lab.padEnd(10)} ${target.name.padEnd(18)} ${passed}/${passed + failed.length} in ${minutes} min`);
 			resolvePromise({ ...target, code, passed, failed, log, minutes });
 		});
 	});
 }
 
-console.log(`live scenario on ${targets.length} model(s), newest per lab as of ${UPDATED}, ${concurrency} at a time\n`);
+console.log(
+	`live scenario on ${targets.length} model(s), ${explicit.length ? "as given" : `newest per lab as of ${UPDATED}`}, ${concurrency} at a time\n`,
+);
 const queue = [...targets];
 const results = [];
 await Promise.all(
@@ -80,8 +91,11 @@ results.sort((a, b) => (order.get(a.model) ?? 0) - (order.get(b.model) ?? 0));
 console.log("\n| Lab | Model | Checks | Failed |\n|---|---|---|---|");
 for (const r of results) {
 	const total = r.passed + r.failed.length;
-	const verdict = r.code === 0 ? `${r.passed}/${total} ✔` : total === 0 ? "did not run ✖" : `${r.passed}/${total} ✖`;
-	console.log(`| ${r.lab} | ${r.name} | ${verdict} | ${r.failed.join("; ") || "—"} |`);
+	const verdict =
+		r.code === 0 ? `${r.passed}/${total} ✔` : r.code === 2 ? "provider could not serve it ⚠" : total === 0 ? "did not run ✖" : `${r.passed}/${total} ✖`;
+	const why = r.code === 2 ? (/could not be served, so the scenario stopped: (.*)/.exec(readFileSync(r.log, "utf8"))?.[1] ?? "") : r.failed.join("; ");
+	console.log(`| ${r.lab} | ${r.name} | ${verdict} | ${why || "—"} |`);
 }
 console.log(`\nfull logs: ${logDir}`);
-process.exit(results.every((r) => r.code === 0) ? 0 : 1);
+// A model its provider could not serve proves nothing either way: never a pass (exit 2).
+process.exit(results.some((r) => r.code !== 0 && r.code !== 2) ? 1 : results.some((r) => r.code === 2) ? 2 : 0);

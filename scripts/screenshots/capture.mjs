@@ -2,7 +2,7 @@
 /**
  * capture — the README's screenshots, taken from real pi sessions.
  *
- * Two interactive pi sessions (alpha on Claude Opus 5.5, bravo on GPT-6.1 Sol: see
+ * Two interactive pi sessions (alpha on the Anthropic model, bravo on the OpenAI one in
  * scripts/lab-models.mjs) run in tmux on a small demo repository. A short scenario is typed into
  * them: bravo reads a test, alpha claims the auth module and makes `login()` async, then bravo
  * asks alpha before fixing the test. Both screens are captured several times a second, and the
@@ -196,8 +196,9 @@ try {
 	// The moment: alpha has replied, bravo has the answer. Prefer frames where bravo's screen still
 	// shows the change notice too; among those, the latest (alpha's summary is complete).
 	const has = (frame, who, ...needles) => needles.every((n) => plain(frame[who] ?? []).includes(n));
-	// The transcript's words (`render.ts`, `tool.ts`): the ask's route header, the reply, the answer.
-	const answered = frames.filter((f) => has(f, "alpha", "bravo → you · ask", "replied to bravo") && has(f, "bravo", "alpha answered"));
+	// The transcript's words (`render.ts`, `tool.ts`): the ask's route header, the reply, and the
+	// answer arriving at bravo as a reply message (an ask does not wait for it).
+	const answered = frames.filter((f) => has(f, "alpha", "bravo → you · ask", "replied to bravo") && has(f, "bravo", "alpha → you · reply"));
 	const withNotice = answered.filter((f) => /alpha changed (a file|\d+ files) you are working with/.test(plain(f.bravo ?? [])));
 	const moment = withNotice.at(-1) ?? answered[0];
 	if (!moment) {

@@ -8,9 +8,11 @@
  * `id` is the model id under the provider you test through. TELECOM_LIVE_PROVIDER supplies the
  * provider prefix (`<provider>/<id>`), and TELECOM_MATRIX_MODELS can override the whole list.
  */
-export const UPDATED = "2026-10-21";
+export const UPDATED = "2026-11-20";
 
 export const LAB_MODELS = [
-	{ lab: "Anthropic", name: "Claude Opus 5.5", id: "claude-opus-5-5" },
-	{ lab: "OpenAI", name: "GPT-6.1 Sol", id: "gpt-6.1-sol" },
+	{ lab: "Anthropic", name: "Claude Sonnet 5.5", id: "claude-sonnet-5-5" },
+	{ lab: "OpenAI", name: "GPT-6.1 Terra", id: "gpt-6.1-terra" },
+	// Served only with an effort level in its id; medium is the provider's default effort.
+	{ lab: "Google", name: "Gemini 4 Neon", id: "gemini-4-neon-medium" },
 ];

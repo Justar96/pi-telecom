@@ -49,7 +49,7 @@ test("status: a reply also answers the waiter, and a later wait is told again", 
 	const proj = makeProject("p-audit-reply");
 	const a = await session(proj);
 	const b = await session(proj);
-	await a.tool({ action: "ask", to: "bravo", message: "which port?", wait: false });
+	await a.tool({ action: "ask", to: "bravo", message: "which port?" });
 	await a.tool({ action: "status", message: "waiting for bravo's port", waitingFor: ["bravo"] });
 	await eventually(() => assert.equal(b.sentOf("telecom-ask").length, 1));
 	await b.tool({ action: "reply", message: "12000" });
@@ -81,8 +81,10 @@ test("ask: a timeout over the cap says it was capped", async () => {
 	const proj = makeProject("p-audit-cap");
 	const a = await session(proj);
 	await session(proj);
-	const res = await a.tool({ action: "ask", to: "bravo", message: "tell me when the suite ends", wait: false, timeoutSec: 7200 });
+	const res = await a.tool({ action: "ask", to: "bravo", message: "tell me when the suite ends", timeoutSec: 7200 });
 	assert.match(res.text, /if none comes within 3600s \(the most an ask waits; you asked for 7200s\), you are told/);
-	const plain = await a.tool({ action: "ask", to: "bravo", message: "and the lint?", wait: false, timeoutSec: 600 });
-	assert.match(plain.text, /within 600s, you are told/);
+	const plain = await a.tool({ action: "ask", to: "bravo", message: "and the lint?", timeoutSec: 600 });
+	assert.doesNotMatch(plain.text, /\n/, "how an ask works was said once");
+	const capped = await a.tool({ action: "ask", to: "bravo", message: "and the e2e?", timeoutSec: 9000 });
+	assert.match(capped.text, /\nOpen for 3600s \(the most an ask waits; you asked for 9000s\)\.$/, "a cap is about this call: said every time");
 });

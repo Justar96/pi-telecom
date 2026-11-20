@@ -105,8 +105,8 @@ export function registerTurns(rt: Runtime, inbound: Inbound): void {
 		const due = rt.ledger.inbound().filter((a) => !a.reminded);
 		if (due.length === 0) return null;
 		for (const ask of due) ask.reminded = true;
-		const list = due.map((a) => `  ${a.id} from ${a.fromCallsign}${a.async ? " (not blocked)" : ""}: ${clip(a.text, 120)}`).join("\n");
-		// An ask made with `wait: false` blocks nobody, but its asker still counts on the reply.
+		const list = due.map((a) => `  ${a.id} from ${a.fromCallsign}${a.async ? "" : " (blocked)"}: ${clip(a.text, 120)}`).join("\n");
+		// Only an older telecom blocks on an ask, but every asker counts on the reply.
 		const blocked = due.some((a) => !a.async);
 		const heading = blocked ? `${plural(due.length, "peer")} still blocked on your reply` : `${plural(due.length, "ask")} still waiting for your reply`;
 		const why = blocked ? `even "I can't help with that" unblocks them` : `even "I can't help with that" tells them where they stand`;

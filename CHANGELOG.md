@@ -6,6 +6,42 @@ All notable changes to `@justar_96/pi-telecom`. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **An ask never blocks.** `ask` returns at once, and the answer arrives as a message that wakes
+  the asker, named by the question; with none within `timeoutSec` (now 1800 s by default, at most
+  3600 s, `PI_TELECOM_ASK_TIMEOUT_MS`) or when the peer leaves, the asker is told without a turn,
+  and a later answer still arrives. The `wait` parameter is gone. Over a day of a nine-agent team
+  two asks in a thousand messages waited for their answer; the wait needed a wait-for graph,
+  cycle interrupts, messages held back for the answer, and refusals for cycles through
+  subagents, all of which are removed. Sessions publish `waitingOn: []`, so telecom 0.8 and older
+  know their blocking asks close no cycle here; their asks still arrive, shown as blocking.
+- **A declared wait ends only when told:** a message or answer with `unblocks`, a lock handed over,
+  the teammate leaving, or `waitingFor: []`. It no longer ends because the waiter got to work
+  after hearing from the teammate, which ended real waits and sent "Your wait … ended" notices.
+
+- Telecom's own notices explain a mechanism once per context (again after a compaction), not
+  every time. A peer's message ends with how to reply only the first time; a lock handed on says
+  only how to release it after the first; news of a teammate an agent waits for (with the call that ends the wait), and a lock kept after
+  its process exited are a line or two after the first; a message to several says how to answer
+  all of them once on its own.
+  In a day of a nine-agent team, the reply hint alone was 904 repeats.
+
+- Live tests and docs use Claude Sonnet 5.5, GPT-6.1 Terra and Gemini 4 Neon
+  (`scripts/lab-models.mjs`); the README screenshot was captured again with the first two.
+- `e2e:live`, `e2e:cache` and `e2e:matrix` stop with exit 2 when the provider cannot serve a
+  model (quota, credentials, overload) instead of failing every check after it, and the matrix
+  names explicitly given models by their lab.
+
+### Added
+
+- Paths outside the repository can be claimed by their full path or `~/…`, resolved through
+  symlinks as the edit guard resolves paths. Teams keep plans, notes and scripts beside the
+  repository, and such claims were refused. A path there has one copy, so the claim binds for
+  every teammate and overlapping claims there conflict. A claim overlapping a checkout of the
+  repository, or through a folder whose name holds glob syntax, is refused; `send`/`ask` with an
+  outside path reach its claimant or whoever changed it last.
+
 ### Fixed
 
 - One process's exit releases all the claims tied to it together, in one notice. Each claim

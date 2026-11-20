@@ -192,6 +192,9 @@ test("a busy holder keeps its lock a while after its process exits, so the next 
 	// The second job ends, and no third is claimed for: the lock goes to the line.
 	await endJob(two);
 	await eventually(() => assert.equal(lockMessages(b).length, 1), 10_000);
+	// How the grace works was said with the first exit; the second says only the two choices.
+	assert.equal(told().length, 2);
+	assert.match(told()[1]?.content ?? "", new RegExp(`^\\*\\*📡 process ${two.pid} exited\\*\\*\\n\\n@cargo stays yours for 3 s more: claim again with the next job's pid, or release\\.$`));
 	assert.equal(published(a)?.claims.length, 0);
 	const log = await logOf(a);
 	assert.match(log, new RegExp(`released @cargo: process ${two.pid} exited`));

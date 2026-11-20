@@ -13,9 +13,10 @@ Git worktrees of one repository form one team, and subagents started with
 
 ![Two pi sessions working in one repository: alpha answers bravo's question while bravo gets a change notice with alpha's diff](https://raw.githubusercontent.com/Justar96/pi-telecom/main/docs/images/team.png)
 
-<sub>alpha (Claude Opus 5.5) made <code>login()</code> async and fixed the test that calls it.
-bravo (GPT-6.1 Sol) had read that test, so it got a change notice with alpha's diff; asked to fix
-the test, it asked alpha first. Captured with <code>npm run screenshots</code>.</sub>
+<sub>alpha (Claude Sonnet 5.5) claimed the auth module and made <code>login()</code> async.
+bravo (GPT-6.1 Terra) had read the test that calls it, so it got a change notice with alpha's
+diff; asked to fix the test, it asked alpha first, and alpha's answer arrived as a reply. Captured
+with <code>npm run screenshots</code>.</sub>
 
 ## Quick start
 
@@ -120,8 +121,7 @@ It publishes:
   doesn't lose it;
 - its checkout and git branch;
 - its claims and locks, its place in a lock's line, and whom it waits for;
-- how many asks it owes, whom its own asks wait on, and `unread` when a message it was sent
-  started no model reply;
+- how many asks it owes, and `unread` when a message it was sent started no model reply;
 - the last 12 files it changed in the repository with pi's `edit` and `write` tools, and the
   last 8 outside it.
 
@@ -210,8 +210,13 @@ a teammate in another checkout is given the full-path call.
 
 A path that overlaps a peer's claim in the same checkout is refused, the rest of the call is
 granted, and the result names the owner to ask. An overlap with a claim in another worktree is
-allowed with a note, and a subagent may claim part of its parent's claim. Paths outside the
-repository can't be claimed; the result says how to tell peers instead.
+allowed with a note, and a subagent may claim part of its parent's claim.
+
+A path outside the repository (notes, scripts, a scratch directory beside it) is claimed by its
+full path or `~/…`, resolved through symlinks. It has one copy, so the claim binds for every
+teammate wherever they work, and two claims there that overlap conflict. A claim that overlaps a
+checkout of the repository is refused, and so is one through a folder whose real name holds glob
+syntax (`notes [old]`), which a claim would read as a pattern.
 
 A claim ends when it is released, when its session ends, or after 2 hours with no edit inside it
 (`PI_TELECOM_CLAIM_TTL_MIN`). The owner is told what expired, and peers it held back are told the
@@ -255,10 +260,10 @@ telecom({ action: "status", message: "waiting for the green run", waitingFor: ["
 ```
 
 The agent is woken when charlie finishes a run or leaves (a run that already messaged the agent
-wakes it once, with the message). The wait is declared once and ends by itself: when charlie sends
-what it needs with `unblocks: true`, or when the agent has heard from charlie and gets to work (an
-edit, claiming files, a long tool call); then the agent is told, with the call to keep waiting if
-it still is. A message that leaves the wait in place says so, with the call to end it. A wait
+wakes it once, with the message). The wait is declared once and lasts until charlie sends what it
+needs with `unblocks: true`, a lock it queued for is handed over by charlie, charlie leaves, or
+the agent clears it (`waitingFor: []`). Nothing guesses that a wait is over. A message from
+charlie that leaves the wait in place says so once, with the call to end it. A wait
 that closes a wait cycle is pointed out once per cycle. If charlie stays idle for 30 minutes or doesn't act on a
 message, the waiter is told once, with the call to nudge it.
 
@@ -311,8 +316,8 @@ recognized. Processes they start, such as a test suite or another `pi`, are not 
 - They make no join or leave notices. Other agents see them inside their parent's entry, with
   their claims. A parent and its subagents get no briefs about each other; siblings see each other.
 - A parent and its subagents don't hold each other back with claims; siblings do.
-- A parent is blocked while its foreground subagent runs, so an `ask` to it (or to a blocked
-  ancestor) is refused at once. The refusal suggests deciding without it, or pi-subagents'
+- A parent is blocked while its foreground subagent runs and reads nothing until it ends, so an
+  `ask` to it (or to a blocked ancestor) is refused at once. The refusal suggests deciding without it, or pi-subagents'
   `contact_supervisor`.
 - A subagent record that stays silent for 5 minutes, while another session in its process keeps
   checking in, is removed.
@@ -338,7 +343,7 @@ or to `subagentOnlyExtensions` in one agent's definition. Each pays the tool's f
 |---|---|---|
 | `board` | `scope?` | The agents in this repository: state, task, claims, recent changes, asks waiting on this agent. `scope: "machine"` lists every agent on the machine. |
 | `send` | `to` or `paths`, `message`, `interrupt?`, `unblocks?` | Messages one agent, or several (`to: "alpha, bravo"`); starts a turn if it is idle (within the wake limit). `interrupt: false` holds it until a busy agent's run ends. |
-| `ask` | `to` or `paths`, `message`, `timeoutSec?`, `wait?` | Asks and waits for the answer (default 300 s, at most 1 h); a late answer arrives as a message. `wait: false` returns at once. |
+| `ask` | `to` or `paths`, `message`, `timeoutSec?` | Asks and returns at once; the answer arrives as a message that starts a turn. With none within `timeoutSec` (default 1800 s, at most 3600 s), the asker is told. |
 | `reply` | `message`, `askId?`, `to?`, `unblocks?` | Answers an ask; `askId` is optional when only one is waiting, or when `to` names its asker. With `to` and no ask of theirs open, it goes as a message. |
 | `broadcast` | `message`, `paths?`, `scope?` | Messages every agent in the repository. Never starts a turn. |
 | `status` | `message`, `waitingFor?` | Sets the task peers see (up to 400 characters) and whom this agent waits for. |
@@ -371,24 +376,20 @@ that points to the log. A broadcast without `paths` reaches everyone right away.
 
 - A `send` with `interrupt: false` reaches a busy agent when its run ends: the run goes on
   with the held messages, in the order they came, before it stops. An idle agent gets it at once.
-- Messages and late answers start at most 6 turns per minute per agent (`PI_TELECOM_MAX_WAKES`);
+- Messages and answers start at most 6 turns per minute per agent (`PI_TELECOM_MAX_WAKES`);
   beyond that they arrive without starting one. Asks and `/telecom run` always start a turn, and
   messages to a busy agent don't count.
 - If a message starts a run that ends without a model reply, it is sent again after about 1, 5
   and 15 minutes, then the human is told. Meanwhile teammates see `unread`, and a `send` to that
   agent warns that its session may be stuck.
+- An ask never blocks: the call returns at once, and the answer arrives as a message that starts
+  a turn. With no answer within `timeoutSec`, or when the peer's session ends, the asker gets a
+  notice that starts no turn, also across a `/reload`; a later answer still arrives.
+  `/telecom off` withdraws open asks from the peers' to-do lists.
 - An agent about to stop with an unanswered ask is reminded once. A `send` to an agent that owes
-  several asks says to expect a wait. Messages from the asked peer during an ask are shown in the
-  ask's result before the answer, in order. Pressing Esc withdraws an ask, and it fails at once if
-  the peer's session ends.
-- With `wait: false`, the answer arrives later as a message that starts a turn. With none within
-  `timeoutSec` (default 1800 s, at most 3600 s), the asker gets a notice that starts no turn, also
-  across a `/reload`. Such an ask never blocks or interrupts anyone's wait.
-- An ask to an agent that is itself waiting interrupts it only if it closes a cycle (alpha waits
-  on bravo, bravo on charlie, charlie asks alpha); otherwise it waits its turn.
-  The board shows who waits on whom: `alpha [busy, waiting on bravo (asked 40s ago)]`. An ask
-  that would close a cycle through a running foreground subagent is refused, naming the ask to
-  answer instead.
+  several asks says to expect a wait.
+- Telecom 0.8 and older block on their asks. Their asks are shown as "they are blocked until you
+  reply", and the board shows whom they wait on: `alpha [busy, waiting on bravo (asked 40s ago)]`.
 - A peer silent for 45 s is shown `unresponsive`: messages wait in its
   inbox, and its claims block no one.
 
@@ -432,7 +433,7 @@ Environment variables, read when a session starts or reconnects:
 |---|---|---|
 | `PI_TELECOM_GUARD` | `standard` | `strict`, `standard` or `off` (see [the edit guard](#the-edit-guard)) |
 | `PI_TELECOM_CALLSIGN` | first free | a fixed callsign for this session |
-| `PI_TELECOM_ASK_TIMEOUT_MS` | `300000` | default wait for `ask` (at most 1 h) |
+| `PI_TELECOM_ASK_TIMEOUT_MS` | `1800000` | how long an `ask` stays open before the asker is told no answer came (at most 1 h) |
 | `PI_TELECOM_MAX_WAKES` | `6` | peer wake-ups per minute; `0` turns them off (asks and `/telecom run` still wake) |
 | `PI_TELECOM_CLAIM_TTL_MIN` | `120` | minutes without an edit before a claim expires |
 | `PI_TELECOM_SESSION_NAME` | on | `off` leaves pi's session names alone (see [Presence](#presence)) |

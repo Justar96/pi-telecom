@@ -15,7 +15,7 @@ import { type BoardScope, type BriefState, renderBoard, renderBrief } from "./bo
 import { CALLSIGN_PATTERN } from "./callsign.ts";
 import { readConfig, type TelecomConfig } from "./config.ts";
 import { isResource, sameResource } from "./glob.ts";
-import { createAskLedger, type HeldMessage, WAITS_CAP } from "./ledger.ts";
+import { createAskLedger } from "./ledger.ts";
 import { type LogEntry, type LogKind, TeamLog } from "./log.ts";
 import { callsignsOf } from "./locks.ts";
 import { type PlaceCache, sameRepo } from "./project.ts";
@@ -116,19 +116,34 @@ const DEFERRED_CAP = 12;
  * and explicit human tasks; `passive` steers it in when busy and appends it silently when idle;
  * `later` holds it for this agent's next run.
  */
+/** A peer's direct message, as delivered or held for the end of a run (`interrupt: false`). */
+export interface HeldMessage {
+	id: string;
+	from: string;
+	fromCallsign: string;
+	text: string;
+	/** A human typed it (`/telecom msg`), not the model. */
+	human?: true;
+	/** Everyone the same message went to, this agent among them (`Envelope.group`). */
+	group?: string[];
+}
+
 export type InjectMode = "wake" | "passive" | "wake-always" | "later";
 export type MessageDetails = TelecomMessageDetails & Record<string, unknown>;
 
 /** A peer's direct message as the model reads it (on arrival, or held until a run ends). `note`:
  *  the line on a wait the sender did not end (`Runtime.stillWaitingNote`), judged at delivery. */
-function messageText(msg: HeldMessage, note = "", self = ""): { content: string; details: MessageDetails } {
+function messageText(msg: HeldMessage, note: string, self: string, replyHint: (group: boolean) => boolean): { content: string; details: MessageDetails } {
 	const human = msg.human ? " (from their human)" : "";
 	// A message to several: each reads who else got it, and how to answer all of them at once.
 	const others = (msg.group ?? []).filter((c) => c !== self && c !== msg.fromCallsign);
 	const also = others.length > 0 ? ` — also to ${others.join(", ")}` : "";
 	const replyTo = others.length > 0 ? `to "${msg.fromCallsign}", or "${[msg.fromCallsign, ...others].join(", ")}" for all of them` : `to "${msg.fromCallsign}"`;
+	// How to reply is said once per context: on every message it was 7% of what agents read. A
+	// message to several says it apart, since it adds how to answer all of them.
+	const hint = replyHint(others.length > 0) ? `\n\n(Reply only if needed: action "send", ${replyTo}.)` : "";
 	return {
-		content: `**📡 Message from ${msg.fromCallsign}${human}${also}**\n\n${msg.text}\n\n(Reply only if needed: action "send", ${replyTo}.)${note}`,
+		content: `**📡 Message from ${msg.fromCallsign}${human}${also}**\n\n${msg.text}${hint}${note}`,
 		details: { from: msg.from, fromCallsign: msg.fromCallsign, id: msg.id, tone: "accent" },
 	};
 }
@@ -359,16 +374,6 @@ export class Runtime {
 		if (me.task !== before) this.logEntry("task", `task: ${me.task}`);
 		me.taskAt = Date.now();
 		this.taskExplicit = explicit;
-	}
-
-	/** Publish whom this agent is blocked on, so peers can tell a wait cycle from a mere queue. */
-	publishWaits(): void {
-		if (!this.self) return;
-		const waits = this.ledger.waits();
-		this.self.waitingOn = waits.on.slice(0, WAITS_CAP);
-		if (waits.since !== undefined) this.self.waitingSince = waits.since;
-		else delete this.self.waitingSince;
-		this.publish();
 	}
 
 	/** Mark this agent busy or idle; `stateSince` says since when, for peers' hints and boards. */
@@ -612,13 +617,14 @@ export class Runtime {
 		}
 	}
 
-	/**
-	 * Deliver a peer's direct message. Shared by the inbox and by an ask that ends unanswered:
-	 * the messages its peer sent meanwhile were held with it (`AskLedger.hold`), and are delivered
-	 * then exactly as they would have been on arrival.
-	 */
+	/** A peer's direct message as the model reads it now (`messageText`). */
+	peerMessage(msg: HeldMessage): { content: string; details: MessageDetails } {
+		return messageText(msg, this.stillWaitingNote(msg.from), this.self?.callsign ?? "", (group) => this.firstTime(group ? "reply-group" : "reply"));
+	}
+
+	/** Deliver a peer's direct message now. */
 	injectMessage(msg: HeldMessage): boolean {
-		const { content, details } = messageText(msg, this.stillWaitingNote(msg.from), this.self?.callsign);
+		const { content, details } = this.peerMessage(msg);
 		return this.inject(MESSAGE_TYPES.message, content, details, "wake");
 	}
 
@@ -649,7 +655,7 @@ export class Runtime {
 	 * The same text as a message delivered on arrival.
 	 */
 	deferredEntries(): Array<{ type: "custom_message"; customType: string; content: string; display: true; details: MessageDetails }> {
-		return this.takeDeferred().map((msg) => ({ type: "custom_message", customType: MESSAGE_TYPES.message, display: true, ...messageText(msg, this.stillWaitingNote(msg.from), this.self?.callsign) }));
+		return this.takeDeferred().map((msg) => ({ type: "custom_message", customType: MESSAGE_TYPES.message, display: true, ...this.peerMessage(msg) }));
 	}
 
 	/**
@@ -660,7 +666,7 @@ export class Runtime {
 	deliverDeferred(): void {
 		const held = this.takeDeferred();
 		held.forEach((msg, i) => {
-			const { content, details } = messageText(msg, this.stillWaitingNote(msg.from), this.self?.callsign);
+			const { content, details } = this.peerMessage(msg);
 			this.inject(MESSAGE_TYPES.message, content, details, i === held.length - 1 ? "wake" : "passive");
 		});
 	}
@@ -668,8 +674,7 @@ export class Runtime {
 	/**
 	 * A line for the end of a message or answer from `fromId`, when this agent still declares it
 	 * waits for that teammate: the message did not say it ends the wait (`unblocks`), so the wait
-	 * stays until the agent gets to work (`waiting.ts`), and it is told so, with the call to drop it now. Empty
-	 * otherwise.
+	 * stays until the agent clears it, and it is told so, with the call to do it. Empty otherwise.
 	 */
 	stillWaitingNote(fromId: string): string {
 		const me = this.self;
@@ -687,7 +692,7 @@ export class Runtime {
 			me.id,
 		);
 		const sender = callsignsOf([fromId], this.peers, me.id)[0];
-		return `\n\n(Still waiting for ${names.join(", ")}: the wait on ${sender} ends when you get to work, or now with telecom({ action: "status", waitingFor: ${JSON.stringify(rest)} }).)`;
+		return `\n\n(Still waiting for ${names.join(", ")}. If this is what you waited for from ${sender}, drop the wait: telecom({ action: "status", waitingFor: ${JSON.stringify(rest)} }).)`;
 	}
 
 	/**
@@ -719,7 +724,7 @@ export class Runtime {
 	flushLater(): void {
 		for (const msg of this.takeDeferred()) {
 			try {
-				const { content, details } = messageText(msg, this.stillWaitingNote(msg.from), this.self?.callsign);
+				const { content, details } = this.peerMessage(msg);
 				this.pi.sendMessage({ customType: MESSAGE_TYPES.message, content, display: true, details }, { deliverAs: "nextTurn" });
 			} catch (error) {
 				this.report("deliver", error);

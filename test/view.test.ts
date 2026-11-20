@@ -128,9 +128,15 @@ test("render: a peer's message, this agent's own send and an answer all draw Mar
 	assert.match(call, /<mdCode>gate\.sh<\/mdCode>/);
 	const status = (TOOL_SPEC as any).renderCall({ action: "status", message: "gate on src/** and test/** running" }, tagged, { expanded: true, args: {} }).render(400).join("\n");
 	assert.match(status, /gate on src\/\*\* and test\/\*\* running/, "a status is a plain line");
-	const result = { content: [{ type: "text", text: `bravo answered:\n\n${body}` }], details: { ok: true } };
-	const answer = (TOOL_SPEC as any).renderResult(result, { expanded: true, isPartial: false }, tagged, { args: { action: "ask", to: "bravo" } }).render(400).join("\n");
+	// The answer to an ask arrives as a reply message.
+	const answer = shown(MESSAGE_TYPES.reply, `**📡 Reply from bravo** to your ask "which script?"\n\n${body}`);
 	assert.match(answer, /<mdListBullet>•<\/mdListBullet> <text>run it <\/text>\*<text>once<\/text>\*/);
+	// The ask itself: what happened, its handle dimmed, and the guidance only once expanded.
+	const asked = { content: [{ type: "text", text: "asked bravo (idle — this wakes them) — handle ask-1\nCarry on with other work: the answer arrives as a message and wakes you." }], details: { ok: true, to: "bravo", askId: "ask-1" } };
+	const draw = (expanded: boolean) => (TOOL_SPEC as any).renderResult(asked, { expanded, isPartial: false }, tagged, { args: { action: "ask", to: "bravo" } }).render(400).join("\n");
+	assert.match(draw(false), /<dim> · ask-1<\/dim>/);
+	assert.doesNotMatch(draw(false), /Carry on/);
+	assert.match(draw(true), /Carry on with other work/);
 });
 
 test("render: the board shows a dot per state and marks this agent", () => {
@@ -200,13 +206,13 @@ test("view: the widget and the board panel say what a renamed session was called
 test("render: a claim result shows the paths it left out under what it claimed", () => {
 	const text = [
 		'claimed src/x.ts — parser. Peers editing there are held back and you are told. Release with telecom({ action: "release" }) when done; idle claims expire after 120 min.',
-		"Not claimed: /notes/TEAM.md is outside this repository (/work/p and its worktrees), and claims cover only its files.",
+		"Not claimed: /work/** overlaps a checkout of this repository, where claims are made inside it.",
 	].join("\n");
 	const result = { content: [{ type: "text", text }], details: { ok: true } };
 	const rendered = (TOOL_SPEC as any).renderResult(result, { expanded: true, isPartial: false }, PLAIN_THEME, { args: { action: "claim" } });
 	const out = rendered.render(160).join("\n");
 	assert.match(out, /✓ claimed src\/x\.ts/);
-	assert.match(out, /⚠ Not claimed: \/notes\/TEAM\.md is outside this repository/);
+	assert.match(out, /⚠ Not claimed: \/work\/\*\* overlaps a checkout of this repository/);
 });
 
 test("render: the short claim, lock, queue and status results show what happened in a row each", () => {

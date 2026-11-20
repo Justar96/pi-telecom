@@ -457,7 +457,7 @@ function textOf(content: unknown): string {
 }
 
 /** A line written for the model, not the human: an instruction or a telecom note in parentheses. */
-export function isHint(line: string): boolean {
+function isHint(line: string): boolean {
 	return /^\(.*\)\.?$/.test(line.trim()) || /^(?:Reply with|Answer each with|Re-read before|Stay out of their claimed paths)\b/.test(line.trim());
 }
 
@@ -526,6 +526,7 @@ export function routeOf(first: string): Route | null {
 	if (m) return { from: who(m[1] ?? ""), to: m[2] ? `you, ${m[2]}` : "you" };
 	m = /^Ask from (\S+(?: \(from their human\))?)$/.exec(strong);
 	if (m) return { from: who(m[1] ?? ""), to: "you", kind: "ask", ...(/blocked until you reply/.test(after) ? { flag: "they wait" } : {}) };
+	// "Late reply" is only in transcripts from telecom 0.8, whose asks blocked.
 	m = /^(Late reply|Reply) from (\S+(?: \(from their human\))?)$/.exec(strong);
 	if (m) {
 		const about = /^ to your ask (".*")$/.exec(after);

@@ -263,7 +263,7 @@ export function renderBoard(input: BoardInput): string {
 		lines.push("", `Waiting on you: ${entries.join("; ")}`);
 	}
 	if (input.inboundAsks.length > 0) {
-		lines.push("", `Unanswered asks (a peer is blocked waiting — answer with action "reply"):`);
+		lines.push("", `Unanswered asks (a peer counts on your answer — reply with action "reply"):`);
 		for (const ask of input.inboundAsks) {
 			lines.push(`  ${ask.id} from ${ask.fromCallsign}: ${clip(ask.text, 120)}`);
 		}

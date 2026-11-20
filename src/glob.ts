@@ -15,8 +15,9 @@
  * (unless a folder by that name exists), overlaps the same name, and overlaps a claim on the whole
  * checkout (`.`, `**`), which only makes that older peer more careful.
  */
-import { basename, isAbsolute, normalize, parse, resolve, sep } from "node:path";
-import { displayPath, isWithin } from "./project.ts";
+import { existsSync } from "node:fs";
+import { basename, isAbsolute, join, normalize, parse, resolve, sep } from "node:path";
+import { canonicalPath, displayPath, isWithin } from "./project.ts";
 import { escapeRegExp } from "./util.ts";
 
 const GLOB_CHARS = /[*?[{]/;
@@ -128,6 +129,44 @@ export function laneRelativePattern(pattern: string, ownerRoot: string): string 
 	const trimmed = globPath(pattern.trim()).replace(/^\.\//, "");
 	if (!isAbsolute(trimmed)) return trimmed;
 	return isWithin(trimmed, ownerRoot) ? displayPath(trimmed, ownerRoot) : null;
+}
+
+/**
+ * Is this a claim on paths outside the repository (an absolute pattern outside its owner's
+ * checkout, naming no checkout)? Such a path has one copy, shared by every lane.
+ */
+export function isOutsideClaim(pattern: string, ownerRoot: string): boolean {
+	return laneRelativePattern(pattern, ownerRoot) === null;
+}
+
+/**
+ * A claim pattern as an absolute path the guard can compare: `~` expanded and the folders before
+ * any glob syntax resolved through symlinks (`canonicalPath`), as the guard resolves every path
+ * it checks. A claim written through a symlink or as `~/…` otherwise matched no edit at all.
+ */
+export function canonicalPattern(pattern: string, root: string): string {
+	const trimmed = pattern.trim();
+	const first = trimmed.search(GLOB_CHARS);
+	if (first === -1) return canonicalPath(trimmed, root);
+	const cut = Math.max(trimmed.lastIndexOf("/", first), sep === "\\" ? trimmed.lastIndexOf("\\", first) : -1);
+	const head = cut === -1 ? "." : cut === 0 ? trimmed.slice(0, 1) : trimmed.slice(0, cut);
+	return join(canonicalPath(head, root), trimmed.slice(cut + 1));
+}
+
+/** A canonical path outside the repository, as a claim stores it: with `/` separators. */
+export function outsidePattern(canonical: string): string {
+	return globPath(canonical);
+}
+
+/**
+ * Does a folder or file named in `canonical` hold glob syntax in its real name (`notes [old]`)?
+ * Only the checkout's own path is read literally, so a claim there would match nothing.
+ */
+export function namesGlobLiterally(canonical: string): boolean {
+	const first = canonical.search(GLOB_CHARS);
+	if (first === -1) return false;
+	const end = canonical.slice(first).search(sep === "\\" ? /[\\/]/ : /\//);
+	return existsSync(end === -1 ? canonical : canonical.slice(0, first + end));
 }
 
 /**

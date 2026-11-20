@@ -141,3 +141,21 @@ export function startPi(name, { cwd, env, args = [], session = ["--no-session"],
 export const isNotify = (re) => (r) => r.type === "extension_ui_request" && r.method === "notify" && re.test(r.message ?? "");
 export const isStatus = (re) => (r) =>
 	r.type === "extension_ui_request" && r.method === "setStatus" && r.statusKey === "telecom" && re.test(r.statusText ?? "");
+
+/**
+ * A run the provider refused for reasons of its own (quota, credentials, overload, rate limit)
+ * says nothing about telecom: live scripts stop and exit 2, never pass. Any other model error
+ * still fails their checks, since a tool schema the provider rejects is telecom's bug.
+ */
+const UNAVAILABLE = /quota|exhausted|temporarily unavailable|credentials|rate.?limit|overloaded|\b(429|503|529)\b/i;
+
+export class ModelUnavailable extends Error {}
+
+/** Throw `ModelUnavailable` when one of a run's records is a provider-side refusal. */
+export function assertServed(records) {
+	for (const r of records) {
+		if (r.type !== "message_end" || r.message?.role !== "assistant" || r.message.stopReason !== "error") continue;
+		const why = String(r.message.errorMessage ?? "");
+		if (UNAVAILABLE.test(why)) throw new ModelUnavailable(why);
+	}
+}

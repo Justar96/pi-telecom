@@ -15,17 +15,18 @@
  * what telecom controls: the tokens a request that DID hit was charged as new (input + cacheWrite),
  * which is the text appended since the last request.
  *
- *   TELECOM_LIVE_MODEL=<provider>/claude-opus-5-5 node scripts/e2e-cache.mjs
- *   (or gpt-6.1-sol — the models are listed in scripts/lab-models.mjs)
+ *   TELECOM_LIVE_MODEL=<provider>/claude-sonnet-5-5 node scripts/e2e-cache.mjs
+ *   (the models are listed in scripts/lab-models.mjs)
  *   (TELECOM_LIVE_EXTENSIONS=/path/to/provider.ts when the provider is an extension)
  *
- * Costs model calls. Exit 0 = pass, 1 = a check failed, 2 = no model configured.
+ * Costs model calls. Exit 0 = pass, 1 = a check failed, 2 = no model configured, or the provider
+ * could not serve it (quota, credentials, overload).
  */
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { isStatus, startPi } from "./rpc-driver.mjs";
+import { assertServed, isStatus, ModelUnavailable, startPi } from "./rpc-driver.mjs";
 
 const model = process.env.TELECOM_LIVE_MODEL;
 if (!model) {
@@ -40,6 +41,8 @@ const runs = Math.max(1, Math.floor(Number(process.env.TELECOM_CACHE_RUNS ?? 3))
 const scratch = realpathSync.native(mkdtempSync(join(tmpdir(), "pi-telecom-cache-")));
 const keepAlive = setInterval(() => {}, 1_000);
 let failures = 0;
+/** Why the provider could not serve the model, when it could not (`ModelUnavailable`). */
+let unavailable = null;
 function check(name, ok, detail = "") {
 	console.log(`${ok ? "✔" : "✖"} ${name}${ok || !detail ? "" : `\n    ${String(detail).slice(0, 1500)}`}`);
 	if (!ok) failures++;
@@ -76,7 +79,9 @@ async function run(agent, prompt, timeoutMs = 180_000) {
 	const start = await agent.waitFor((r) => r.type === "agent_start" && agent.records.indexOf(r) >= from, timeoutMs);
 	const startAt = agent.records.indexOf(start);
 	await agent.waitFor((r) => r.type === "agent_settled" && agent.records.indexOf(r) > startAt, timeoutMs);
-	return agent.records.slice(from);
+	const records = agent.records.slice(from);
+	assertServed(records);
+	return records;
 }
 
 function usageOf(agent) {
@@ -263,11 +268,18 @@ try {
 	check("median cache hit rate with telecom is in line with the baseline (after the first request)", steadyWith >= steadyWithout - 0.05,
 		`with ${(steadyWith * 100).toFixed(1)}% vs without ${(steadyWithout * 100).toFixed(1)}%`);
 } catch (error) {
-	console.error(error);
-	failures++;
+	if (error instanceof ModelUnavailable) unavailable = error.message;
+	else {
+		console.error(error);
+		failures++;
+	}
 } finally {
 	clearInterval(keepAlive);
 	rmSync(scratch, { recursive: true, force: true });
+}
+if (unavailable && failures === 0) {
+	console.log(`\n${model} could not be served, so the cache check stopped: ${unavailable}`);
+	process.exit(2);
 }
 console.log(failures === 0 ? "\nall cache checks passed" : `\n${failures} cache check(s) failed`);
 process.exit(failures === 0 ? 0 : 1);

@@ -10,11 +10,11 @@
  *     missing from one read still holds its locks and keeps its place), but a race only against
  *     records actually read: a record kept only because it may come back must never win one;
  *   - a teammate it DECLARED it waits for (`status` with `waitingFor`, published as `blockedOn`):
- *     it is woken when that teammate finishes a run or leaves (then the wait is dropped), and the
- *     wait ends by itself: when that teammate sends a message or answer marked `unblocks`, when the
- *     agent gets to work after hearing from it (a go-ahead and an FYI look alike, but only a
- *     go-ahead is followed by work, so nobody has to clear waits by hand), or when it hands the
- *     agent a lock it queued for. Declared waits
+ *     it is woken when that teammate finishes a run or leaves (then the wait is dropped). The wait
+ *     ends when that teammate sends a message or answer marked `unblocks`, when it hands the agent
+ *     a lock it queued for, or when the agent clears it (`waitingFor: []`). Never by a guess: ending
+ *     a wait because the agent "got to work" after a message ended real waits, and the notices
+ *     saying so were noise. Declared waits
  *     that form a cycle are pointed out to each agent on it once everyone on it has sat idle a
  *     while: a cycle with a busy member is usually someone writing the go-ahead, not a stall.
  *
@@ -32,8 +32,6 @@ import type { Runtime } from "./runtime.ts";
 import { type Presence, QUEUED_CAP } from "./transport.ts";
 import { ago, clip, elapsed, setBounded, shortId } from "./util.ts";
 
-/** A task that says its agent waits: once the wait ends, peers would read it wrong. */
-const WAITING_TASK = /\b(?:wait(?:s|ing)?|await(?:s|ing)?|blocked|until)\b/i;
 /** A teammate's task, as a wake-up quotes it. */
 const TASK_SHOWN = 120;
 /** Locks whose last holder is remembered, to say how each freed. */
@@ -66,7 +64,7 @@ export interface Waiting {
 	/** The inbox was drained: take the locks released in it, if first in line. */
 	afterDrain(): void;
 	/** A peer sent this agent a message or answer. With `unblocks` a declared wait on it is over;
-	 *  without, the wait ends when the agent next gets to work (`refresh`, `endHeardWaits`). */
+	 *  without, it stays until the agent clears it. */
 	heard(id: string, unblocks: boolean): void;
 	/** The agent declared whom it waits for: note how each looks now, so a change is news. Returns
 	 *  a warning when the declaration closes a wait cycle. */
@@ -87,15 +85,12 @@ export function createWaiting(rt: Runtime): Waiting {
 	/** How each teammate this agent waits for looked when last checked: a change is news. `since`:
 	 *  when the wait began; `told`: the stall last pointed out (see `stallNews`). */
 	const seen = new Map<string, { callsign: string; state: Presence["state"]; task: string; since: number; told?: string; busyFrom?: number }>();
-	/** When each awaited teammate last messaged or answered this agent, kept past the wait's end
-	 *  of `heardAt`: a run that ended with a message to this agent needs no second wake-up. */
+	/** When each awaited teammate last messaged or answered this agent: a run that ended with a
+	 *  message to this agent needs no second wake-up. */
 	const lastHeard = new Map<string, number>();
 	/** Wait cycles this agent was told it closes, by key: a pipeline of handoffs closes the same
 	 *  two-way cycle on every status, and the note said nothing new the second time. */
 	const cyclesTold = new Set<string>();
-	/** Awaited teammates that messaged or answered this agent since the wait was declared, and when:
-	 *  the wait ends once the agent gets to work after that. */
-	const heardAt = new Map<string, number>();
 	/** The stalled wait cycle this agent was told it is on: the cycle plus when its last member went
 	 *  idle, so a new idle spell is a new stall. */
 	let toldCycle: string | null = null;
@@ -179,9 +174,14 @@ export function createWaiting(rt: Runtime): Waiting {
 		const heads = taken.map((t) => `**📡 ${t.name} is yours now (${t.how})**`).join("\n");
 		const first = taken[0]?.name ?? "";
 		const waits = ended.length > 0 ? ` Your wait on ${callsignsOf(ended, peers, me.id).join(", ")} ended with it.` : "";
+		const release = `telecom({ action: "release", paths: ["${first}"] })`;
+		// How a handed-on lock works is said once per context; after that, the release call only.
+		const body = rt.firstTime("lock-handed")
+			? `You queued for it, so telecom claimed it for you.${waits} Release it as soon as you are done, since others may be in line: ${release}. It stays yours while you are working; once you are idle, it lapses ${rt.claimTtlMinutes()} min after it became yours unless you claim it again.`
+			: `${waits.trim()}${waits ? " " : ""}Release when done: ${release}.`;
 		rt.inject(
 			MESSAGE_TYPES.claim,
-			`${heads}\n\nYou queued for it, so telecom claimed it for you.${waits} Release it as soon as you are done, since others may be in line: telecom({ action: "release", paths: ["${first}"] }). It stays yours while you are working; once you are idle, it lapses ${rt.claimTtlMinutes()} min after it became yours unless you claim it again.`,
+			`${heads}\n\n${body}`,
 			{ tone: "accent" },
 			"wake",
 		);
@@ -234,48 +234,8 @@ export function createWaiting(rt: Runtime): Waiting {
 			delete me.blockedOn;
 			delete me.blockedSince;
 		}
-		for (const id of ids) {
-			seen.delete(id);
-			heardAt.delete(id);
-		}
+		for (const id of ids) seen.delete(id);
 		rt.publish();
-	}
-
-	/**
-	 * A wait on a teammate it heard from ends when the agent gets to work afterwards: it got on
-	 * with the work it waited to start. Merely reading the message, or going back to waiting (which
-	 * it says by declaring the wait again), ends nothing. Judged on what its own record already
-	 * holds (recent changes, claims, the long step), so no hook or bookkeeping beyond the time heard.
-	 */
-	function endHeardWaits(me: Presence): void {
-		if (heardAt.size === 0) return;
-		// Work is an edit, a new claim on files, or a long command (a gate or a build, which a
-		// go-ahead often starts with no edit at all). Not a lock: one can be handed over while the
-		// agent still waits for something else. Not a long telecom call: that is a blocking ask.
-		const workedSince = (at: number) =>
-			me.recent.some((r) => r.at >= at) ||
-			me.claims.some((c) => !isResource(c.pattern) && c.since >= at) ||
-			(me.step !== undefined && me.step.tool !== "telecom" && me.step.since >= at);
-		const ended = [...heardAt].filter(([id, at]) => me.blockedOn?.includes(id) && workedSince(at)).map(([id]) => id);
-		for (const id of [...heardAt.keys()]) if (!me.blockedOn?.includes(id)) heardAt.delete(id);
-		if (ended.length === 0) return;
-		const peers = rt.peers;
-		const names = callsignsOf(ended, peers, me.id);
-		dropWaits(me, ended);
-		// Said, not done silently: the model still believes it waits, and teammates now see it as not
-		// waiting. Short, and with no ready-made call to wait again: agents that work in rounds
-		// (hear, work, report back) declare the next wait when they report, and a call here had them
-		// declare it at once, mid-round. The task is named only when it still reads as waiting.
-		// `passive`: it is at work, so this is steered in.
-		const rest = callsignsOf(me.blockedOn ?? [], peers, me.id);
-		const still = rest.length > 0 ? ` You still wait for ${rest.join(", ")}.` : "";
-		const task = me.task && WAITING_TASK.test(me.task) ? ` Your task still says "${clip(me.task, TASK_SHOWN)}": update it when it changes.` : "";
-		rt.inject(
-			MESSAGE_TYPES.message,
-			`**📡 Your wait on ${names.join(", ")} ended**\n\nYou got to work after hearing from ${names.length === 1 ? "them" : "each"}, so teammates no longer see you as waiting.${still}${task}`,
-			{ tone: "info" },
-			"passive",
-		);
 	}
 
 	function wakeDeclared(me: Presence, peers: readonly Presence[]): void {
@@ -283,6 +243,7 @@ export function createWaiting(rt: Runtime): Waiting {
 		for (const id of [...seen.keys()]) if (!waits.includes(id)) seen.delete(id);
 		if (waits.length === 0) return;
 		const gone: string[] = [];
+		const finished: string[] = [];
 		const news: string[] = [];
 		const stalls: string[] = [];
 		let stalled: string | null = null;
@@ -318,6 +279,7 @@ export function createWaiting(rt: Runtime): Waiting {
 			const heardInRun = before.busyFrom !== undefined && (lastHeard.get(id) ?? 0) >= before.busyFrom;
 			if (before.state === "busy" && now.state === "idle" && !heardInRun) {
 				news.push(`${now.callsign} finished its run${now.task ? ` (task: ${clip(now.task, TASK_SHOWN)})` : ""}`);
+				finished.push(id);
 			}
 			// A new task is not a wake-up: agents set status mid-run to report progress, and in a long
 			// team session almost half the waiters woken by one went straight back to waiting. The
@@ -334,10 +296,20 @@ export function createWaiting(rt: Runtime): Waiting {
 		}
 		if (news.length === 0) return;
 		const heads = news.map((n) => `**📡 ${n} — you were waiting for them**`).join("\n");
-		const after = gone.length > 0 ? "Whoever left is off your waits. " : "";
+		const after = gone.length > 0 ? "Whoever left is off your waits." : "";
+		// What to do with the news is said in full once per context; after that only the call that
+		// ends the wait, since nothing ends a wait the agent forgets to clear (no guess does).
+		const keep = callsignsOf((me.blockedOn ?? []).filter((id) => !finished.includes(id)), rt.peers, me.id);
+		const clear = `telecom({ action: "status", waitingFor: ${JSON.stringify(keep)} })`;
+		const how = rt.firstTime("wait-news")
+			? `Carry on if this is what you were waiting for, and update your wait (or clear it): telecom({ action: "status", message: "…" }).`
+			: finished.length > 0
+				? `If that is what you waited for, end the wait: ${clear}.`
+				: "";
+		const body = [after, how].filter(Boolean).join(" ");
 		rt.inject(
 			MESSAGE_TYPES.message,
-			`${heads}\n\n${after}Carry on if this is what you were waiting for, and update your wait (or clear it): telecom({ action: "status", message: "…" }).`,
+			`${heads}${body ? `\n\n${body}` : ""}`,
 			{ tone: "accent" },
 			"wake",
 		);
@@ -426,7 +398,6 @@ export function createWaiting(rt: Runtime): Waiting {
 				lastSeen = [];
 				toldCycle = null;
 				seen.clear();
-				heardAt.clear();
 				lastHeard.clear();
 				fromLine.clear();
 				return;
@@ -434,7 +405,6 @@ export function createWaiting(rt: Runtime): Waiting {
 			for (const name of [...fromLine.keys()]) if (!me.claims.some((c) => sameResource(c.pattern, name))) fromLine.delete(name);
 			settle(me, read, true);
 			takeFreeLocks(me, present);
-			endHeardWaits(me);
 			wakeDeclared(me, present);
 			flagCycle(me, present);
 			lastSeen = rivals(me, present);
@@ -468,14 +438,11 @@ export function createWaiting(rt: Runtime): Waiting {
 			if (!me?.blockedOn?.includes(id)) return;
 			setBounded(lastHeard, id, Date.now(), HOLDERS_CAP);
 			if (unblocks) dropWaits(me, [id]);
-			else heardAt.set(id, Date.now());
 		},
 
 		declare(peers) {
 			const me = rt.self;
 			seen.clear();
-			// Declaring again, after hearing, is the agent saying it still waits.
-			heardAt.clear();
 			if (!me) return null;
 			for (const id of me.blockedOn ?? []) {
 				const peer = peers.find((p) => p.id === id);
@@ -511,7 +478,6 @@ export function createWaiting(rt: Runtime): Waiting {
 			lastHolder.clear();
 			fromLine.clear();
 			seen.clear();
-			heardAt.clear();
 			lastHeard.clear();
 			cyclesTold.clear();
 			toldCycle = null;

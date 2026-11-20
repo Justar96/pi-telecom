@@ -7,7 +7,7 @@
 import { UNRESPONSIVE_MS } from "./awareness.ts";
 import { idleFor } from "./board.ts";
 import { blockedOnMe, isForegroundChild } from "./family.ts";
-import { claimMatcher, claimsOverlap, laneRelativePattern } from "./glob.ts";
+import { claimMatcher, claimsOverlap, isOutsideClaim, laneRelativePattern } from "./glob.ts";
 import { displayPath, inCheckout, laneName, sameRepo } from "./project.ts";
 import type { Presence } from "./transport.ts";
 import { ago, elapsed, idMatches, shortId } from "./util.ts";
@@ -74,13 +74,15 @@ export function ownerOf(patterns: readonly string[], action: string, self: Prese
 	const team = peers.filter((p) => p.id !== self.id && sameRepo(p, self));
 	const claimants: Array<{ peer: Presence; pattern: string; lane: boolean }> = [];
 	for (const peer of team) {
-		const lane = peer.projectRoot !== self.projectRoot;
+		const otherCheckout = peer.projectRoot !== self.projectRoot;
+		// A claim outside the repository has one copy: it is in no lane, and compared as it is.
+		const outside = (c: { pattern: string; checkout?: string }) => !c.checkout && isOutsideClaim(c.pattern, peer.projectRoot);
 		const claim = peer.claims.find((c) => {
 			if (c.expiresAt <= now) return false;
-			const pattern = lane ? laneRelativePattern(c.pattern, peer.projectRoot) : c.pattern;
+			const pattern = otherCheckout && !outside(c) ? laneRelativePattern(c.pattern, peer.projectRoot) : c.pattern;
 			return pattern !== null && patterns.some((p) => claimsOverlap(p, pattern, self.projectRoot));
 		});
-		if (claim) claimants.push({ peer, pattern: claim.pattern, lane });
+		if (claim) claimants.push({ peer, pattern: claim.pattern, lane: otherCheckout && !outside(claim) });
 	}
 	const local = claimants.filter((c) => !c.lane);
 	const pool = local.length > 0 ? local : claimants;
@@ -95,10 +97,12 @@ export function ownerOf(patterns: readonly string[], action: string, self: Prese
 		};
 	}
 	const inside = patterns.map((p) => claimMatcher(p, self.projectRoot));
+	// Paths outside the repository are one file for everyone, matched as they are.
+	const outsideOnes = patterns.filter((p) => isOutsideClaim(p, self.projectRoot)).map((p) => claimMatcher(p, self.projectRoot));
 	let latest: { peer: Presence; path: string; at: number } | null = null;
 	for (const peer of team) {
 		for (const r of peer.recent) {
-			const mine = inCheckout(r.path, peer.projectRoot, self.projectRoot);
+			const mine = inCheckout(r.path, peer.projectRoot, self.projectRoot) ?? (outsideOnes.some((match) => match(r.path)) ? r.path : null);
 			if (mine && inside.some((match) => match(mine)) && (!latest || r.at > latest.at)) latest = { peer, path: mine, at: r.at };
 		}
 	}
@@ -116,24 +120,22 @@ export function targetName(target: Target & { ok: true }): string {
 	return target.via ? `${target.peer.callsign}, which ${target.via}` : target.peer.callsign;
 }
 
-/**
- * How a message is sent, for `stateHint`: `deferred`, with `interrupt: false`; `blockingAsk`, an
- * ask whose sender waits for the answer (only that one can time out while the peer is busy).
- */
-export type HintFor = { deferred?: boolean; blockingAsk?: boolean };
+/** How a message is sent, for `stateHint`: `deferred`, with `interrupt: false`. */
+export type HintFor = { deferred?: boolean };
 
 /** When a message to `peer` reaches its model, as its sender is told. */
 export function stateHint(peer: Presence, self: Presence, peers: readonly Presence[], how: HintFor = {}): string {
-	const { deferred = false, blockingAsk = false } = how;
+	const { deferred = false } = how;
 	if (Date.now() - peer.heartbeatAt > UNRESPONSIVE_MS) {
 		return `unresponsive since ${ago(peer.heartbeatAt)} — it waits in their inbox until they are back`;
 	}
 	if (peer.state === "busy") {
 		// `interrupt: false`: held by the recipient's runtime, whatever it is inside of.
 		if (deferred) return `busy — it reaches them when their current run ends${owedHint(peer)}`;
+		// Only an older telecom blocks in an ask (`ledger.ts`).
 		if (peer.waitingOn?.length) {
 			const on = peer.waitingOn.map((id) => (id === self.id ? "you" : (peers.find((p) => p.id === id)?.callsign ?? shortId(id))));
-			if (on.includes("you")) return `busy waiting on your answer — an ask from you reaches it now (a wait cycle), anything else after you answer`;
+			if (on.includes("you")) return `busy waiting on your answer — it reads this after you answer`;
 			return `busy waiting on ${on.join(", ")}${peer.waitingSince ? ` (asked ${ago(peer.waitingSince)})` : ""} — it reads this when that wait ends`;
 		}
 		// A session waiting on a foreground subagent is inside one long tool call: nothing
@@ -141,15 +143,10 @@ export function stateHint(peer: Presence, self: Presence, peers: readonly Presen
 		if (blockedOnMe(self, peer, peers)) return "busy waiting for your run to end — it reads this after you finish";
 		const child = peers.find((c) => c.state === "busy" && isForegroundChild(c, peer));
 		if (child) return `busy waiting on its subagent ${child.callsign} — it reads this when that run ends`;
-		// One long call (a test suite, a build, a subagent): nothing reaches its model until it ends,
-		// and an ask that waits for it may time out first. Only a blocking ask is told so: on a
-		// message or a `wait: false` ask the advice was noise, and read as a correction.
+		// One long call (a test suite, a build, a subagent): nothing reaches its model until it ends.
 		const step = peer.step;
 		if (step && Date.now() - step.since >= LONG_STEP_MS) {
-			const advice = blockingAsk
-				? `. This ask may time out before then; telecom({ action: "ask", to: "${peer.callsign}", message: "…", wait: false }) returns at once`
-				: "";
-			return `busy in ${step.tool} for ${elapsed(step.since)} — it reads this when that call ends${advice}${owedHint(peer)}`;
+			return `busy in ${step.tool} for ${elapsed(step.since)} — it reads this when that call ends${owedHint(peer)}`;
 		}
 		return `busy — it reaches them before their next step${owedHint(peer)}`;
 	}

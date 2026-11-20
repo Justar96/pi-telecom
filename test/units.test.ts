@@ -8,7 +8,7 @@ import { childCallsign, mustYield, pickCallsign, reclaimable } from "../src/call
 import { readConfig } from "../src/config.ts";
 import { detectLineage, lineOf, sessionIdOfFile } from "../src/family.ts";
 import { claimsOverlap, laneRelativePattern, matchesClaim } from "../src/glob.ts";
-import { closesCycle, createAskLedger, WAITS_CAP, type WaitNode, waitedOn } from "../src/ledger.ts";
+import { createAskLedger } from "../src/ledger.ts";
 import { canonicalPath, displayPath, findProjectRoot, findRepo, inCheckout, laneName, readBranch, sameRepo } from "../src/project.ts";
 import { HangingText } from "../src/render.ts";
 import { idMatches, shortId } from "../src/util.ts";
@@ -139,10 +139,10 @@ test("project: git root, branch, canonical and display paths", () => {
 test("config: defaults and validation", () => {
 	const cfg = readConfig({});
 	assert.equal(cfg.guard, "standard");
-	assert.equal(cfg.askTimeoutMs, 300_000);
+	assert.equal(cfg.askTimeoutMs, 1_800_000);
 	assert.equal(readConfig({ PI_TELECOM_GUARD: "STRICT" }).guard, "strict");
 	assert.equal(readConfig({ PI_TELECOM_GUARD: "nonsense" }).guard, "standard");
-	assert.equal(readConfig({ PI_TELECOM_ASK_TIMEOUT_MS: "-5" }).askTimeoutMs, 300_000);
+	assert.equal(readConfig({ PI_TELECOM_ASK_TIMEOUT_MS: "-5" }).askTimeoutMs, 1_800_000);
 	assert.equal(readConfig({ PI_TELECOM_CALLSIGN: "Bad Name!" }).callsign, undefined);
 	assert.equal(readConfig({ PI_TELECOM_CALLSIGN: "Ops" }).callsign, "ops");
 	assert.equal(readConfig({ PI_TELECOM_DISABLE: "1" }).disabled, true);
@@ -192,36 +192,28 @@ test("transport: root safety, delivery order, validation, sweep of dead sessions
 	assert.ok(!big.ok);
 });
 
-test("ledger: answer, timeout, interruption, peer gone, late replies", async () => {
+test("ledger: an open ask is answered once, expires, or ends with its peer; a late answer still names it", () => {
 	const ledger = createAskLedger();
 	const meta = { to: "peer", toCallsign: "bravo", text: "q?" };
-	const answered = ledger.awaitAnswer("a1", meta, 10_000);
-	assert.ok(ledger.settle("a1", "yes", "bravo", "peer"));
-	assert.deepEqual(await answered, { ok: true, text: "yes", fromCallsign: "bravo", held: [] });
+	ledger.track("a1", meta, 10_000);
+	assert.equal(ledger.answered("a1", "someone-else"), null, "only whom it went to answers it");
+	assert.deepEqual(ledger.answered("a1", "peer"), meta);
+	assert.equal(ledger.answered("a1", "peer"), null, "a second answer is a plain reply");
 
-	const timed = ledger.awaitAnswer("a2", meta, 1);
-	await new Promise((r) => setTimeout(r, 5));
-	ledger.expire(Date.now());
-	const t = await timed;
-	assert.ok(!t.ok && /did not answer/.test(t.reason));
-	assert.deepEqual(ledger.wasAbandoned("a2", "peer"), { to: "peer", toCallsign: "bravo", text: "q?" });
+	ledger.track("a2", meta, 1);
+	assert.deepEqual(ledger.expire(Date.now() + 5).map((e) => e.id), ["a2"]);
+	assert.deepEqual(ledger.expire(Date.now() + 5), [], "told once");
+	assert.deepEqual(ledger.answered("a2", "peer"), meta, "a late answer still names it");
 
-	const interrupted = ledger.awaitAnswer("a3", meta, 10_000);
-	ledger.interruptAll({ id: "in1", from: "peer", fromCallsign: "bravo", text: "and you?", at: 1, reminded: false });
-	const i = await interrupted;
-	assert.ok(!i.ok && i.interruptedBy?.id === "in1");
-
-	const gone = ledger.awaitAnswer("a4", meta, 10_000);
-	ledger.failPeerGone((id) => id === "peer");
-	const g = await gone;
-	assert.ok(!g.ok && /ended/.test(g.reason));
-
-	const controller = new AbortController();
-	const aborted = ledger.awaitAnswer("a5", meta, 10_000, controller.signal);
-	controller.abort();
-	const a = await aborted;
-	assert.ok(!a.ok && /aborted/.test(a.reason));
-	assert.equal(ledger.outboundCount(), 0);
+	ledger.track("a3", meta, 10_000);
+	assert.deepEqual(ledger.failPeerGone((id) => id === "peer").map((e) => e.id), ["a3"]);
+	ledger.track("a4", meta, 10_000);
+	assert.deepEqual(ledger.abandonAll(), [{ id: "a4", to: "peer" }]);
+	assert.deepEqual(ledger.asyncOpen(), []);
+	// Over the cap the oldest open ask ends, and its answer still names it.
+	for (let i = 0; i < 100; i++) ledger.track(`f${i}`, meta, 10_000);
+	assert.ok(ledger.asyncOpen().length < 100, "bounded");
+	assert.deepEqual(ledger.answered("f0", "peer"), meta);
 });
 
 test("ledger: a flood of inbound asks stays bounded, the oldest giving way", () => {
@@ -465,33 +457,6 @@ test("transport: repo and parent travel optionally; a silent subagent is gone th
 	assert.deepEqual(contested?.data, { path: "/x/a.ts", pattern: "src/**", lane: true });
 });
 
-test("ledger: an inbound ask interrupts a wait only when it closes a wait cycle", () => {
-	const node = (id: string, waitingOn: string[] | undefined, extra: Partial<WaitNode> = {}): WaitNode => ({
-		id, pid: 1, state: "busy", ...(waitingOn ? { waitingOn } : {}), ...extra,
-	});
-	// a waits on b; c asks a. b still answers a, and c's ask waits its turn.
-	const queue = [node("a", ["b"]), node("b", []), node("c", ["a"])];
-	assert.equal(closesCycle("c", node("a", ["b"]), queue), false);
-	// a and b ask each other: a cycle of two.
-	assert.equal(closesCycle("b", node("a", ["b"]), [node("a", ["b"]), node("b", ["a"])]), true);
-	// a → b → c, then c asks a: a cycle of three, seen through b's record.
-	const ring = [node("a", ["b"]), node("b", ["c"]), node("c", ["a"])];
-	assert.equal(closesCycle("c", node("a", ["b"]), ring), true);
-	// The asker already stopped waiting on us (it was interrupted itself): our wait goes on.
-	assert.equal(closesCycle("b", node("a", ["b"]), [node("a", ["b"]), node("b", [])]), false);
-	// a waits on its busy foreground subagent a-1 (same process), which waits on c; c asks a.
-	const family = [node("a", []), node("a-1", ["c"], { parent: "a" }), node("c", ["a"], { pid: 2 })];
-	assert.equal(closesCycle("c", node("a", []), family), true);
-	assert.equal(closesCycle("c", node("a", []), family.map((n) => (n.id === "a-1" ? { ...n, state: "idle" as const } : n))), false);
-	// An older telecom on the way publishes no waits: unknown, so the caller interrupts as before.
-	assert.equal(closesCycle("c", node("a", ["b"]), [node("a", ["b"]), node("b", undefined), node("c", ["a"])]), null);
-	// Hostile records cannot make the walk loop forever.
-	const loop = [node("a", ["b"]), node("b", ["d"]), node("d", ["b"]), node("c", ["a"])];
-	assert.equal(closesCycle("c", node("a", ["b"]), loop), false);
-	assert.deepEqual([...waitedOn(node("a", ["b"]), loop)].sort(), ["b", "d"]);
-	assert.deepEqual([...waitedOn(node("a", []), family)].sort(), ["a-1", "c"], "through a busy foreground subagent");
-});
-
 test("family: only the runner process itself hosts background subagents; processes it starts do not", () => {
 	const env = (runner?: string) => ({
 		PI_SUBAGENT_CHILD: "1",
@@ -502,35 +467,6 @@ test("family: only the runner process itself hosts background subagents; process
 	assert.deepEqual(detectLineage({ ...base, env: env("4242") }), { role: "child", parent: "root-session-1" });
 	assert.deepEqual(detectLineage({ ...base, env: env("1001") }), { role: "main" }, "a pi or test suite run from a child's bash inherits the variables");
 	assert.deepEqual(detectLineage({ ...base, env: env() }), { role: "child", parent: "root-session-1" }, "a runner from before the pid variable");
-});
-
-test("ledger: a wait list at the cap may have been cut, so it never proves there is no cycle", () => {
-	const node = (id: string, waitingOn: string[]): WaitNode => ({ id, pid: 1, state: "busy", waitingOn });
-	const others = Array.from({ length: WAITS_CAP }, (_, i) => `other-${i}`);
-	// b waits on a; a waits on b too, but as its ninth wait, cut from its published record.
-	assert.equal(closesCycle("a", node("b", ["a"]), [node("a", others), node("b", ["a"])]), true);
-	// A node on the way at the cap: the edge to the asker may be the one that was cut.
-	assert.equal(closesCycle("c", node("a", ["x"]), [node("x", others), node("c", ["a"])]), null);
-	assert.equal(closesCycle("c", node("a", ["x"]), [node("x", others.slice(1)), node("c", ["a"])]), false);
-});
-
-test("ledger: a known cycle wins over an unknown branch, regardless of peer order", () => {
-	const start: WaitNode = { id: "a", pid: 1, state: "busy", waitingOn: ["old", "b"] };
-	const peers: WaitNode[] = [
-		{ id: "old", pid: 2, state: "busy" },
-		{ id: "b", pid: 3, state: "busy", waitingOn: ["c"] },
-		{ id: "c", pid: 4, state: "busy", waitingOn: ["a"] },
-	];
-	assert.equal(closesCycle("c", start, peers), true);
-	assert.equal(closesCycle("c", { ...start, waitingOn: ["b", "old"] }, peers), true);
-});
-
-test("ledger: an unfinished depth-limited search cannot prove there is no cycle", () => {
-	const chain: WaitNode[] = Array.from({ length: 40 }, (_, i) => ({
-		id: `n${i}`, pid: i + 1, state: "busy", waitingOn: [i === 39 ? "asker" : `n${i + 1}`],
-	}));
-	chain.push({ id: "asker", pid: 100, state: "busy", waitingOn: ["n0"] });
-	assert.equal(closesCycle("asker", chain[0] as WaitNode, chain), null);
 });
 
 test("transport: explicit task wakes are accepted only on human direct messages", () => {

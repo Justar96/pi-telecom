@@ -22,8 +22,8 @@
  */
 import { join } from "node:path";
 import type { GuardMode } from "./config.ts";
-import { claimShown, coversCheckout, matchesClaim } from "./glob.ts";
-import { displayPath, laneIn, laneName, type Place, type PlaceCache, placeOf, sameRepo, workingCheckout } from "./project.ts";
+import { absolutePattern, claimShown, coversCheckout, isOutsideClaim, matchesClaim } from "./glob.ts";
+import { displayPath, isWithin, laneIn, laneName, type Place, type PlaceCache, placeOf, sameRepo, workingCheckout } from "./project.ts";
 import type { Claim, Presence } from "./transport.ts";
 import { ago, fileFingerprint, pairKey, setBounded } from "./util.ts";
 
@@ -355,8 +355,9 @@ export class Awareness {
 	): Verdict {
 		if (mode === "off") return { action: "allow" };
 		const now = Date.now();
+		// A path outside the repository has one copy for everyone: claims made there bind wherever
+		// their owners work, and only they cover it.
 		const mine = this.placeOf(path, self);
-		if (!mine) return { action: "allow" };
 		// Advisory matches are kept aside while the scan goes on: a binding claim further down the
 		// list (a responsive owner in this checkout) must still hold the edit back.
 		let lane: { peer: Presence; claim: Claim; what: string } | null = null;
@@ -368,14 +369,22 @@ export class Awareness {
 			// checkout binds only there. Any other binds when it names this very file, or when its owner
 			// works in the checkout this file lies in (its recent edits landed there): then both agents
 			// change one copy. Otherwise the copies are separate: advisory.
-			const sharedCheckout = this.checkoutsOf(peer).has(mine.checkout);
+			const sharedCheckout = mine ? this.checkoutsOf(peer).has(mine.checkout) : true;
 			for (const claim of peer.claims) {
 				if (claim.expiresAt <= now) continue;
 				const root = claim.checkout ?? peer.projectRoot;
 				const exact = matchesClaim(path, claim.pattern, root);
-				if (!exact && !matchesClaim(join(root, mine.rel), claim.pattern, root)) continue;
-				const otherLane = claim.checkout ? claim.checkout !== mine.checkout : !exact && !sharedCheckout;
-				const shown = displayPath(path, mine.checkout);
+				const outsideClaim = !claim.checkout && isOutsideClaim(claim.pattern, root);
+				if (!mine) {
+					if (!exact || !outsideClaim) continue;
+				} else if (outsideClaim) {
+					// A claim outside its owner's checkout governs a checkout's files only when it lies
+					// inside that checkout (an older telecom's absolute claim into it): one over a folder
+					// holding a worktree, or a forged `/`, must not hold back work in it.
+					if (!exact || !isWithin(absolutePattern(claim.pattern, root), mine.checkout)) continue;
+				} else if (!exact && !matchesClaim(join(root, mine.rel), claim.pattern, root)) continue;
+				const otherLane = !mine ? false : claim.checkout ? claim.checkout !== mine.checkout : !exact && !sharedCheckout;
+				const shown = mine ? displayPath(path, mine.checkout) : path;
 				const what = `${shown} is inside ${peer.callsign}'s claim "${claimShown(claim)}"${
 					claim.note ? ` (${claim.note})` : ""
 				}, held since ${ago(claim.since)}`;

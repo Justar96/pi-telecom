@@ -12,6 +12,7 @@ import type { Theme, ThemeColor, ToolDefinition } from "@earendil-works/pi-codin
 import type { Component } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
 import { CALLSIGN_PATTERN } from "./callsign.ts";
+import { MAX_ASK_TIMEOUT_MS } from "./config.ts";
 import { type RenderContext, renderContext } from "./host.ts";
 import {
 	agentColor,
@@ -19,7 +20,6 @@ import {
 	callsignText,
 	dimCalls,
 	HangingText,
-	isHint,
 	moreLines,
 	paintCallsigns,
 	plainText,
@@ -56,15 +56,14 @@ const TOOL_PARAMETERS = Type.Object({
 		}),
 	),
 	interrupt: Type.Optional(Type.Boolean({ description: "send: false holds it until the recipient's current run ends (progress updates, FYIs); default true." })),
-	timeoutSec: Type.Optional(Type.Number({ description: "ask: seconds to wait (default 300; with wait false, 1800)." })),
-	wait: Type.Optional(Type.Boolean({ description: "ask: false returns at once; the answer arrives later as a message." })),
+	timeoutSec: Type.Optional(Type.Number({ description: "ask: seconds until you are told no answer came (default 1800)." })),
 	queue: Type.Optional(Type.Boolean({ description: "claim: false refuses a held @lock instead of waiting in line for it (default: wait; you get it, and are woken, when it frees)." })),
 	pid: Type.Optional(
 		Type.Integer({ description: "claim: keep these claims while this process runs (a background build or test); released when it exits. For the next job, claim again with its pid." }),
 	),
 	waitingFor: Type.Optional(
 		Type.Array(Type.String(), {
-			description: "status: callsigns you are blocked on; you are woken when one finishes a run or leaves. Declare once: it ends by itself when you get to work after hearing from them; [] clears it.",
+			description: "status: callsigns you are blocked on; you are woken when one finishes a run or leaves. Declare once: it lasts until they send a message marked unblocks, or [] clears it.",
 		}),
 	),
 	unblocks: Type.Optional(Type.Boolean({ description: "send/reply: true when this is what the recipient waits for; it ends their wait on you at once." })),
@@ -110,17 +109,17 @@ export const TOOL_SPEC = {
 	description: [
 		"Coordinate with other pi agents working in parallel (this project by default). Agents have callsigns: alpha, bravo, ….",
 		"board: who works here, on what, their claims and recent changes (scope machine: all projects).",
-		"send: message an agent (to = callsign, or paths = whoever owns them); wakes it if idle. ask: same, then wait for the answer (wait false: don't). reply: answer an inbound ask (askId).",
+		"send: message an agent (to = callsign, or paths = whoever owns them); wakes it if idle. ask: same, expecting an answer, which arrives as a message and wakes you. reply: answer an inbound ask (askId).",
 		"broadcast: tell the whole project (never wakes idle agents); with paths, agents working elsewhere get it at their next prompt. status: set the task peers see (message), and whom you wait for (waitingFor).",
 		'claim: reserve paths/globs so peers stay out (message = why); "@name" (e.g. "@cargo") is a lock on a shared non-file resource. release: give them back (all if paths omitted).',
 		"log: what the team did earlier — broadcasts, tasks, claims, joins (paths: only entries about them).",
 	].join("\n"),
 	promptSnippet: "Coordinate with parallel pi agents: team board, message/ask/reply, broadcast, claim paths",
 	promptGuidelines: [
-		"When 📡 telecom shows other agents in this project: claim an area before a large change and release it after; re-read a file a peer changed before editing it; reply to a peer's ask promptly (they are blocked).",
+		"When 📡 telecom shows other agents in this project: claim an area before a large change and release it after; re-read a file a peer changed before editing it; reply to a peer's ask promptly (they count on it).",
 		"Message peers only for real coordination (requests, handoffs, shared-interface changes) — no acknowledgements; each message costs the recipient a turn.",
 		"Broadcast only what every agent must act on, with `paths` when it is about files. Keep `status` to one line naming your task; `send` results and requests to whoever needs them, and progress updates and FYIs with `interrupt: false`.",
-		"To hear when a peer's long job ends, ask with `wait: false` (the answer arrives as a message and wakes you), not a long `timeoutSec` or a polling loop.",
+		"To hear when a peer's long job ends, ask them to tell you (the answer wakes you), not a polling loop.",
 		'Take turns on a shared resource (build, test runner, port) with a lock claim such as "@cargo" (a held one puts you in line, and you are woken when it is yours), and say whom you wait for with status waitingFor, instead of negotiating leases in messages.',
 	],
 	parameters: TOOL_PARAMETERS,
@@ -175,7 +174,7 @@ export const TOOL_SPEC = {
 			const paintLine = (l: string) => dimCalls(theme, l, (t) => paintCallsigns(theme, t, names, (x) => theme.fg("error", x)));
 			lines = reason.map((l, i) => (i === 0 ? `${theme.fg("error", "✗")} ${paintLine(l)}` : `  ${paintLine(l)}`));
 		} else {
-			lines = resultLines(context.args?.action, text, details, names, theme)
+			lines = resultLines(context.args?.action, text, names, theme)
 				.filter((l) => expanded || !l.quiet)
 				.map((l) => l.text);
 		}
@@ -241,8 +240,7 @@ function callHeader(args: Partial<ToolParams>, theme: Theme): string {
 		case "ask":
 			if (who) head += arrow + who;
 			else if (paths.length) head += `${arrow}${muted("whoever owns ")}${pathList}`;
-			if (action === "ask" && args.wait === false) head += muted(" · does not wait");
-			else if (action === "ask" && args.timeoutSec) head += muted(` · waits up to ${args.timeoutSec}s`);
+			if (action === "ask" && args.timeoutSec && args.timeoutSec > 0) head += muted(` · open ${Math.round(Math.min(args.timeoutSec, MAX_ASK_TIMEOUT_MS / 1000))}s`);
 			break;
 		case "reply":
 			if (who) head += arrow + who;
@@ -305,7 +303,6 @@ function claimRow(line: string, theme: Theme, say: (t: string) => string, muted:
 function resultLines(
 	action: string | undefined,
 	text: string,
-	details: Record<string, unknown>,
 	names: readonly string[],
 	theme: Theme,
 ): Row[] {
@@ -328,26 +325,10 @@ function resultLines(
 			return [{ text: head }, ...quiet(rest)];
 		}
 		case "ask": {
-			if (details.interrupted === true) {
-				const [why = "", ...more] = text.split("\n\n");
-				return [
-					{ text: `${theme.fg("warning", "⚠")} ${theme.fg("warning", why)}` },
-					...more
-						.join("\n\n")
-						.split("\n")
-						.map((l) => (isHint(l) ? { text: theme.fg("dim", l), quiet: true } : { text: say(l) })),
-				];
-			}
-			// "asked bravo (…) — ask-…": what happened, then the model's guidance, quieter.
-			if (details.async === true) {
-				const [what, handle] = splitOnce(first, " — handle ");
-				return [{ text: `${tick} ${say(what)}${handle ? theme.fg("dim", ` · ${handle}`) : ""}` }, ...quiet(rest)];
-			}
-			// "alpha answered:\n\n<the answer>": the answer is what the human wants to read, and
-			// the peer wrote it as Markdown.
-			const answer = rest.join("\n").replace(/^\n+/, "").split("\n");
-			const prose = proseStyler(theme, names);
-			return [{ text: `${tick} ${say(first.replace(/:$/, ""))}` }, ...answer.map((l) => (isHint(l) ? { text: theme.fg("dim", l), quiet: true } : { text: prose(l) }))];
+			// "asked bravo (…) — handle ask-…": what happened, then the model's guidance, quieter.
+			// The answer arrives later, as a reply message (`render.ts`).
+			const [what, handle] = splitOnce(first, " — handle ");
+			return [{ text: `${tick} ${say(what)}${handle ? theme.fg("dim", ` · ${handle}`) : ""}` }, ...quiet(rest)];
 		}
 		case "claim":
 			return text.split("\n").flatMap((l) => claimRow(l, theme, say, muted));

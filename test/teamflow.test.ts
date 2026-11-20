@@ -61,7 +61,7 @@ test("reply: `to` picks that teammate's ask, and with none open goes as a messag
 	const a = await session(proj);
 	const b = await session(proj);
 	const c = await session(proj);
-	const asked = await c.tool({ action: "ask", to: "alpha", message: "is the gate green?", wait: false });
+	const asked = await c.tool({ action: "ask", to: "alpha", message: "is the gate green?" });
 	assert.ok(!asked.isError, asked.text);
 	await eventually(() => assert.equal(a.sentOf("telecom-ask").length, 1));
 	// alpha means bravo: before, the one open ask (charlie's) took the answer.
@@ -149,25 +149,6 @@ test("wire: a message's group is peer data — callsigns only, capped, and only 
 	assert.equal(parseEnvelope({ ...base, kind: "message", group: ["bravo"] })?.group, undefined, "a group of one is a plain message");
 	assert.equal(parseEnvelope({ ...base, kind: "broadcast", group: ["bravo", "charlie"] })?.group, undefined);
 	assert.equal(parseEnvelope({ ...base, kind: "message", group: "bravo, charlie" })?.group, undefined);
-});
-
-test("waits: a wait that ends by itself says so, briefly, with the task when it still reads as waiting", async () => {
-	const proj = makeProject("p-flow-wait-ended");
-	writeFileSync(join(proj, "notes.md"), "n\n");
-	const a = await session(proj);
-	const b = await session(proj);
-	const c = await session(proj);
-	await a.tool({ action: "status", message: "waiting for golf's verdict", waitingFor: ["bravo", "charlie"] });
-	await b.tool({ action: "send", to: "alpha", message: "verdict: not cleared, fix B1" });
-	await eventually(() => assert.equal(a.sentOf("telecom-message").length, 1));
-	await a.read("notes.md");
-	await a.edit("notes.md", "n", "fixing B1");
-	await eventually(() => assert.deepEqual(published(a)?.blockedOn, [c.id]));
-	await eventually(() => assert.ok(a.sentOf("telecom-message").some((m) => /Your wait on bravo ended/.test(m.content))));
-	const told = a.sentOf("telecom-message").find((m) => /Your wait on bravo ended/.test(m.content));
-	assert.match(told?.content ?? "", /You still wait for charlie\. Your task still says "waiting for golf's verdict": update it when it changes\.$/);
-	assert.doesNotMatch(told?.content ?? "", /telecom\(/, "no ready-made call to wait again");
-	assert.equal(told?.options, undefined, "information: no turn of its own");
 });
 
 test("waits: a run that ended with a message to the waiter wakes it once, with the message", async () => {

@@ -46,7 +46,9 @@ export const ENV = {
 	heartbeatMs: "PI_TELECOM_HEARTBEAT_MS",
 } as const;
 
-const DEFAULT_ASK_TIMEOUT_MS = 5 * 60_000;
+/** How long an ask stays open before its asker is told no answer came. Nothing blocks on it, and
+ *  it is meant for "tell me when your job is done": peers' jobs run for tens of minutes. */
+const DEFAULT_ASK_TIMEOUT_MS = 30 * 60_000;
 export const MAX_ASK_TIMEOUT_MS = 60 * 60_000;
 const DEFAULT_MAX_WAKES = 6;
 const DEFAULT_CLAIM_TTL_MIN = 120;
