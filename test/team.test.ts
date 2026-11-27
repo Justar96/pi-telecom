@@ -3,8 +3,8 @@
  * files on disk. Each scenario uses its own project directory so they cannot see each other.
  */
 import assert from "node:assert/strict";
-import { chmodSync, closeSync, constants, mkdirSync, openSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { chmodSync, closeSync, constants, mkdirSync, openSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { join, sep } from "node:path";
 import { afterEach, test } from "node:test";
 import { findProjectRoot, findRepo } from "../src/project.ts";
 import { openTransport, processStartTicks, WIRE_VERSION } from "../src/transport.ts";
@@ -1475,9 +1475,12 @@ test("claims outside the repository: through a symlink or `~`, a claim guards th
 	symlinkSync(real, link);
 	const a = await session(proj);
 	const b = await session(proj);
+	// A claim names its file as stored: the real path (on Windows, with long folder names, not a
+	// temp folder's 8.3 short name), with `/` as claim patterns separate folders on every platform.
+	const asClaimed = (path: string) => realpathSync.native(path).split(sep).join("/");
 	const viaLink = await a.tool({ action: "claim", paths: [join(link, "TEAM.md")] });
 	assert.ok(!viaLink.isError, viaLink.text);
-	assert.match(viaLink.text, new RegExp(`^claimed ${escapeRegExp(join(real, "TEAM.md"))}`), "stored as the real path");
+	assert.match(viaLink.text, new RegExp(`^claimed ${escapeRegExp(asClaimed(join(real, "TEAM.md")))}`), "stored as the real path");
 	await b.read(join(link, "TEAM.md"));
 	assert.match((await b.edit(join(link, "TEAM.md"), "plan", "x")).blocked ?? "", /inside alpha's claim/);
 	assert.match((await a.tool({ action: "release", paths: [join(real, "TEAM.md")] })).text, /^released /);
@@ -1488,7 +1491,7 @@ test("claims outside the repository: through a symlink or `~`, a claim guards th
 	withEnv(t, "HOME", home);
 	withEnv(t, "USERPROFILE", home);
 	const tilde = await a.tool({ action: "claim", paths: ["~/playground/PLAN.md"] });
-	assert.match(tilde.text, new RegExp(`^claimed ${escapeRegExp(join(home, "playground", "PLAN.md"))}`));
+	assert.match(tilde.text, new RegExp(`^claimed ${escapeRegExp(asClaimed(join(home, "playground", "PLAN.md")))}`));
 	await b.read(join(home, "playground", "PLAN.md"));
 	assert.match((await b.edit(join(home, "playground", "PLAN.md"), "plan", "x")).blocked ?? "", /inside alpha's claim/);
 	assert.match((await a.tool({ action: "release", paths: ["~/playground/PLAN.md"] })).text, /^released /);
