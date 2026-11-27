@@ -6,6 +6,38 @@ All notable changes to `@justar_96/pi-telecom`. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **A shorter board.** Claims bound to one worktree name it once (`claims: in feature-x: a, b`)
+  instead of `(in feature-x)` after every path; a file changed in another worktree is named by
+  its folder; the agent's own block leaves out what it changed itself; and the lock list is headed
+  `Locks:` without re-explaining the line. On a live three-agent board this cut a quarter of the text.
+- A `send` to several says "Each sees who else got it" once per context, not on every send.
+- The transcript shows a `reply` without its ask handle until expanded; the result names the peer.
+
+### Fixed
+
+- **A claim tied to a process wakes its idle holder when the process exits.** The notice was
+  passive, so an idle holder slept on with its job finished until a teammate happened to message
+  it; in one six-agent team that left finished jobs unreported for over an hour in a day. The
+  exit notice now starts a turn, within the wake limit; a busy holder still gets it inside its
+  run. Processes ending together are one notice and one wake-up. A lock kept for a next job that
+  never came is released with a notice that wakes nobody: the exit already said so.
+- A lock or path claimed again without a `pid` keeps the process it was tied to only while that
+  process runs. After an exit it was kept anyway, so the result said "renewed for another
+  120 min" and the next heartbeat released it for the old exit two minutes later.
+  A renewal tied to a running process now says so (per path, when only some are), and a claim
+  whose process had already exited says that, since no notice will follow.
+- `ask` naming several agents (`to: "alpha, bravo"`) is refused with the call for each, and the
+  `send` for one message they all read, instead of "no live agent answers to \"alpha, bravo\". In
+  this project: alpha, bravo". Names are resolved as `send` resolves them: duplicates, the caller
+  and a stray comma fall away, so one agent left is simply asked; `send` takes `"bravo,"` too.
+- `reply` with the handle of the agent's own ask goes to that ask's peer as a message, instead
+  of being refused as an unknown inbound ask (or, with `to`, sent as an answer the peer was not
+  woken for). It works after a `/reload`, and a peer that left is named, not its session id.
+- The wake-limit note says "wake-ups", not "peer wake-ups": a finished job, a lock handed on
+  and news of an awaited teammate count toward the limit too.
+
 ## [0.9.0] - 2026-11-20
 
 ### Changed

@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
 import { openTransport, parseEnvelope, WIRE_VERSION } from "../src/transport.ts";
-import { eventually, makeProject, SCRATCH, Session, session, stopSessions, track } from "./harness.ts";
+import { eventually, makeProject, SCRATCH, Session, session, sleep, stopSessions, track } from "./harness.ts";
 
 afterEach(stopSessions);
 
@@ -153,4 +153,86 @@ test("wire: `async` is kept only on an ask, and only as true", () => {
 	assert.equal(parseEnvelope({ ...base, kind: "ask", async: "yes" })?.async, undefined);
 	assert.equal(parseEnvelope({ ...base, kind: "message", async: true })?.async, undefined);
 	assert.equal(parseEnvelope({ ...base, kind: "ask" })?.async, undefined, "an older peer's ask blocks, as before");
+});
+
+test("ask: naming several agents is refused with the call for each, and nothing is sent", async () => {
+	const proj = makeProject("p-ask-several");
+	const a = await session(proj);
+	const b = await session(proj);
+	const c = await session(proj);
+	await eventually(async () => assert.match((await a.tool({ action: "board" })).text, /charlie/));
+	const asked = await a.tool({ action: "ask", to: "bravo, charlie", message: "who reviewed PR1?" });
+	assert.equal(asked.isError, true);
+	assert.equal(
+		asked.text,
+		'telecom: an ask goes to one agent, and each answer comes back on its own handle. Nothing was sent. Ask each: telecom({ action: "ask", to: "bravo", message: "…" }), telecom({ action: "ask", to: "charlie", message: "…" }). For one message they all read: telecom({ action: "send", to: "bravo, charlie", message: "…" }).',
+	);
+	await sleep(200);
+	assert.equal(b.sentOf("telecom-ask").length + c.sentOf("telecom-ask").length, 0);
+});
+
+test("reply: the handle of an agent's own ask sends the text to whom the ask went, as a message", async () => {
+	const proj = makeProject("p-reply-own");
+	const a = await session(proj);
+	const b = await session(proj);
+	const asked = await a.tool({ action: "ask", to: "bravo", message: "review PR 12?" });
+	const askId = String(asked.details.askId);
+	await eventually(() => assert.equal(b.sentOf("telecom-ask").length, 1));
+	await b.tool({ action: "reply", askId: lastAskId(b), message: "one finding" });
+	await eventually(() => assert.equal(a.sentOf("telecom-reply").length, 1));
+	// The ask is answered; the asker uses its handle to tell bravo more.
+	const more = await a.tool({ action: "reply", askId, message: "fixed in the next commit" });
+	assert.equal(more.isError, false, more.text);
+	assert.match(more.text, new RegExp(`^"${askId}" is your own ask to bravo, so this went to them as a message: sent to bravo`));
+	await eventually(() => assert.ok(b.sentOf("telecom-message").some((m) => /fixed in the next commit/.test(m.content))));
+	assert.equal(b.sentOf("telecom-reply").length, 0, "not an answer to an ask bravo never made");
+});
+
+test("ask: several names are resolved as send resolves them: duplicates, the caller and a stray comma fall away", async () => {
+	const proj = makeProject("p-ask-several-names");
+	const a = await session(proj);
+	const b = await session(proj);
+	const c = await session(proj);
+	await eventually(async () => assert.match((await a.tool({ action: "board" })).text, /charlie/));
+	for (const to of ["bravo, bravo", "bravo,", "@bravo, Bravo", "bravo, alpha"]) {
+		const asked = await a.tool({ action: "ask", to, message: `one agent: ${to}` });
+		assert.equal(asked.isError, false, `${to}: ${asked.text}`);
+		assert.match(asked.text, /^asked bravo/);
+	}
+	const unknown = await a.tool({ action: "ask", to: "bravo, zulu", message: "x" });
+	assert.equal(unknown.isError, true);
+	assert.match(unknown.text, /no live agent answers to "zulu"[\s\S]*Nothing was sent\./);
+	await sleep(200);
+	assert.equal(b.sentOf("telecom-ask").length, 4);
+	assert.equal(c.sentOf("telecom-ask").length, 0);
+});
+
+test("reply: an own ask's handle with `to` naming its peer goes as a message too; a peer that left is named, not its id", async () => {
+	const proj = makeProject("p-reply-own-to");
+	const a = await session(proj);
+	const b = await session(proj);
+	const askId = String((await a.tool({ action: "ask", to: "bravo", message: "review PR 12?" })).details.askId);
+	const more = await a.tool({ action: "reply", askId, to: "bravo", message: "the head moved" });
+	assert.match(more.text, new RegExp(`^"${askId}" is your own ask to bravo, so this went to them as a message`));
+	await eventually(() => assert.ok(b.sentOf("telecom-message").some((m) => /the head moved/.test(m.content))));
+	await b.stop();
+	await eventually(async () => assert.doesNotMatch((await a.tool({ action: "board" })).text, /bravo/), 5_000);
+	const gone = await a.tool({ action: "reply", askId, message: "still there?" });
+	assert.equal(gone.isError, true);
+	assert.equal(gone.text, `telecom: "${askId}" is your own ask to bravo, who is gone — their session ended, so nothing was sent. telecom({ action: "board" }) shows who is here.`);
+});
+
+test("reply: an own ask's handle still reaches its peer after a /reload", async () => {
+	const proj = makeProject("p-reply-own-reload");
+	const a = await session(proj);
+	const b = await session(proj);
+	const askId = String((await a.tool({ action: "ask", to: "bravo", message: "review PR 12?" })).details.askId);
+	await eventually(() => assert.equal(b.sentOf("telecom-ask").length, 1));
+	await b.tool({ action: "reply", askId: lastAskId(b), message: "done" });
+	await eventually(() => assert.equal(a.sentOf("telecom-reply").length, 1));
+	await a.stop("reload");
+	const replacement = track(await new Session(proj, { id: a.id }).start("reload"));
+	const more = await replacement.tool({ action: "reply", askId, message: "thanks, merged" });
+	assert.equal(more.isError, false, more.text);
+	await eventually(() => assert.ok(b.sentOf("telecom-message").some((m) => /thanks, merged/.test(m.content))));
 });

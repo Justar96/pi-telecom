@@ -219,9 +219,9 @@ owners, coupled boundaries, durability limits and regression tests. Use it when 
 
   | mode | used for | when busy | when idle |
   |---|---|---|---|
-  | `wake` | direct messages, answers to this agent's asks, a lock handed to a waiter, news of a teammate the agent declared it waits for (its run ended, it left, it stalled), a wait cycle whose members all stalled | steered in | starts a turn (wake-limited) |
+  | `wake` | direct messages, answers to this agent's asks, a lock handed to a waiter, news of a teammate the agent declared it waits for (its run ended, it left, it stalled), a wait cycle whose members all stalled, the exit of a process a claim is tied to (one notice per heartbeat) | steered in | starts a turn (wake-limited) |
   | `wake-always` | asks and explicit human team tasks | steered in | starts a turn |
-  | `passive` | notices, broadcasts, claim news, claims released because their process exited, mid-run team updates (joins/departures), an ask that expired or whose peer left, an answer to no ask this agent knows | steered in | appended, no turn |
+  | `passive` | notices, broadcasts, claim news, a lock released when its grace after an exit ran out, mid-run team updates (joins/departures), an ask that expired or whose peer left, an answer to no ask this agent knows | steered in | appended, no turn |
   | `later` | broadcasts about paths away from this agent's work | held by the runtime for the next run | held by the runtime for the next run |
   | deferred | a direct message sent with `interrupt: false` | held to the end of the run (`agent_before_settle` entries, `continue: true`), or `wake` at `agent_settled` | delivered as `wake` |
 
@@ -359,7 +359,9 @@ Each rule has a test or an e2e check. Read the reason before bending a rule.
    tasks use `wake-always`. A new passive kind must use `passive`. A lock handed to a waiter, the
    answer to an ask, and news about a teammate an agent declared it waits for use
    `wake`: the agent asked for exactly that signal, like an ask's answer. So does a wait cycle
-   whose members have all stalled: nobody on it moves otherwise.
+   whose members have all stalled: nobody on it moves otherwise. So does the exit of a process a
+   claim is tied to (`pid`): the holder acts on the job's end, and asleep it left finished jobs
+   unreported for up to an hour.
 9. **Every refusal says what happened and what to do next,** including the exact
    `telecom({ ... })` call when one helps. Models follow these literally; the live tests show it.
    A successful result says what happened and what the agent cannot know; how a mechanism works

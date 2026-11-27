@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
-import { renderBrief, TASK_ONLY_HOLD_MS } from "../src/board.ts";
+import { renderBoard, renderBrief, TASK_ONLY_HOLD_MS } from "../src/board.ts";
 import { childCallsign, mustYield, pickCallsign, reclaimable } from "../src/callsign.ts";
 import { readConfig } from "../src/config.ts";
 import { detectLineage, lineOf, sessionIdOfFile } from "../src/family.ts";
@@ -515,4 +515,24 @@ test("briefs: a move to another worktree is held like a task change, a move back
 	assert.equal(held.text, null, "right after a brief, a move alone waits");
 	assert.match(renderBrief(me, [me, moved], { ...held.state, toldAt: old }).text ?? "", /bravo now works on lane in worktree /);
 	assert.equal(renderBrief(me, [me, stayed], { ...held.state, toldAt: old }).text, null, "back where it was told: nothing to tell");
+});
+
+test("board: claims bound to one worktree name it once, the agent's own block leaves out its changes, and locks carry no explanation", () => {
+	const now = Date.now();
+	const base = { v: 1, pid: 1, ticks: null, role: "main", state: "idle", startedAt: now, heartbeatAt: now, waitingOn: [] } as const;
+	const root = "/work/repo";
+	const wt = "/work/worktrees/feature-x";
+	const self = { ...base, id: "s-self", callsign: "alpha", cwd: root, projectRoot: root, repo: `${root}/.git`, claims: [{ pattern: "@cargo", since: now, expiresAt: now + 60_000 }],
+		recent: [{ path: `${root}/src/mine.ts`, at: now - 1_000, op: "edit" }] } as unknown as Presence;
+	const peer = { ...base, id: "s-peer", callsign: "bravo", cwd: root, projectRoot: root, repo: `${root}/.git`, recent: [],
+		claims: [
+			{ pattern: "src/a.ts", since: now, expiresAt: now + 60_000, checkout: wt, note: "the fix" },
+			{ pattern: "src/b/**", since: now, expiresAt: now + 60_000, checkout: wt, note: "the fix" },
+			{ pattern: "docs/c.md", since: now, expiresAt: now + 60_000, note: "the fix" },
+		] } as unknown as Presence;
+	const board = renderBoard({ self, peers: [self, peer], scope: "project", inboundAsks: [] });
+	assert.match(board, /claims: in feature-x: src\/a\.ts, src\/b\/\*\*, docs\/c\.md — the fix/);
+	assert.doesNotMatch(board, /\(in feature-x\)/);
+	assert.doesNotMatch(board, /mine\.ts/, "an agent knows what it changed");
+	assert.match(board, /\nLocks:\n {2}@cargo — you/);
 });

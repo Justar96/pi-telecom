@@ -83,6 +83,8 @@ interface Handoff {
 	abandonedAsks?: Array<[string, LateAsk]>;
 	/** Asks still open: the replacement still says when one goes unanswered. */
 	asyncAsks?: Array<[string, AsyncAsk]>;
+	/** Asks this session sent, so a reply on one's handle after a reload still reaches its peer. */
+	sentAsks?: unknown[];
 	/** Places in line for locks, and declared waits: a reload must not lose them. */
 	queued?: QueueEntry[];
 	blockedOn?: string[];
@@ -313,6 +315,12 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard, w
 	 * for it keeps the lock (`claimAction` ends the grace); it is told so at once, and without that
 	 * claim the lock is released when the time is up. An idle agent cannot claim again, so the
 	 * first in line gets its lock at once.
+	 *
+	 * A job's end is told as a `wake`: the agent tied the claim to the job to hear when it ends, and is usually the
+	 * one to act next (read the result, report it, start the next run). As a passive notice an idle
+	 * holder slept on with the job long finished: in one team's day, at least an hour of finished
+	 * jobs sat unreported until a teammate happened to message the holder. Everything one heartbeat
+	 * finds is one notice, so jobs ending together cost one wake-up.
 	 */
 	function releaseExited(me: Presence, now: number): void {
 		// Asked once per process: a process dying between two of its claims' checks had one claim
@@ -328,6 +336,11 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard, w
 			return alive;
 		};
 		const gone = me.claims.filter((c) => c.pid !== undefined && !running(c));
+		/** What this heartbeat tells, as one notice: exits that end together cost one turn, not one each. */
+		const told: Array<{ heading: string; text: string; line: string }> = [];
+		/** A job ended: the holder acts on that, so it is woken. A lock's grace running out is not news
+		 *  of that kind (the exit was told, with the time), so alone it is passive. */
+		let fresh = false;
 		for (const pid of new Set(gone.map((c) => c.pid))) {
 			if (pid === undefined) continue;
 			const tied = gone.filter((c) => c.pid === pid);
@@ -353,7 +366,8 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard, w
 				.filter(Boolean)
 				.join(" ");
 			const heading = freed.length > 0 ? `${plural(freed.length, "claim")} released` : `process ${pid} exited`;
-			rt.inject(MESSAGE_TYPES.claim, `**📡 ${heading}**\n\n${text}`, {}, "passive");
+			told.push({ heading, text, line: freed.length > 0 ? text : `Process ${pid} exited. ${text}` });
+			fresh = true;
 		}
 		// Locks kept for a next job that did not come.
 		const over = new Map<number, string[]>();
@@ -363,8 +377,13 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard, w
 		}
 		for (const [pid, patterns] of over) {
 			rt.releaseClaims(me, patterns, `process ${pid} exited`);
-			rt.inject(MESSAGE_TYPES.claim, `**📡 ${plural(patterns.length, "claim")} released**\n\n${exitedText(pid, patterns)}`, {}, "passive");
+			const text = exitedText(pid, patterns);
+			told.push({ heading: `${plural(patterns.length, "claim")} released`, text, line: text });
 		}
+		const only = told.length === 1 ? told[0] : undefined;
+		if (told.length === 0) return;
+		const content = only ? `**📡 ${only.heading}**\n\n${only.text}` : `**📡 processes exited**\n\n${told.map((t) => t.line).join("\n")}`;
+		rt.inject(MESSAGE_TYPES.claim, content, {}, fresh ? "wake" : "passive");
 	}
 
 	/** Claims that lapsed and the model was not yet told of (`tellLapsed`). */
@@ -529,6 +548,7 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard, w
 			contesters: [...rt.contesters].map(([pattern, who]) => [pattern, [...who]]),
 			abandonedAsks: rt.ledger.lateCandidates(),
 			asyncAsks: rt.ledger.asyncOpen(),
+			sentAsks: rt.ledger.sentAsks(),
 			...(me.queued?.length ? { queued: me.queued } : {}),
 			...(me.blockedOn?.length ? { blockedOn: me.blockedOn, ...(me.blockedSince ? { blockedSince: me.blockedSince } : {}) } : {}),
 		};
@@ -651,6 +671,7 @@ export function registerLifecycle(rt: Runtime, inbound: Inbound, guard: Guard, w
 			for (const ask of handoff?.inboundAsks ?? []) rt.ledger.noteInbound(ask);
 			if (Array.isArray(handoff?.abandonedAsks)) rt.ledger.restoreAbandoned(handoff.abandonedAsks);
 			if (Array.isArray(handoff?.asyncAsks)) rt.ledger.restoreAsync(handoff.asyncAsks);
+			if (Array.isArray(handoff?.sentAsks)) rt.ledger.restoreSent(handoff.sentAsks);
 			for (const [pattern, who] of handoff?.contesters ?? []) rt.contesters.set(pattern, new Map(who));
 			// Also when the word is kept but its entry does not say this session held it (a fork's, an
 			// older telecom's): the next resume then knows it for its own.

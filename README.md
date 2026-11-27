@@ -230,9 +230,10 @@ telecom({ action: "claim", paths: ["@cargo", "target/**"], pid: 48211, message: 
 ```
 
 It stays while the process runs, even with its owner idle, and is released when the process
-exits; the owner is told. A lock whose holder is still working is kept two more minutes (or the
+exits; the owner is told, and woken if idle. A lock whose holder is still working is kept two more minutes (or the
 claim TTL, if that is shorter), so claiming it again for the next job keeps it across a series of
-jobs. A pid that isn't running makes an ordinary claim.
+jobs. Claimed again without a pid, a claim keeps its process only while that process still runs.
+A pid that isn't running makes an ordinary claim.
 
 ### Locks
 
@@ -343,8 +344,8 @@ or to `subagentOnlyExtensions` in one agent's definition. Each pays the tool's f
 |---|---|---|
 | `board` | `scope?` | The agents in this repository: state, task, claims, recent changes, asks waiting on this agent. `scope: "machine"` lists every agent on the machine. |
 | `send` | `to` or `paths`, `message`, `interrupt?`, `unblocks?` | Messages one agent, or several (`to: "alpha, bravo"`); starts a turn if it is idle (within the wake limit). `interrupt: false` holds it until a busy agent's run ends. |
-| `ask` | `to` or `paths`, `message`, `timeoutSec?` | Asks and returns at once; the answer arrives as a message that starts a turn. With none within `timeoutSec` (default 1800 s, at most 3600 s), the asker is told. |
-| `reply` | `message`, `askId?`, `to?`, `unblocks?` | Answers an ask; `askId` is optional when only one is waiting, or when `to` names its asker. With `to` and no ask of theirs open, it goes as a message. |
+| `ask` | `to` or `paths`, `message`, `timeoutSec?` | Asks one agent and returns at once; the answer arrives as a message that starts a turn. With none within `timeoutSec` (default 1800 s, at most 3600 s), the asker is told. |
+| `reply` | `message`, `askId?`, `to?`, `unblocks?` | Answers an ask; `askId` is optional when only one is waiting, or when `to` names its asker. With `to` and no ask of theirs open, or with the handle of the agent's own ask, it goes as a message. |
 | `broadcast` | `message`, `paths?`, `scope?` | Messages every agent in the repository. Never starts a turn. |
 | `status` | `message`, `waitingFor?` | Sets the task peers see (up to 400 characters) and whom this agent waits for. |
 | `claim` | `paths`, `message?`, `queue?`, `pid?` | Claims paths or globs, or takes `@name` locks; a held lock is waited for in line (`queue: false` refuses instead), `pid` holds the claims while that process runs. |
@@ -434,7 +435,7 @@ Environment variables, read when a session starts or reconnects:
 | `PI_TELECOM_GUARD` | `standard` | `strict`, `standard` or `off` (see [the edit guard](#the-edit-guard)) |
 | `PI_TELECOM_CALLSIGN` | first free | a fixed callsign for this session |
 | `PI_TELECOM_ASK_TIMEOUT_MS` | `1800000` | how long an `ask` stays open before the asker is told no answer came (at most 1 h) |
-| `PI_TELECOM_MAX_WAKES` | `6` | peer wake-ups per minute; `0` turns them off (asks and `/telecom run` still wake) |
+| `PI_TELECOM_MAX_WAKES` | `6` | wake-ups per minute (messages, answers, locks handed on, finished jobs); `0` turns them off (asks and `/telecom run` still wake) |
 | `PI_TELECOM_CLAIM_TTL_MIN` | `120` | minutes without an edit before a claim expires |
 | `PI_TELECOM_SESSION_NAME` | on | `off` leaves pi's session names alone (see [Presence](#presence)) |
 | `PI_TELECOM_DIR` | see [How it works](#how-it-works) | the shared directory |

@@ -136,7 +136,7 @@ export const TOOL_SPEC = {
 	renderCall(args, theme, last) {
 		// omp passes its options (with `expanded`) where pi passes the theme, and the theme last.
 		const context = renderContext<ToolParams>(last, theme as unknown as { expanded?: unknown });
-		const header = callHeader(args, theme);
+		const header = callHeader(args, theme, context.expanded === true);
 		const message = args.message?.trim() ?? "";
 		// A claim's message is its reason. What goes to a peer is Markdown, drawn as the peer's
 		// transcript draws it; a status is a plain line.
@@ -225,7 +225,7 @@ function edgeColor(args: Partial<ToolParams> | undefined, failed: boolean): Them
 const PROSE_ACTIONS: ReadonlySet<string> = new Set(["send", "ask", "reply", "broadcast"]);
 
 /** `📡 send → bravo`, `📡 claim src/auth/**`, `📡 broadcast → the team · about src/db`. */
-function callHeader(args: Partial<ToolParams>, theme: Theme): string {
+function callHeader(args: Partial<ToolParams>, theme: Theme, expanded = false): string {
 	const action = args.action ?? "…";
 	const muted = (t: string) => theme.fg("muted", t);
 	const arrow = muted(" → ");
@@ -244,7 +244,8 @@ function callHeader(args: Partial<ToolParams>, theme: Theme): string {
 			break;
 		case "reply":
 			if (who) head += arrow + who;
-			if (args.askId) head += theme.fg("dim", ` · ${args.askId}`);
+			// The handle means nothing to the human, and the result names the peer: shown expanded only.
+			if (args.askId && expanded) head += theme.fg("dim", ` · ${args.askId}`);
 			break;
 		case "broadcast":
 			head += arrow + muted(args.scope === "machine" ? "every agent on this machine" : "the team");

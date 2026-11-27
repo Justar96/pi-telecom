@@ -137,6 +137,10 @@ test("render: a peer's message, this agent's own send and an answer all draw Mar
 	assert.match(draw(false), /<dim> · ask-1<\/dim>/);
 	assert.doesNotMatch(draw(false), /Carry on/);
 	assert.match(draw(true), /Carry on with other work/);
+	// A reply's call: the handle means nothing folded (the result names the peer); expanded, it is there.
+	const reply = (expanded: boolean) => (TOOL_SPEC as any).renderCall({ action: "reply", askId: "ask-44k-mwz1a86i-cx552", message: "done" }, plain, { expanded, args: {} }).render(200).join("\n");
+	assert.doesNotMatch(reply(false), /ask-44k/);
+	assert.match(reply(true), /reply · ask-44k-mwz1a86i-cx552/);
 });
 
 test("render: the board shows a dot per state and marks this agent", () => {

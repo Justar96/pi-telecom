@@ -16,6 +16,7 @@ import { UNRESPONSIVE_MS } from "./awareness.ts";
 import { lineOf } from "./family.ts";
 import { claimMatcher, claimShown, claimsOverlap, isResource, laneRelativePattern, sameResource } from "./glob.ts";
 import { callsignsOf, declaredCycles, lineFor, lockLines } from "./locks.ts";
+import { basename } from "node:path";
 import { displayPath, inCheckout, type Lane, laneIn, laneName, type PlaceCache, placeOf, readBranch, sameRepo, workingCheckout } from "./project.ts";
 import type { Presence } from "./transport.ts";
 import { ago, clip, elapsed, plural, shortId } from "./util.ts";
@@ -187,27 +188,38 @@ function describePeer(
 	const claims = liveClaims(peer, now);
 	if (claims.length > 0) {
 		// Claims made together share their note: say it once per group, not once per path.
-		const byNote = new Map<string, string[]>();
+		// Within a group, the claims bound to one worktree name it once (`in wt: a, b`), not after
+		// each path: an agent claiming files of its own worktree repeated "(in wt)" on every one.
+		const byNote = new Map<string, Array<{ pattern: string; checkout?: string }>>();
 		let room = opts.brief ? BRIEF_CLAIMS_SHOWN : claims.length;
 		for (const c of claims) {
 			const note = c.note ? clip(c.note, 60) : "";
 			const group = byNote.get(note) ?? [];
 			byNote.set(note, group);
-			if (room-- > 0) group.push(claimShown(c));
+			if (room-- > 0) group.push(c);
 		}
-		const groups = [...byNote].filter(([, patterns]) => patterns.length > 0);
-		const hidden = claims.length - groups.reduce((n, [, patterns]) => n + patterns.length, 0);
+		const groups = [...byNote].filter(([, list]) => list.length > 0);
+		const hidden = claims.length - groups.reduce((n, [, list]) => n + list.length, 0);
+		const shownGroup = (list: ReadonlyArray<{ pattern: string; checkout?: string }>): string => {
+			const byCheckout = new Map<string, string[]>();
+			for (const c of list) byCheckout.set(c.checkout ?? "", [...(byCheckout.get(c.checkout ?? "") ?? []), c.pattern]);
+			return [...byCheckout]
+				.map(([checkout, patterns]) => (checkout ? (patterns.length === 1 ? claimShown({ pattern: patterns[0] as string, checkout }) : `in ${basename(checkout)}: ${patterns.join(", ")}`) : patterns.join(", ")))
+				.join(", ");
+		};
 		lines.push(
-			`    claims: ${groups.map(([note, patterns]) => `${patterns.join(", ")}${note ? ` — ${note}` : ""}`).join("; ")}${
+			`    claims: ${groups.map(([note, list]) => `${shownGroup(list)}${note ? ` — ${note}` : ""}`).join("; ")}${
 				hidden > 0 ? `; +${hidden} more (telecom board)` : ""
 			}`,
 		);
 	}
-	if (places.length > 0) {
-		// Paths relative to the checkout they lie in, named once where it is not the one shown above.
+	// An agent knows what it changed itself: its own block leaves that out.
+	if (places.length > 0 && !opts.self) {
+		// Paths relative to the checkout they lie in, named once where it is not the one shown above:
+		// by its folder name, as claims name it (the peer's line gives the path of the one it works in).
 		const shown = places.map(({ r, place }) => {
 			const path = place ? displayPath(r.path, place.checkout) : r.path;
-			const elsewhere = place && place.checkout !== working ? ` in ${place.checkout}` : "";
+			const elsewhere = place && place.checkout !== working ? ` in ${basename(place.checkout)}` : "";
 			return `${path}${elsewhere} (${ago(r.at, now)})`;
 		});
 		lines.push(`    recently changed: ${shown.join(", ")}`);
@@ -247,7 +259,8 @@ export function renderBoard(input: BoardInput): string {
 	lines.push("", ...describePeer(self, self, { self: true, peers: input.peers }));
 	const team = [self, ...others.filter((p) => sameRepo(p, self))];
 	const locks = lockLines(team, self.id, Date.now());
-	if (locks.length > 0) lines.push("", "Locks (claiming a held one waits in line for it):", ...locks.map((l) => `  ${l}`));
+	// How a lock's line works is in the tool's description and the first claim's result.
+	if (locks.length > 0) lines.push("", "Locks:", ...locks.map((l) => `  ${l}`));
 	for (const cycle of declaredCycles(team)) {
 		const names = callsignsOf(cycle, team, "");
 		lines.push("", `⚠ Wait cycle: ${names.join(" → ")} — each declared it waits for the next, so none of them moves until one goes ahead.`);

@@ -54,6 +54,9 @@ test("send: one message to several teammates reaches each, and each sees who els
 	assert.equal(one.details.to, "delta");
 	await eventually(() => assert.equal(d.sentOf("telecom-message").length, 1));
 	assert.doesNotMatch(d.sentOf("telecom-message")[0]?.content ?? "", /also to/);
+	// That each sees the others was said with the first: a second send to several only reports.
+	const again = await a.tool({ action: "send", to: "bravo, charlie", message: "and B2?" });
+	assert.match(again.text, /^sent to bravo \([^)]*\); charlie \([^)]*\)\.$/);
 });
 
 test("reply: `to` picks that teammate's ask, and with none open goes as a message, never to another asker", async () => {

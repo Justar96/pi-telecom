@@ -829,8 +829,8 @@ export class Runtime {
 
 	private wakeLimitNote(): string {
 		return this.cfg.maxWakesPerMinute === 0
-			? "(telecom: peer wake-ups are off in this session (PI_TELECOM_MAX_WAKES=0), so this arrived without starting a turn.)"
-			: `(telecom: the limit of ${this.cfg.maxWakesPerMinute} peer wake-ups in the last minute was reached, so this arrived without starting a turn.)`;
+			? "(telecom: wake-ups are off in this session (PI_TELECOM_MAX_WAKES=0), so this arrived without starting a turn.)"
+			: `(telecom: the limit of ${this.cfg.maxWakesPerMinute} wake-ups in the last minute was reached, so this arrived without starting a turn.)`;
 	}
 
 	// ------------------------------------------------------------------ settings kept in the session

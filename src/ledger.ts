@@ -61,6 +61,12 @@ export interface AskLedger {
 	inbound(): InboundAsk[];
 	/** Forget inbound asks from sessions that are gone: nobody is waiting on them any more. */
 	dropInboundFrom(sessionIds: ReadonlySet<string>): InboundAsk[];
+	/** Whom an ask this agent sent went to, open, ended or answered; `null` for a handle it never sent
+	 *  (or one too old to be remembered). */
+	sentTo(askId: string): { to: string; toCallsign: string } | null;
+	/** Asks this agent sent, by handle: kept over a `/reload` (`sentTo` after one). */
+	sentAsks(): Array<[string, { to: string; toCallsign: string }]>;
+	restoreSent(entries: ReadonlyArray<unknown>): void;
 	/** Track an ask just delivered: its answer arrives as a message. */
 	track(askId: string, meta: { to: string; toCallsign: string; text: string }, timeoutMs: number): void;
 	/** The ask `askId` named, when it was ours and `from` is whom it went to: open, or ended
@@ -88,11 +94,14 @@ const ABANDONED_CAP = 64;
 const INBOUND_CAP = 64;
 /** Open outbound asks kept at once; the oldest gives way (its answer reads as a plain reply). */
 const OPEN_CAP = 64;
+/** Asks this agent sent, remembered by handle (`sentTo`) after their answer. */
+const SENT_CAP = 64;
 
 export function createAskLedger(): AskLedger {
 	const inbound = new Map<string, InboundAsk>();
 	const open = new Map<string, AsyncAsk>();
 	const abandoned = new Map<string, LateAsk>();
+	const sent = new Map<string, { to: string; toCallsign: string }>();
 
 	/** End an open ask without an answer; a later answer still reads as a reply to it. */
 	function end(id: string, ask: AsyncAsk): EndedAsync {
@@ -127,7 +136,27 @@ export function createAskLedger(): AskLedger {
 			return dropped;
 		},
 
+		sentTo(askId) {
+			const found = open.get(askId) ?? sent.get(askId) ?? abandoned.get(askId);
+			return found?.to !== undefined ? { to: found.to, toCallsign: found.toCallsign } : null;
+		},
+
+		sentAsks() {
+			return [...sent.entries()].map(([id, s]): [string, { to: string; toCallsign: string }] => [id, { ...s }]);
+		},
+
+		restoreSent(entries) {
+			for (const entry of entries) {
+				// Parked by this same process, but a file all the same: a malformed entry is skipped.
+				if (!Array.isArray(entry)) continue;
+				const [id, s] = entry as [unknown, { to?: unknown; toCallsign?: unknown } | null];
+				if (typeof id !== "string" || !s || typeof s.to !== "string" || typeof s.toCallsign !== "string") continue;
+				setBounded(sent, id, { to: s.to, toCallsign: s.toCallsign }, SENT_CAP);
+			}
+		},
+
 		track(askId, meta, timeoutMs) {
+			setBounded(sent, askId, { to: meta.to, toCallsign: meta.toCallsign }, SENT_CAP);
 			// Over the cap the oldest ends as if expired, unannounced: its answer still names it.
 			const oldest = open.size >= OPEN_CAP ? [...open][0] : undefined;
 			if (oldest) end(...oldest);

@@ -271,12 +271,16 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 	function sendTargets(call: ActionCall): Array<Target & { ok: true }> | string {
 		const raw = call.params.to?.trim() ?? "";
 		const names = raw.split(",").map((n) => n.trim()).filter(Boolean);
+		const peers = rt.readPeers();
 		if (names.length <= 1) {
-			const target = messageTarget(call);
+			// "bravo," names one agent: the stray comma is not part of the name, unless a session's
+			// whole name holds it.
+			const one = names[0];
+			const bare = one !== undefined && one !== raw && !resolveTarget(raw, call.me, peers).ok;
+			const target = messageTarget(bare ? { ...call, params: { ...call.params, to: one } } : call);
 			return target.ok ? [target] : target.reason;
 		}
-		if (!call.message) return '"send" needs a `message`';
-		const peers = rt.readPeers();
+		if (!call.message) return `"${call.params.action}" needs a \`message\``;
 		// A session name may itself hold a comma: the whole of `to` naming one agent wins.
 		const whole = resolveTarget(raw, call.me, peers);
 		if (whole.ok) return [whole];
@@ -324,7 +328,30 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 		if (only) return reached.length > 0 ? ok(`sent to ${shown[0]}`, { to: only.peer.callsign }) : fail(reasons[0] ?? "not delivered");
 		if (reached.length === 0) return fail(`not delivered to anyone: ${reasons.join("; ")}`, { failed });
 		const missed = failed.length > 0 ? `\nNot delivered to ${failed.join(", ")}: ${reasons.join("; ")}` : "";
-		return ok(`sent to ${shown.join("; ")}. Each sees who else got it.${missed}`, { reached, failed });
+		// That each recipient sees the others is said once per context.
+		const seen = rt.firstTime("send-group") ? " Each sees who else got it." : "";
+		return ok(`sent to ${shown.join("; ")}.${seen}${missed}`, { reached, failed });
+	}
+
+	/**
+	 * Whom an ask goes to. Each ask has its own handle and answer, so it goes to one agent; several
+	 * in `to` are refused with the call for each. Read as one name, the list was refused as "no live
+	 * agent answers to \"alpha, bravo\". In this project: alpha, bravo", which named the very agents.
+	 */
+	function askTarget(call: ActionCall): Target {
+		// Resolved as `send` resolves several: duplicates, the caller itself and a stray comma fall
+		// away, an unknown name is refused as such, and one agent left is simply asked.
+		if (!call.params.to?.includes(",")) return messageTarget(call);
+		const targets = sendTargets(call);
+		if (typeof targets === "string") return { ok: false, reason: targets };
+		const [first] = targets;
+		if (targets.length === 1 && first) return first;
+		const names = targets.map((t) => t.peer.callsign);
+		const each = names.map((n) => `telecom({ action: "ask", to: "${n}", message: "…" })`).join(", ");
+		return {
+			ok: false,
+			reason: `an ask goes to one agent, and each answer comes back on its own handle. Nothing was sent. Ask each: ${each}. For one message they all read: telecom({ action: "send", to: "${names.join(", ")}", message: "…" }).`,
+		};
 	}
 
 	/**
@@ -332,7 +359,7 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 	 * message, which wakes this agent; if none comes within the timeout, it is told, passively.
 	 */
 	function askAction(call: ActionCall): ToolResult {
-		const target = messageTarget(call);
+		const target = askTarget(call);
 		if (!target.ok) return fail(target.reason);
 		const { me, net, params, message } = call;
 		const peer = target.peer;
@@ -400,6 +427,20 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 			);
 		}
 		const ask = outstanding.find((a) => a.id === askId);
+		// The handle of an ask this agent sent, not one asked of it: models reply on their own ask's
+		// handle to tell its peer more. What they want is for the peer to read it, so it goes as a
+		// message to whom the ask went.
+		const own = ask ? null : rt.ledger.sentTo(askId);
+		const named = own && params.to?.trim() ? resolveTarget(params.to, me, rt.readPeers()) : null;
+		if (own && (!named || (named.ok && named.peer.id === own.to))) {
+			// By its id: the callsign may be another session's by now.
+			if (!rt.readPeers().some((p) => p.id === own.to)) {
+				return fail(`"${askId}" is your own ask to ${own.toCallsign}, who is gone — their session ended, so nothing was sent. telecom({ action: "board" }) shows who is here.`);
+			}
+			const sent = sendAction({ ...call, params: { ...params, to: own.to } });
+			if (sent.isError) return sent;
+			return ok(`"${askId}" is your own ask to ${own.toCallsign}, so this went to them as a message: ${sent.content[0]?.text ?? ""}`, { ...sent.details, asMessage: true });
+		}
 		let to: Presence | undefined;
 		if (ask) {
 			to = rt.readPeers().find((p) => p.id === ask.from);
@@ -684,12 +725,27 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 			.join("\n");
 		if (patterns.length === 0) return fail(away, { refused: [...wide, ...literal, ...badNames, ...negated] });
 		const now = Date.now();
-		/** The process a claim lasts for: this call's, else the one a live claim being made again already had. */
+		/**
+		 * The process a claim lasts for: this call's, else the one a live claim being made again
+		 * already had, while it still runs. One that has exited is not carried over: the claim would
+		 * be released for that exit moments after the result said it was renewed for the TTL (an
+		 * agent claiming a lock again for its next job, without a pid, was told "another 120 min" and
+		 * then "process … exited, stays yours for 2 min more").
+		 */
+		/** Processes a claim made again was tied to and that have exited: the agent is told, since the
+		 *  heartbeat that would have told it finds nothing tied to them any more. */
+		const ended = new Set<number>();
 		const tied = (prior?: Claim): Pick<Claim, "pid" | "pidStart"> => {
 			if (askedPid !== undefined) return pid !== undefined ? { pid, ...(pidStart ? { pidStart } : {}) } : {};
 			if (!prior?.pid || prior.expiresAt <= now) return {};
+			if (!jobRuns(prior.pid, prior.pidStart ?? null)) {
+				ended.add(prior.pid);
+				return {};
+			}
 			return { pid: prior.pid, ...(prior.pidStart ? { pidStart: prior.pidStart } : {}) };
 		};
+		/** The process a claim made by this call lasts for, whether named now or kept from before. */
+		const pidOf = (pattern: string): number | undefined => me.claims.find((c) => c.pattern === pattern)?.pid;
 		const paths = patterns.filter((p) => !isResource(p));
 		const locks = patterns.filter(isResource);
 		const { conflicts, lanes } = claimConflicts(me, paths.map(scopedOf), now);
@@ -775,11 +831,22 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 		// How a claim and a lock work is said once per context (`Runtime.firstTime`): on every call
 		// it was most of what `claim` returned. What this claim lasts for is said every time.
 		if (grantedPaths.length > 0) {
+			// Made again without a pid, a claim keeps the process it had: say so, or the agent reads the TTL.
+			const carried = new Map<number, string[]>();
+			if (pid === undefined) {
+				for (const p of grantedPaths) {
+					const held = pidOf(p);
+					if (held !== undefined) carried.set(held, [...(carried.get(held) ?? []), claimShown(scopedOf(p))]);
+				}
+			}
+			const still = [...carried]
+				.map(([held, names]) => (names.length === grantedPaths.length ? ` Still kept while process ${held} runs.` : ` ${names.join(", ")}: still kept while process ${held} runs.`))
+				.join("");
 			const how = rt.firstTime("claim")
-				? ` Peers editing there are held back and you are told. Release with telecom({ action: "release" }) when done; ${pid !== undefined ? `kept while process ${pid} runs` : `idle claims expire after ${ttl} min`}.`
+				? ` Peers editing there are held back and you are told. Release with telecom({ action: "release" }) when done; ${pid !== undefined ? `kept while process ${pid} runs` : `idle claims expire after ${ttl} min`}.${still}`
 				: pid !== undefined
 					? ` Kept while process ${pid} runs.`
-					: "";
+					: still;
 			lines.push(
 				`claimed ${grantedPaths.map((p) => claimShown(scopedOf(p))).join(", ")}${note ? ` — ${note}` : ""}.${how}${overlap}${everywhereHint(me, grantedPaths.filter((p) => !scopes.has(p)))}`,
 			);
@@ -804,7 +871,18 @@ export function registerTool(rt: Runtime, waiting: Waiting): void {
 				);
 			}
 		}
-		if (kept.length > 0) lines.push(`renewed ${kept.join(", ")}: ${pid !== undefined ? `yours while process ${pid} runs` : `yours for another ${ttl} min`}.`);
+		// Each renewed lock with what it now lasts for: a lock made again without a pid keeps a process
+		// that still runs (`tied`).
+		const byPid = new Map<number | undefined, string[]>();
+		for (const l of kept) byPid.set(pidOf(l), [...(byPid.get(pidOf(l)) ?? []), l]);
+		for (const [held, names] of byPid) {
+			lines.push(`renewed ${names.join(", ")}: ${held !== undefined ? `yours while process ${held} runs` : `yours for another ${ttl} min`}.`);
+		}
+		if (ended.size > 0) {
+			const pids = [...ended];
+			const one = pids.length === 1;
+			lines.push(`${one ? "process" : "processes"} ${pids.join(", ")} had already exited, so ${one ? "it no longer holds this claim" : "they no longer hold these claims"}.`);
+		}
 		if (lost.length > 0) {
 			lines.push(`${lost.join(", ")}: another agent took ${lost.length === 1 ? "it" : "them"} at the same moment, first. You are first in line, and woken when it frees.`);
 		}
